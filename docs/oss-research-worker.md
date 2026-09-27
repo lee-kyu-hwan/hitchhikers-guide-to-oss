@@ -510,9 +510,11 @@ sentinel 항목 하나를 넣었다. `security create-keychain`·`add-generic-pa
 | 위 deny 프로파일 안에서 srt 실행 | `sandbox_apply: Operation not permitted`, 시작 불가 |
 | srt 안에서 위 deny 프로파일로 `sandbox-exec` | `sandbox_apply: Operation not permitted`, 시작 불가 |
 
-macOS는 이미 sandbox된 프로세스에 두 번째 Seatbelt 프로파일을 적용하지 못한다.
-그래서 srt와 별도 deny 프로파일을 합성할 수 없다. srt 설정에도 거부 키가 없다.
-남는 방법은 셋이다. 모두 이번에 구현하지 않았다.
+이 머신(macOS 26.4.1)에서 시험한 두 중첩 방향 모두 두 번째 Seatbelt 프로파일
+적용이 EPERM으로 실패했다. 따라서 이 경로로는 srt와 별도 deny 프로파일을 합성하지
+못했다. srt 0.0.77 README에 문서화된 설정 키에도 거부 키가 없다. 이것은 그
+경로 하나의 실측이며, 다른 모든 Keychain 차단 방식이 불가능하다는 증명은 아니다.
+이 문서가 검토한 대안은 셋이다. 모두 이번에 구현하지 않았다.
 
 1. srt 라이브러리가 만든 프로파일 문자열을 고쳐 두 허용 규칙을 빼는 방식. srt
    패치에 해당하고 문서화된 기능이 아니다. 권하지 않는다.
@@ -634,6 +636,11 @@ Linux 게스트 안의 별도 로그인(`.credentials.json`), API key·`apiKeyHe
 
 ## 미구현과 미증명의 구분
 
+아래 스킬·Agent 행의 구성기 구현은 PR #226(`lee-kyu-hwan/189-research-skill-runtime`, 별도 브랜치)의
+검증 결과다. 이 #82 checkout에는 그 구성기 코드가 아직 통합되지 않았고, main을 통해
+순차 통합한다. 실제 모델로는 검증하지 않았다. 승인된 오프라인 개발은 착수마다 ask하지
+않지만, live gate(실제 환경 구성·인증·live 실행)는 닫힌 채 유지한다.
+
 | 기능 | 코드 상태 | live 증거 | 독립 구현 계획(제안) |
 |---|---|---|---|
 | 스킬·Agent(deep-research) | **닫힌 게이트 뒤 구성기**. `read-only`는 그대로다. `corpus-extract`·`deep-research` 프로필이 도구 표면, 검토된 원본 staging(hash pin, manifest), staged 경로 `denyWrite`, 수거 때 변경 검사를 만든다(「조사 스킬 실행 구성」) | 없음. staged 변경 거부는 실제 srt 비AI probe만 | ① 도구 목록 확정(계약 문서). ② 구성기 완료(오프라인 + srt probe). ③ live에서 staged 로드·자식 경계(계약 §3.2, R1~R5)를 판정한다. ④ WebFetch 도메인과 relay 후보는 사용자·조정자 결정이다 |
@@ -652,7 +659,7 @@ Linux 게스트 안의 별도 로그인(`.credentials.json`), API key·`apiKeyHe
 | 환경 sentinel 분리 | PASS (실측) | srt는 거르지 않음. 실행기 허용 목록이 거름 |
 | Orca 유사 Unix socket 거부 | PASS (실측) | 서버 accept 0건 |
 | 네트워크: 허용 조회 / 비허용·직접 우회 거부 | PASS (실측, 로컬) | `allowLocalBinding: false` 전제 |
-| 네트워크: 허용 목적지로의 쓰기(REST·GraphQL mutation·git push) 차단 | **FAIL(미차단)** | srt는 목적지만 거른다. 현재 실행기는 GitHub를 허용하지 않아 쓰기 경로가 없다. 조회를 열려면 #192 중계가 필요 |
+| 네트워크: 허용 목적지로의 쓰기(REST·GraphQL mutation·git push) 차단 | srt 단독은 **FAIL(미차단)**, relay 경유는 relay 검사로 거부 | srt는 목적지만 거른다. 실행기는 GitHub를 허용하지 않고, supervisor가 띄운 #192 relay port만 허용한다. REST 쓰기 405는 제품 supervisor 경로, GraphQL mutation·CONNECT 터널 등은 #82 통합 시험(`tests/test_oss_research_offline_integration.py`)에서 확인. git push 경로는 relay에 없다 |
 | 정책 부재·손상 fail closed | PASS (실측) | 알 수 없는 키는 무시되는 한계 있음 |
 | 결과 수거·타임아웃·보고서 비실행 | PASS (mock) | `CollectTests` 12건 |
 | supervisor: 한 deadline·출력 상한·ready 검증·실패 원인·두 그룹 정리 | PASS (오프라인 fake + 실제 srt 비AI probe) | `test_oss_research_worker_supervisor.py` 29건. 실제 srt 3건: relay 경유 조회 성공과 나머지 거부, 무응답 upstream에서 deadline 종료, setsid 관찰. 실제 srt 성공 manifest는 probe가 낸 result 모양 JSON이다. 모델 결과가 아니다 |
@@ -663,7 +670,7 @@ Linux 게스트 안의 별도 로그인(`.credentials.json`), API key·`apiKeyHe
 | permission mode 선택 | PASS (오프라인) | `dontAsk`/`auto`만 허용, 기본 `dontAsk`, 도구 표면 불변. auto 동작은 미검증 |
 | 시스템 읽기 최소화 | PASS (실측) | `SYSTEM_READ` 3개. 양성: Claude 기동·`localhost` 해석·hosts. 음성: `/etc/passwd` 등 6건 |
 | lock 재현 | PASS (실측, 오프라인 캐시) | 커밋한 lock으로 `npm ci` → 같은 트리. node·OS·Claude 바이너리 무결성은 미검증 |
-| Keychain | **미검증(부분 관찰)** | 파일형 fixture는 파일 deny로만 막힘. srt 설정으로 mach-lookup 거부 불가, 중첩 불가. 로그인·XPC 경로 미증명 |
+| Keychain | **미검증(부분 관찰)** | 파일형 fixture는 파일 deny로만 막힘. srt 0.0.77 README 키에 mach-lookup 거부가 없고, 이 머신에서 시험한 중첩 두 방향은 EPERM. 로그인·XPC 경로 미증명. 계정 분리·VM은 시험하지 않은 별도 경로 |
 | Claude 실행 파일 기동 | PASS (실측, 기동만) | `--version`·`--help` exit 0, 네트워크·인증 없음. 모델 요청 미검증 |
 | 정상 조사(모델 호출·결과 반환) | 미검증 | 모델 호출 안 함 |
 | staged 프로필 인자·정책·manifest | PASS (오프라인) | `test_oss_research_worker_skills.py`: read-only argv·정책 불변, 프로필별 도구·규칙, 도메인 검사(GitHub 계열 거부), pin 불일치·누락·symlink(파일·디렉터리·root) Blocked, 설치본 Blocked, 입력의 Claude 설정 거부, 부모 비밀 비상속, 수거 때 변경 실패, `main` 모든 프로필 exit 3 |
@@ -681,9 +688,10 @@ Linux 게스트 안의 별도 로그인(`.credentials.json`), API key·`apiKeyHe
 2. **인증 바인딩**: 인증 방식을 먼저 고른다(「인증」). 그 방식으로 정상 모델 호출 1회. 만료·잘못된
    토큰에서 명시적 실패. 토큰이 argv·로그·결과에 남지 않는지 확인한다. 전달
    방식과 노출 범위는 사용자 결정이다.
-3. **Keychain**: srt 설정에는 mach-lookup 거부 키가 없고, 별도 Seatbelt deny
-   프로파일은 srt와 중첩되지 않는다(`sandbox_apply` EPERM). 따라서 srt 설정만으로는
-   불가능하다. 최소 대안은 (a) 로그인 Keychain이 없는 전용 macOS 사용자 계정으로
+3. **Keychain**: srt 0.0.77 README 키에는 mach-lookup 거부 키가 없고, 이 머신에서
+   시험한 별도 Seatbelt deny 프로파일의 중첩 두 방향은 `sandbox_apply` EPERM이었다.
+   그 범위에서는 srt 설정만으로 막지 못했다(다른 방식의 불가능 증명은 아니다).
+   검토한 대안은 (a) 로그인 Keychain이 없는 전용 macOS 사용자 계정으로
    조사 프로세스 실행(관리자 설정 필요), (b) Keychain이 없는 Linux VM·컨테이너(현재
    docker daemon 미실행)다. 선택은 사용자 결정이다. 그 전까지 게이트는 닫혀 있다.
 4. **조회 중계(#192, 별도 writer)**: 조정자 결정. 부모 소유 loopback 포트, srt
