@@ -19,6 +19,7 @@ from pathlib import Path
 import re
 import signal
 import socket
+import socketserver
 import sys
 import threading
 import time
@@ -573,6 +574,13 @@ class RelayServer(http.server.ThreadingHTTPServer):
         super().__init__((HOST, 0), RelayHandler)
         self.relay = relay
         self._slots = threading.BoundedSemaphore(MAX_CONCURRENT_CONNECTIONS)
+
+    def server_bind(self) -> None:
+        # HTTPServer.server_bind names the server with socket.getfqdn(HOST), a
+        # reverse lookup that a slow resolver can stall past the ready deadline.
+        socketserver.TCPServer.server_bind(self)
+        self.server_name = HOST
+        self.server_port = self.server_address[1]
 
     def verify_request(self, request: Any, client_address: Any) -> bool:
         return client_address[0] == HOST

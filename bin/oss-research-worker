@@ -1,29 +1,511 @@
 #!/usr/bin/env python3
-"""Start a read-only Claude worker for OSS research in an Orca worktree."""
+"""Start a read-only Claude worker for OSS research inside the sandbox runtime.
+
+The real launch is closed. The pinned srt install and the shape of a
+profile-bound credential file are checked, but no real launch has been
+measured with them. The code that hands the credential to the child and
+checks it was not exposed sits behind that gate and runs only in tests with
+fake sentinels. See docs/research/oss-research-worker.md.
+"""
 
 from __future__ import annotations
 
 import argparse
+import errno
+import hashlib
+import json
+import math
 import os
 from pathlib import Path
+import re
+import select
+import shutil
+import stat
+import signal
 import subprocess
 import sys
+import time
+from typing import NamedTuple
 
 
 READ_TOOLS = "Read,Glob,Grep"
 DENIED_TOOLS = "Bash,PowerShell,WebFetch,WebSearch,Edit,Write,NotebookEdit,Agent,Task"
 MAX_PROMPT_BYTES = 65_536
-GITHUB_CREDENTIAL_VARIABLES = (
-    "GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN",
-    "GITHUB_ENTERPRISE_TOKEN", "GITHUB_PERSONAL_ACCESS_TOKEN",
-    "GH_CONFIG_DIR", "GIT_ASKPASS", "SSH_ASKPASS", "SSH_AUTH_SOCK",
+PROFILES = ("claude-profile1", "claude-profile2")
+# Only these parent variables reach the child. Everything else, including
+# GitHub/SSH/Orca/cloud credentials and the parent CLAUDE_CONFIG_DIR, is dropped.
+INHERITED_VARIABLES = ("PATH", "LANG", "LC_ALL", "LC_CTYPE", "TERM")
+# Model endpoint only. OAuth sign-in/refresh domains depend on the auth decision.
+ALLOWED_DOMAINS = ("api.anthropic.com",)
+WRITABLE_AREAS = ("home", "tmp", "output")
+# The only system paths opened under denyRead "/", measured on srt 0.0.77 with
+# Claude Code 2.1.283 (--version/--help) and a Python probe:
+# - /usr/share/icu: Claude --help crashes (Bun SIGTRAP) without it.
+# - /etc: srt emits (subpath "/etc"), which covers the link only, not
+#   /private/etc; without it getaddrinfo("localhost") cannot reach srt's proxy.
+# - /private/etc/hosts: the one file behind that lookup.
+# /etc/passwd, /etc/ssh, /usr/local, /usr/bin and the rest stay unreadable.
+SYSTEM_READ = ("/usr/share/icu", "/etc", "/private/etc/hosts")
+# The only srt install the gate accepts: a local prefix made by
+#   npm install --prefix <prefix> --save-exact --ignore-scripts \
+#     @anthropic-ai/sandbox-runtime@0.0.77
+# `srt --version` prints npm_package_version or "1.0.0", so it is not checked.
+SRT_PACKAGE = "@anthropic-ai/sandbox-runtime"
+SRT_VERSION = "0.0.77"
+# Every package in the prefix's package-lock.json. Its dependencies are ^
+# ranges, so a later install can resolve newer ones; that install is refused.
+SRT_LOCKED = {
+    SRT_PACKAGE: ("0.0.77", "sha512-uOe6kkAbo91r5shXXBxZ1DKbOpWmnXkNDDujXrFJRaHSG7D7"
+                            "s8b7Yfsu0pGDkYFgKZ2ECtVCNisl6pCYcaMF7A=="),
+    "@pondwader/socks5-server": ("1.0.10", "sha512-bQY06wzzR8D2+vVCUoBsr5QS2U6UgPUQRmEr"
+                                           "NwtsuI6vLcyRKkafjkr3KxbtGFf9aBBIV2mcvlsKD1UYaIV+sg=="),
+    "commander": ("12.1.0", "sha512-Vw8qHK3bZM9y/P10u3Vib8o/DdkvA2OtPtZvD871QKjy74Wj1WSK"
+                            "FILMPRPSdUSx5RFK1arlJzEtA4PkFgnbuA=="),
+    "node-forge": ("1.4.0", "sha512-LarFH0+6VfriEhqMMcLX2F7SwSXeWwnEAJEsYm5QKWchiVYVvJyV"
+                            "9v7UDvUv+w5HO23ZpQTXDv/GxdDdMyOuoQ=="),
+    "zod": ("3.25.76", "sha512-gzUt/qt81nXsFGKIFcC3YnfEAx5NkunCfnDlvuBSSFS02bcXu4Lmea0A"
+                       "FIUwbLWxWPx3d9p8S5QoaujKcNQxcQ=="),
+}
+SRT_TREE_SHA256 = "e39390f88844ecf70ca4923a99314be5a85a7a35460d31f8508fe6b55cdae643"
+DEFAULT_TIMEOUT_SECONDS = 1800
+# A `claude setup-token` token the user saved for one profile, at
+# <any dir>/<profile>/oauth-token. Only the file's shape is checked here.
+CREDENTIAL_NAME = "oauth-token"
+CREDENTIAL_PATTERN = re.compile(r"[A-Za-z0-9._-]{20,4096}\n?")
+CREDENTIAL_MAX_BYTES = 4097
+# The one variable the credential reaches the child through. It is set from
+# the checked file only; the parent's own value is never inherited.
+CREDENTIAL_VARIABLE = "CLAUDE_CODE_OAUTH_TOKEN"
+# Bounds on the after-run search of the writable areas for the credential.
+EXPOSURE_MAX_FILES = 10_000
+EXPOSURE_MAX_BYTES = 256 * 1024 * 1024
+EXPOSURE_SECONDS = 30.0
+# Claude permission modes the child may be started with. Choosing auto only
+# changes this CLI argument; nothing here shows what auto blocks.
+PERMISSION_MODES = ("dontAsk", "auto")
+DEFAULT_PERMISSION_MODE = "dontAsk"
+
+# Output bounds: past one, the supervisor stops both groups and the run fails.
+MAX_STDOUT_BYTES = 8 * 1024 * 1024
+MAX_STDERR_BYTES = 1024 * 1024
+MAX_READY_BYTES = 16 * 1024
+# After the child exits its pipes must close within this; cleanup is bounded too.
+EXIT_GRACE_SECONDS = 2.0
+CLEANUP_SECONDS = 5.0
+# The read-only GitHub relay (#192) is the sibling of this script, never a
+# path from the command line. Its limits mirror the relay's own argument checks.
+RELAY_SOURCES = (
+    ("issues", Path("collecting-open-source-issues/scripts/collect_open_source_issues.py")),
+    ("sibling", Path("collecting-recent-closed-prs/scripts/collect_recent_closed_prs.py")),
 )
+REPOSITORY = re.compile(r"\A([A-Za-z0-9][A-Za-z0-9-]{0,38})/([A-Za-z0-9_.-]{1,100})\Z")
+MAX_RELAY_REPOSITORIES = 20
+MAX_RELAY_REQUEST_BUDGET = 10_000
+MAX_RELAY_RESPONSE_BYTES = 64 * 1024 * 1024
+MAX_RELAY_RESPONSE_BYTE_BUDGET = 1024 * 1024 * 1024
+MAX_RELAY_TIMEOUT_SECONDS = 300.0
+
+EXIT_BAD_INPUT = 2
+EXIT_BLOCKED = 3
+EXIT_FAILED = 4
 
 
-def build_command(prompt: str) -> list[str]:
-    return [
-        "claude",
+class Blocked(Exception):
+    """The isolated launch cannot start; never fall back to an unisolated one."""
+
+
+def reject_symlinks(root: Path) -> None:
+    for current, directories, files in os.walk(root):
+        for name in directories + files:
+            if (Path(current) / name).is_symlink():
+                raise ValueError(f"symlink is not allowed: {Path(current) / name}")
+
+
+def checked_input(input_dir: Path, prompt_file: Path, home: Path) -> tuple[Path, str]:
+    if input_dir.is_symlink() or prompt_file.is_symlink():
+        raise ValueError("input directory and prompt must not be symlinks")
+    input_dir = input_dir.resolve(strict=True)
+    if not input_dir.is_dir():
+        raise ValueError("input must be a directory")
+    if home.resolve().is_relative_to(input_dir):
+        raise ValueError("input directory must not contain the parent HOME")
+    reject_symlinks(input_dir)
+    resolved = prompt_file.resolve(strict=True)
+    if not resolved.is_file() or not resolved.is_relative_to(input_dir):
+        raise ValueError("prompt must be a regular file inside the input directory")
+    if resolved.stat().st_size > MAX_PROMPT_BYTES:
+        raise ValueError("prompt is too large")
+    prompt = resolved.read_text(encoding="utf-8")
+    if not prompt.strip() or "\0" in prompt:
+        raise ValueError("prompt must be nonempty UTF-8 text without NUL")
+    return input_dir, prompt
+
+
+def checked_run_dir(run_dir: Path, input_dir: Path) -> Path:
+    if run_dir.exists() or run_dir.is_symlink():
+        raise ValueError("run directory must not exist yet")
+    parent = run_dir.parent.resolve(strict=True)
+    run_dir = parent / run_dir.name
+    if run_dir.is_relative_to(input_dir) or input_dir.is_relative_to(run_dir):
+        raise ValueError("run and input directories must not overlap")
+    return run_dir
+
+
+def tree_sha256(root: Path) -> str:
+    """Digest of every name, file content and link target under root.
+
+    npm's hidden lockfile is skipped: it only differs by the prefix name.
+    """
+    digest = hashlib.sha256()
+    for path in sorted(root.rglob("*")):
+        relative = path.relative_to(root).as_posix()
+        if relative == ".package-lock.json":
+            continue
+        if path.is_symlink():
+            entry = ["link", relative, os.readlink(path)]
+        elif path.is_file():
+            entry = ["file", relative, hashlib.sha256(path.read_bytes()).hexdigest()]
+        elif path.is_dir():
+            entry = ["dir", relative]
+        else:
+            raise Blocked(f"special file in the sandbox runtime install: {relative}")
+        digest.update(json.dumps(entry).encode() + b"\n")
+    return digest.hexdigest()
+
+
+def verify_runtime(prefix: Path | None, path: str | None) -> list[str]:
+    """Return the argv that starts the pinned srt, or raise Blocked.
+
+    srt on PATH is never used: only the prefix whose lock, package version
+    and installed tree match the measured 0.0.77 install.
+    """
+    if prefix is None:
+        raise Blocked("no --runtime-prefix given; srt (sandbox runtime) is not "
+                      "installed for this worker; not starting unisolated")
+    prefix = prefix.resolve()
+    modules = prefix / "node_modules"
+    package = modules / SRT_PACKAGE
+    cli = package / "dist/cli.js"
+    if not cli.is_file():
+        raise Blocked(f"srt (sandbox runtime) is not installed in {prefix}; "
+                      "not starting unisolated")
+    try:
+        lock = json.loads((prefix / "package-lock.json").read_text(encoding="utf-8"))
+        locked = {name.removeprefix("node_modules/"): (entry["version"], entry["integrity"])
+                  for name, entry in lock["packages"].items() if name}
+        installed = json.loads((package / "package.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError, KeyError, TypeError, AttributeError) as error:
+        raise Blocked(f"sandbox runtime lock or package file is unusable: {error}")
+    if locked != SRT_LOCKED:
+        raise Blocked(f"locked packages are not the pinned {SRT_PACKAGE}@{SRT_VERSION} "
+                      "set with its measured dependency versions and integrity")
+    if installed.get("name") != SRT_PACKAGE or installed.get("version") != SRT_VERSION:
+        raise Blocked(f"installed sandbox runtime is not {SRT_PACKAGE}@{SRT_VERSION}")
+    if tree_sha256(modules) != SRT_TREE_SHA256:
+        raise Blocked("installed sandbox runtime tree differs from the measured "
+                      f"{SRT_VERSION} install")
+    node = shutil.which("node", path=path)
+    if node is None:
+        raise Blocked("node is not on PATH; srt cannot start")
+    return [node, str(cli)]
+
+
+class Credential:
+    """A checked token held in memory only. repr/str never show the value."""
+
+    __slots__ = ("profile", "_value")
+
+    def __init__(self, profile: str, value: str):
+        self.profile = profile
+        self._value = value
+
+    def __repr__(self) -> str:
+        return f"<credential for {self.profile}>"
+
+    __str__ = __repr__
+
+    def __reduce__(self):
+        raise TypeError("a credential is never serialized")
+
+    def reveal(self) -> str:
+        """The value, for the child environment and exposure checks only."""
+        return self._value
+
+
+def open_credential(profile: str, credential: Path,
+                    forbidden: tuple[Path, ...]) -> tuple[int, os.stat_result]:
+    """Open a private token file bound to profile and return (descriptor, stat).
+
+    The directory and the file are opened without following links, and the
+    owner, mode and link count are checked on those descriptors, so what is
+    checked is what a later read gets. Nothing is read. Messages never
+    include the content.
+    """
+    if credential.is_symlink() or credential.parent.is_symlink():
+        raise Blocked("credential file and its directory must not be symlinks")
+    credential = credential.absolute()
+    if credential.name != CREDENTIAL_NAME or credential.parent.name != profile:
+        raise Blocked(f"credential file must be <dir>/{profile}/{CREDENTIAL_NAME}")
+    if any(part in PROFILES for part in credential.parent.parent.parts):
+        raise Blocked("credential path must name only its own profile")
+    if any(credential.resolve().is_relative_to(path) for path in forbidden):
+        raise Blocked("credential file must be outside the input and run directories")
+    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+    directory_fd = file_fd = None
+    try:
+        directory_fd = os.open(credential.parent, flags | os.O_DIRECTORY)
+        file_fd = os.open(CREDENTIAL_NAME, flags, dir_fd=directory_fd)
+        directory, info = os.fstat(directory_fd), os.fstat(file_fd)
+        if not stat.S_ISREG(info.st_mode):
+            raise Blocked("credential file is not a regular file")
+        for label, entry, mode in (("directory", directory, 0o700), ("file", info, 0o600)):
+            if entry.st_uid != os.getuid() or stat.S_IMODE(entry.st_mode) != mode:
+                raise Blocked(f"credential {label} must be owned by this user with mode {mode:o}")
+        if info.st_nlink != 1:
+            raise Blocked("credential file must have exactly one link")
+        if not 20 <= info.st_size <= CREDENTIAL_MAX_BYTES:
+            raise Blocked("credential file is not a single-line ASCII token")
+    except BaseException as error:
+        if file_fd is not None:
+            os.close(file_fd)
+        if isinstance(error, OSError):
+            if error.errno == errno.ELOOP:
+                raise Blocked("credential file and its directory must not be symlinks")
+            raise Blocked(f"credential file is unusable: {error.strerror}")
+        raise
+    finally:
+        if directory_fd is not None:
+            os.close(directory_fd)
+    return file_fd, info
+
+
+def checked_credential(profile: str, credential: Path, *forbidden: Path) -> None:
+    """Raise Blocked unless credential is a private file bound to profile.
+
+    The closed gate uses this: path, owner, mode, link count and size only.
+    The token itself is not read (load_credential does that).
+    """
+    os.close(open_credential(profile, credential, forbidden)[0])
+
+
+def load_credential(profile: str, credential: Path, *forbidden: Path) -> Credential:
+    """checked_credential plus one read of the token through the same descriptor.
+
+    Called only past the gate (tests call it directly while it is closed).
+    """
+    descriptor, info = open_credential(profile, credential, forbidden)
+    try:
+        data = os.read(descriptor, CREDENTIAL_MAX_BYTES + 1)
+        after = os.fstat(descriptor)
+    except OSError as error:
+        raise Blocked(f"credential file is unusable: {error.strerror}")
+    finally:
+        os.close(descriptor)
+    if (after.st_size, after.st_mtime_ns) != (info.st_size, info.st_mtime_ns) \
+            or len(data) != info.st_size:
+        raise Blocked("credential file changed while it was read")
+    try:
+        token = data.decode("ascii")
+    except UnicodeError:
+        raise Blocked("credential file is not a single-line ASCII token")
+    if not CREDENTIAL_PATTERN.fullmatch(token):
+        raise Blocked("credential file is not a single-line ASCII token")
+    return Credential(profile, token.removesuffix("\n"))
+
+
+def require_runtime(profile: str, prefix: Path | None, path: str | None,
+                    credential: Path | None = None,
+                    forbidden: tuple[Path, ...] = ()) -> tuple[list[str], str, Credential]:
+    """Raise Blocked until a real launch has been measured.
+
+    The runtime and credential-file checks are real. Passing them only says
+    the inputs are in place: no launch of Claude with this policy and a bound
+    credential has been observed yet. Do not replace this with a flag.
+    While closed, the credential's metadata is checked but its token is never
+    read; an opened gate would return load_credential's result instead.
+    """
+    runtime = verify_runtime(prefix, path)
+    if credential is None:
+        raise Blocked(
+            f"isolated launch is closed: srt {SRT_VERSION} verified at {runtime[1]}, "
+            f"but no credential binding for {profile}")
+    checked_credential(profile, credential, *forbidden)
+    raise Blocked(
+        f"isolated launch is closed: srt {SRT_VERSION} and the {profile} credential "
+        "file are checked, but no real launch has been measured with them")
+
+
+def build_environment(parent: dict[str, str], run_dir: Path,
+                      credential: Credential | None = None) -> dict[str, str]:
+    """The child's environment: the allowlist, run paths and, only when given,
+    the checked credential. The relay never gets it (relay_environment)."""
+    environment = {name: parent[name] for name in INHERITED_VARIABLES if name in parent}
+    environment["HOME"] = str(run_dir / "home")
+    environment["TMPDIR"] = str(run_dir / "tmp")
+    environment["CLAUDE_CONFIG_DIR"] = str(run_dir / "home/.claude")
+    if credential is not None:
+        environment[CREDENTIAL_VARIABLE] = credential.reveal()
+    return environment
+
+
+def build_policy(input_dir: Path, run_dir: Path, claude: Path,
+                 relay_port: int | None = None, model: bool = True) -> dict:
+    """srt settings using only keys documented in the sandbox-runtime README.
+
+    The model endpoint is allowed only for a model run (model=False is the
+    non-AI relay-only probe); the relay port only after its ready line checked.
+    srt 0.0.77 rejects a network section without deniedDomains.
+    """
+    domains = list(ALLOWED_DOMAINS) if model else []
+    if relay_port is not None:
+        domains.append(f"127.0.0.1:{relay_port}")
+    return {
+        "filesystem": {
+            "denyRead": ["/"],
+            "allowRead": [*SYSTEM_READ, str(input_dir), str(run_dir), str(claude)],
+            "allowWrite": [str(run_dir / name) for name in WRITABLE_AREAS],
+            "denyWrite": [str(run_dir / "policy"), str(run_dir / "result")],
+        },
+        "network": {
+            "allowedDomains": domains,
+            "deniedDomains": [],
+            "allowUnixSockets": [],
+            "allowAllUnixSockets": False,
+            "allowLocalBinding": False,
+        },
+    }
+
+
+class RelayRequest(NamedTuple):
+    repositories: tuple[str, ...]
+    request_budget: int
+    max_response_bytes: int
+    response_byte_budget: int
+    timeout_seconds: float
+
+
+class RelayLaunch(NamedTuple):
+    argv: list[str]
+    environment: dict[str, str]
+    sources: list[dict[str, str]]
+    relay_sha256: str
+
+
+def checked_relay_request(repositories: list[str], request_budget: int,
+                          max_response_bytes: int, response_byte_budget: int,
+                          timeout_seconds: float) -> RelayRequest:
+    """Raise ValueError unless the relay arguments are inside the relay's own limits."""
+    if not 1 <= len(repositories) <= MAX_RELAY_REPOSITORIES:
+        raise ValueError(f"relay needs 1 to {MAX_RELAY_REPOSITORIES} repositories")
+    for repository in repositories:
+        if REPOSITORY.match(repository) is None:
+            raise ValueError("relay repository must be OWNER/NAME")
+    if len({repository.lower() for repository in repositories}) != len(repositories):
+        raise ValueError("relay repositories must be unique")
+    for label, value, limit in (("request budget", request_budget, MAX_RELAY_REQUEST_BUDGET),
+                                ("max response bytes", max_response_bytes,
+                                 MAX_RELAY_RESPONSE_BYTES),
+                                ("response byte budget", response_byte_budget,
+                                 MAX_RELAY_RESPONSE_BYTE_BUDGET)):
+        if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= limit:
+            raise ValueError(f"relay {label} must be an integer from 1 to {limit}")
+    if not (math.isfinite(timeout_seconds) and 0 < timeout_seconds <= MAX_RELAY_TIMEOUT_SECONDS):
+        raise ValueError(f"relay timeout must be above 0 and at most {MAX_RELAY_TIMEOUT_SECONDS:g}")
+    return RelayRequest(tuple(repositories), request_budget, max_response_bytes,
+                        response_byte_budget, timeout_seconds)
+
+
+def trusted_relay(script: Path) -> tuple[Path, Path]:
+    """The relay beside this script and the skills directory it must load.
+
+    In the chezmoi source tree both come from the same checkout; installed,
+    the relay is ~/.local/bin/oss-research-relay and the skills ~/.codex/skills.
+    """
+    script = script.resolve()
+    if script.name.startswith("executable_"):
+        relay = script.with_name("executable_oss-research-relay")
+        skills = script.parents[2] / "dot_codex/skills"
+    else:
+        relay = script.with_name("oss-research-relay")
+        skills = Path.home() / ".codex/skills"
+    if relay.is_symlink() or not relay.is_file():
+        raise Blocked(f"the read-only relay is not installed beside the worker: {relay}")
+    return relay, skills
+
+
+def relay_sources(skills: Path) -> list[dict[str, str]]:
+    """The provenance the relay's ready line must report, hashed by the parent."""
+    sources = []
+    for role, relative in RELAY_SOURCES:
+        try:
+            path = (skills / relative).resolve(strict=True)
+            digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        except OSError as error:
+            raise Blocked(f"relay source {relative} is unusable: {error.strerror}")
+        sources.append({"role": role, "path": str(path), "sha256": digest})
+    return sources
+
+
+def relay_environment(parent: dict[str, str]) -> dict[str, str]:
+    """The relay is credential-free: no GitHub token or proxy variable reaches it."""
+    environment = {name: parent[name] for name in INHERITED_VARIABLES if name in parent}
+    environment["PYTHONDONTWRITEBYTECODE"] = "1"
+    return environment
+
+
+def relay_launch(request: RelayRequest, parent: dict[str, str]) -> RelayLaunch:
+    relay, skills = trusted_relay(Path(__file__))
+    argv = [str(Path(sys.executable).resolve()), "-B", str(relay)]
+    for repository in request.repositories:
+        argv += ["--repo", repository]
+    argv += ["--request-budget", str(request.request_budget),
+             "--max-response-bytes", str(request.max_response_bytes),
+             "--response-byte-budget", str(request.response_byte_budget),
+             "--timeout-seconds", repr(request.timeout_seconds),
+             "--skills-dir", str(skills)]
+    return RelayLaunch(argv, relay_environment(parent), relay_sources(skills),
+                       hashlib.sha256(relay.read_bytes()).hexdigest())
+
+
+def unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    document = dict(pairs)
+    if len(document) != len(pairs):
+        raise ValueError("duplicate key")
+    return document
+
+
+def checked_ready(line: bytes, sources: list[dict[str, str]]) -> int:
+    """Return the relay port, or raise ValueError when the ready line is not exact."""
+    try:
+        ready = json.loads(line.decode("utf-8"), object_pairs_hook=unique_object)
+    except (UnicodeDecodeError, ValueError) as error:
+        raise ValueError(f"ready line is not JSON: {error}")
+    if not isinstance(ready, dict) or set(ready) != {"event", "host", "port", "base_url", "sources"}:
+        raise ValueError("ready line does not hold exactly the ready fields")
+    port = ready["port"]
+    if ready["event"] != "ready" or ready["host"] != "127.0.0.1":
+        raise ValueError("ready line is not a 127.0.0.1 ready event")
+    if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65_535:
+        raise ValueError("ready port is not a TCP port")
+    if ready["base_url"] != f"http://127.0.0.1:{port}":
+        raise ValueError("ready base_url does not match the port")
+    if ready["sources"] != sources:
+        raise ValueError("relay sources differ from the parent-hashed skills")
+    return port
+
+
+def sandboxed(runtime: list[str], policy: Path, argv: list[str]) -> list[str]:
+    return [*runtime, "--settings", str(policy), "--", *argv]
+
+
+def build_command(runtime: list[str], policy: Path, claude: str, prompt: str,
+                  permission_mode: str = DEFAULT_PERMISSION_MODE) -> list[str]:
+    if permission_mode not in PERMISSION_MODES:
+        raise ValueError(f"permission mode must be one of {', '.join(PERMISSION_MODES)}")
+    return sandboxed(runtime, policy, [
+        claude,
         "--print",
+        "--output-format", "json",
         "--no-session-persistence",
         "--safe-mode",
         "--restricted",
@@ -31,75 +513,563 @@ def build_command(prompt: str) -> list[str]:
         "--no-chrome",
         "--disable-slash-commands",
         "--setting-sources", "",
-        "--permission-mode", "dontAsk",
+        "--permission-mode", permission_mode,
         "--permission-prompts", "none",
         "--tools", READ_TOOLS,
         "--allowedTools", READ_TOOLS,
         "--disallowedTools", DENIED_TOOLS,
         "--max-turns", "20",
         "--", prompt,
-    ]
+    ])
 
 
-def profile_environment(profile: str, home: Path) -> dict[str, str]:
-    environment = os.environ.copy()
-    for name in GITHUB_CREDENTIAL_VARIABLES:
-        environment.pop(name, None)
-    environment.pop("CLAUDE_CONFIG_DIR", None)
-    if profile == "claude-profile1":
-        environment["CLAUDE_CONFIG_DIR"] = str(
-            home / ".local/share/ai-account-profiles/claude/profile1"
-        )
-    elif profile != "claude-profile2":
-        raise ValueError(f"unsupported profile: {profile}")
-    return environment
+def prepare_run(run_dir: Path, policy: dict) -> Path:
+    run_dir.mkdir(mode=0o700)
+    for name in (*WRITABLE_AREAS, "policy", "result"):
+        (run_dir / name).mkdir(mode=0o700)
+    (run_dir / "home/.claude").mkdir(mode=0o700)
+    policy_file = run_dir / "policy/srt-settings.json"
+    policy_file.write_text(json.dumps(policy, indent=2), encoding="utf-8")
+    policy_file.chmod(0o400)
+    return policy_file
 
 
-def read_prompt(path: Path, worktree: Path) -> str:
-    if path.is_symlink():
-        raise ValueError("prompt must not be a symlink")
-    resolved = path.resolve(strict=True)
-    if not resolved.is_file():
-        raise ValueError("prompt must be a regular file")
-    if not resolved.is_relative_to(worktree):
-        raise ValueError("prompt must be inside the worktree")
-    if resolved.stat().st_size > MAX_PROMPT_BYTES:
-        raise ValueError("prompt is too large")
-    prompt = resolved.read_text(encoding="utf-8")
-    if not prompt.strip() or "\0" in prompt:
-        raise ValueError("prompt must be nonempty UTF-8 text without NUL")
-    return prompt
+class Supervisor:
+    """One monotonic deadline over every process group this parent starts.
+
+    Every process gets its own session, so one killpg reaches it and the
+    descendants that stay in its group. Output is read with select into
+    bounded buffers (self.data); nothing waits without a deadline, cleanup
+    included. A descendant that calls setsid leaves the group and is not
+    reached by cleanup: its pipes are closed on it, but it may keep running.
+    """
+
+    def __init__(self, seconds: float):
+        self.deadline = time.monotonic() + seconds
+        self.processes: list[subprocess.Popen] = []
+        self.failures: list[str] = []
+        self.data: dict[str, bytes] = {"stdout": b"", "stderr": b"",
+                                       "relay stdout": b"", "relay stderr": b""}
+
+    def remaining(self) -> float:
+        return max(0.0, self.deadline - time.monotonic())
+
+    def fail(self, reason: str) -> None:
+        if reason not in self.failures:
+            self.failures.append(reason)
+
+    def start(self, argv: list[str], environment: dict[str, str], cwd: Path) -> subprocess.Popen:
+        if self.remaining() <= 0:
+            raise TimeoutError("deadline passed; no new process is started")
+        process = subprocess.Popen(
+            argv, cwd=cwd, env=environment, stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
+        self.processes.append(process)
+        return process
+
+    def _append(self, name: str, chunk: bytes, limit: int) -> bool:
+        """Add chunk to a stream; False (and a failure) once it passes limit."""
+        self.data[name] += chunk
+        if len(self.data[name]) > limit:
+            self.data[name] = self.data[name][:limit]
+            self.fail(f"output-too-large: {name}")
+            return False
+        return True
+
+    def read_ready(self, relay: subprocess.Popen) -> bytes | None:
+        """The relay's first stdout line, newline included, of at most MAX_READY_BYTES.
+
+        The relay's stderr is drained into its bounded buffer meanwhile.
+        """
+        streams = {relay.stdout.fileno(): "relay stdout", relay.stderr.fileno(): "relay stderr"}
+        while True:
+            remaining = self.remaining()
+            if remaining <= 0:
+                self.fail("timeout")
+                return None
+            ready, _, _ = select.select(list(streams), [], [], remaining)
+            for descriptor in ready:
+                name = streams[descriptor]
+                # One byte at a time on stdout so nothing past the line is consumed.
+                chunk = os.read(descriptor, 1 if name == "relay stdout" else 65_536)
+                if not chunk:
+                    if name == "relay stdout":
+                        self.fail("relay-exited")
+                        return None
+                    del streams[descriptor]
+                    continue
+                if name == "relay stdout":
+                    self.data[name] += chunk
+                    if len(self.data[name]) > MAX_READY_BYTES:
+                        self.fail("relay-ready-too-large")
+                        return None
+                    if chunk == b"\n":
+                        line, self.data[name] = self.data[name], b""
+                        return line
+                elif not self._append(name, chunk, MAX_STDERR_BYTES):
+                    return None
+
+    def run(self, child: subprocess.Popen, relay: subprocess.Popen | None = None) -> int | None:
+        """Wait for child and read its output into self.data; stop on any bound.
+
+        Returns the child's exit code, or None when the supervisor stopped it.
+        The relay must stay alive until cleanup: a relay that exits before the
+        child's pipes close, even at the same moment as the child, fails the run.
+        """
+        streams = {child.stdout.fileno(): ("stdout", MAX_STDOUT_BYTES),
+                   child.stderr.fileno(): ("stderr", MAX_STDERR_BYTES)}
+        if relay is not None:
+            streams[relay.stdout.fileno()] = ("relay stdout", MAX_READY_BYTES)
+            streams[relay.stderr.fileno()] = ("relay stderr", MAX_STDERR_BYTES)
+        child_pipes = {child.stdout.fileno(), child.stderr.fileno()}
+        exited_at = None
+        while True:
+            if relay is not None and relay.poll() is not None:
+                self.fail("relay-exited")
+                return None
+            if exited_at is None and child.poll() is not None:
+                exited_at = time.monotonic()
+            if exited_at is not None and not child_pipes & streams.keys():
+                return child.returncode
+            if exited_at is not None and time.monotonic() - exited_at > EXIT_GRACE_SECONDS:
+                self.fail("child-pipes-held-open")
+                return None
+            remaining = self.remaining()
+            if remaining <= 0:
+                self.fail("timeout")
+                return None
+            ready, _, _ = select.select(list(streams), [], [], min(remaining, 0.1))
+            for descriptor in ready:
+                name, limit = streams[descriptor]
+                chunk = os.read(descriptor, 65_536)
+                if not chunk:
+                    del streams[descriptor]
+                elif not self._append(name, chunk, limit):
+                    return None
+
+    def cleanup(self) -> None:
+        """Kill every group, reap within CLEANUP_SECONDS, and record survivors.
+
+        Killed descendants may linger briefly as zombies of launchd, so a group
+        counts as surviving only if it still exists when the cleanup time is up.
+        """
+        for process in self.processes:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+        until = time.monotonic() + CLEANUP_SECONDS
+        for process in self.processes:
+            try:
+                process.wait(timeout=max(0.0, until - time.monotonic()))
+            except subprocess.TimeoutExpired:
+                self.fail(f"process-not-reaped: {process.pid}")
+            for stream in (process.stdout, process.stderr):
+                if stream is not None:
+                    stream.close()
+        for process in self.processes:
+            while True:
+                try:
+                    os.killpg(process.pid, 0)
+                except ProcessLookupError:
+                    break
+                except PermissionError:
+                    pass
+                if time.monotonic() >= until:
+                    self.fail(f"process-group-survived: {process.pid}")
+                    break
+                time.sleep(0.05)
 
 
-def checked_worktree() -> Path:
-    cwd = Path.cwd().resolve(strict=True)
-    result = subprocess.run(
-        ["git", "rev-parse", "--show-toplevel"],
-        cwd=cwd, stdin=subprocess.DEVNULL,
-        capture_output=True, text=True, check=True,
-    )
-    if Path(result.stdout.strip()).resolve(strict=True) != cwd:
-        raise ValueError("start the worker at the worktree root")
-    return cwd
+def text(data: bytes) -> str:
+    return data.decode("utf-8", errors="replace")
+
+
+def launch(command: list[str], environment: dict[str, str], cwd: Path,
+           timeout: float) -> tuple[int | None, str, str]:
+    """Run one child under a Supervisor without a relay.
+
+    The exit code is None when the supervisor stopped the child; the reason is
+    only in Supervisor.failures, so the CLI uses run_research instead.
+    """
+    supervisor = Supervisor(timeout)
+    try:
+        exit_code = supervisor.run(supervisor.start(command, environment, cwd))
+    finally:
+        supervisor.cleanup()
+    if supervisor.failures:
+        exit_code = None
+    return exit_code, text(supervisor.data["stdout"]), text(supervisor.data["stderr"])
+
+
+def parent_path_problems(run_dir: Path) -> list[str]:
+    """The parent-only paths must still be what prepare_run created."""
+    expected = {run_dir: "dir", run_dir / "result": "dir",
+                run_dir / "policy": "dir", run_dir / "policy/srt-settings.json": "file"}
+    problems = []
+    for path, kind in expected.items():
+        if path.is_symlink() or path.resolve() != path:
+            problems.append(f"parent path moved: {path}")
+        elif not (path.is_dir() if kind == "dir" else path.is_file()):
+            problems.append(f"parent path is not a {kind}: {path}")
+    if not problems and any((run_dir / "result").iterdir()):
+        problems.append("result directory is not empty")
+    return problems
+
+
+def area_problems(run_dir: Path) -> list[str]:
+    problems = []
+    for name in WRITABLE_AREAS:
+        area = run_dir / name
+        if area.is_symlink() or not area.is_dir() or area.resolve() != area:
+            problems.append(f"writable area {name} is not the created directory")
+            continue
+        for current, directories, files in os.walk(area):
+            for entry in directories + files:
+                path = Path(current) / entry
+                if path.is_symlink():
+                    problems.append(f"symlink in {name}: {path.relative_to(run_dir)}")
+                elif not path.resolve().is_relative_to(area):
+                    problems.append(f"path escape in {name}: {path.relative_to(run_dir)}")
+                elif name == "output" and not (path.is_file() or path.is_dir()):
+                    problems.append(f"special file in output: {path.relative_to(run_dir)}")
+    return problems
+
+
+class ExposureScan:
+    """Look for the exact credential value in names and regular files under the
+    writable areas, within EXPOSURE_MAX_FILES / _BYTES / _SECONDS.
+
+    Past a bound the scan stops and counts as incomplete, which fails the run
+    like an exposure. Links are not followed; special files are not read.
+    """
+
+    def __init__(self, value: str):
+        self.needle = value.encode()
+        self.files = self.bytes = 0
+        self.until = time.monotonic() + EXPOSURE_SECONDS
+
+    def bound(self) -> str | None:
+        if self.files > EXPOSURE_MAX_FILES:
+            return "files"
+        if self.bytes > EXPOSURE_MAX_BYTES:
+            return "bytes"
+        if time.monotonic() > self.until:
+            return "time"
+        return None
+
+    def file_holds(self, path: Path) -> bool:
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        try:
+            if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+                return False
+            tail = b""
+            while chunk := os.read(descriptor, 1024 * 1024):
+                self.bytes += len(chunk)
+                if self.needle in tail + chunk:
+                    return True
+                if self.bound():
+                    return False
+                tail = (tail + chunk)[-(len(self.needle) - 1):]
+            return False
+        finally:
+            os.close(descriptor)
+
+    def area(self, area: Path) -> str | None:
+        """"exposed", "incomplete: <bound>", or None when the area is clean."""
+        value = self.needle.decode()
+        # Without onerror, os.walk skips a directory it cannot list and the
+        # area would look clean; any listing error makes the scan incomplete.
+        errors: list[OSError] = []
+        for current, directories, files in os.walk(area, onerror=errors.append):
+            if errors:
+                return "incomplete: unreadable"
+            for entry in directories + files:
+                self.files += 1
+                path = Path(current) / entry
+                try:
+                    if value in entry or (entry in files and not path.is_symlink()
+                                          and self.file_holds(path)):
+                        return "exposed"
+                except OSError:
+                    return "incomplete: unreadable"
+                if reason := self.bound():
+                    return f"incomplete: {reason}"
+        return "incomplete: unreadable" if errors else None
+
+
+def exposure_problems(run_dir: Path, credential: Credential,
+                      streams: dict[str, str]) -> list[str]:
+    """Where the exact credential value shows up: a stream, or a name or
+    regular file under a writable area. Only the location is reported.
+
+    Only the exact value is matched. Encoded, split or transformed copies
+    (base64, escapes, reversed) are not found; see the docs for the limits.
+    """
+    value = credential.reveal()
+    problems = [f"credential-exposed: {name}" for name, data in streams.items()
+                if value in data]
+    scan = ExposureScan(value)
+    for name in WRITABLE_AREAS:
+        area = run_dir / name
+        if area.is_symlink() or not area.is_dir():
+            continue
+        found = scan.area(area)
+        if found == "exposed":
+            problems.append(f"credential-exposed: {name}")
+        elif found is not None:
+            problems.append(f"credential-scan-{found.replace(': ', ': ' + name + ' ')}")
+            break
+    return problems
+
+
+def require_profile(credential: Credential | None, profile: str) -> None:
+    """Blocked when the credential was loaded for another profile."""
+    if credential is not None and credential.profile != profile:
+        raise Blocked(f"credential is bound to {credential.profile}, not {profile}")
+
+
+def result_problems(exit_code: int | None, stdout: str) -> tuple[list[str], str | None]:
+    if exit_code is None:
+        return ["no exit code: the supervisor stopped the child"], None
+    problems = [] if exit_code == 0 else [f"exit code {exit_code}"]
+    try:
+        result = json.loads(stdout)
+    except json.JSONDecodeError:
+        return problems + ["stdout is not a JSON result"], None
+    if not isinstance(result, dict) or result.get("type") != "result":
+        return problems + ["stdout is not a result object"], None
+    if result.get("subtype") != "success" or result.get("is_error") is not False:
+        problems.append("result is not a success")
+    denials = result.get("permission_denials")
+    if not isinstance(denials, list) or denials:
+        problems.append("permission_denials is missing or nonempty")
+    text = result.get("result")
+    if not isinstance(text, str) or not text.strip():
+        problems.append("result text is empty")
+        text = None
+    return problems, text
+
+
+def collect(run_dir: Path, profile: str, exit_code: int | None,
+            stdout: str, stderr: str, failures: list[str] = (),
+            relay: dict | None = None, credential: Credential | None = None,
+            permission_mode: str | None = None) -> bool:
+    """Record the outcome. The report is data: it is never executed here.
+
+    failures are the supervisor's reasons (timeout, output bound, relay
+    ready or exit, cleanup); any one of them fails the run. With a credential,
+    a stream or writable-area file holding its exact value fails the run and
+    no stream file or report is written; the manifest is written only if it
+    does not hold the value either.
+    """
+    moved = parent_path_problems(run_dir)
+    if moved:
+        print("OSS research worker result not recorded: " + "; ".join(moved),
+              file=sys.stderr)
+        return False
+    result_dir = run_dir / "result"
+    relay_stderr = relay.pop("stderr", "") if relay is not None else None
+    problems, report_text = result_problems(exit_code, stdout)
+    exposed = []
+    if credential is not None:
+        streams = {"stdout": stdout, "stderr": stderr, "report": report_text or ""}
+        try:
+            # JSON escapes (\uXXXX) would hide the value from the raw check.
+            streams["stdout json"] = json.dumps(json.loads(stdout), ensure_ascii=False)
+        except (ValueError, RecursionError):
+            pass
+        if relay_stderr is not None:
+            streams["relay stderr"] = relay_stderr
+        exposed = exposure_problems(run_dir, credential, streams)
+    if not exposed:
+        (result_dir / "stdout.json").write_text(stdout, encoding="utf-8")
+        (result_dir / "stderr.log").write_text(stderr, encoding="utf-8")
+        if relay_stderr is not None:
+            (result_dir / "relay.log").write_text(relay_stderr, encoding="utf-8")
+    problems = exposed + list(failures) + problems + area_problems(run_dir)
+    if credential is not None:
+        # A path in a problem may itself hold the value; keep only the fact.
+        problems = [item if credential.reveal() not in item
+                    else "credential-exposed: problem text" for item in problems]
+        failures = [item if credential.reveal() not in item
+                    else "credential-exposed: failure text" for item in failures]
+    manifest = {
+        "status": "failed" if problems else "succeeded",
+        "profile": profile,
+        "exit_code": exit_code,
+        "failures": list(failures),
+        "problems": problems,
+        "policy_sha256": hashlib.sha256(
+            (run_dir / "policy/srt-settings.json").read_bytes()).hexdigest(),
+    }
+    if permission_mode is not None:
+        manifest["permission_mode"] = permission_mode
+    if credential is not None:
+        manifest["credential"] = {"variable": CREDENTIAL_VARIABLE,
+                                  "exact_value_check": "failed" if exposed else "clean"}
+    if relay is not None:
+        manifest["relay"] = relay
+    if not problems:
+        report = result_dir / "report.md"
+        report.write_text(report_text, encoding="utf-8")
+        report.chmod(0o444)
+        manifest["report_sha256"] = hashlib.sha256(report.read_bytes()).hexdigest()
+    document = json.dumps(manifest, indent=2)
+    if credential is not None and credential.reveal() in document:
+        print("OSS research worker result not recorded: manifest would hold the credential",
+              file=sys.stderr)
+        return False
+    (result_dir / "manifest.json").write_text(document, encoding="utf-8")
+    return not problems
+
+
+def run_supervised(input_dir: Path, run_dir: Path, profile: str, seconds: float,
+                   relay: RelayLaunch | None, policy_for, command_for,
+                   environment: dict[str, str], credential: Credential | None = None,
+                   permission_mode: str | None = None) -> bool:
+    """Start the relay (if any) and the sandboxed child under one deadline.
+
+    policy_for(port) builds the policy once the relay's ready line checked out
+    (port is None without a relay or when it failed); command_for(policy_file)
+    builds the sandboxed child argv. Both groups are killed on every exit. A
+    start failure is recorded in the manifest; an OSError from prepare_run
+    (the run directory itself) propagates, since no manifest can be trusted then.
+    A credential loaded for another profile is Blocked before any directory,
+    process or value use. A credential is refused anywhere but the child's environment: in the relay's
+    argv or environment, or in the child's argv, nothing of that process starts.
+    """
+    require_profile(credential, profile)
+    supervisor = Supervisor(seconds)
+    port, relay_record, relay_process, exit_code = None, None, None, None
+    value = credential.reveal() if credential is not None else None
+
+    def holds(strings) -> bool:
+        return value is not None and any(value in item for item in strings)
+
+    try:
+        if relay is not None:
+            relay_record = {"sources": relay.sources, "relay_sha256": relay.relay_sha256,
+                            "port": None}
+            if holds([*relay.argv, *relay.environment, *relay.environment.values()]):
+                supervisor.fail("credential-in-relay")
+            else:
+                try:
+                    relay_process = supervisor.start(relay.argv, relay.environment, input_dir)
+                except TimeoutError:
+                    supervisor.fail("timeout")
+                except OSError as error:
+                    supervisor.fail(f"relay-not-started: {type(error).__name__}")
+            line = supervisor.read_ready(relay_process) if relay_process else None
+            if line is not None:
+                try:
+                    port = checked_ready(line, relay.sources)
+                except ValueError as error:
+                    supervisor.fail(f"relay-not-ready: {error}")
+            relay_record["port"] = port
+        policy_file = prepare_run(run_dir, policy_for(port))
+        command = command_for(policy_file)
+        if holds(command):
+            supervisor.fail("credential-in-argv")
+        if not supervisor.failures:
+            try:
+                child = supervisor.start(command, environment, input_dir)
+            except TimeoutError:
+                supervisor.fail("timeout")
+            except OSError as error:
+                supervisor.fail(f"child-not-started: {type(error).__name__}")
+            else:
+                exit_code = supervisor.run(child, relay_process)
+    finally:
+        supervisor.cleanup()
+    if relay_record is not None:
+        relay_record["stderr"] = text(supervisor.data["relay stderr"])
+    if supervisor.failures:
+        exit_code = None
+    return collect(run_dir, profile, exit_code, text(supervisor.data["stdout"]),
+                   text(supervisor.data["stderr"]), supervisor.failures, relay_record,
+                   credential, permission_mode)
+
+
+def run_research(runtime: list[str], claude: str, prompt: str, input_dir: Path,
+                 run_dir: Path, profile: str, seconds: float,
+                 relay: RelayLaunch | None, parent: dict[str, str],
+                 permission_mode: str = DEFAULT_PERMISSION_MODE,
+                 credential: Credential | None = None) -> bool:
+    """The Claude run: model endpoint plus the relay port once it is ready.
+
+    Reached only past require_runtime, which is closed; tests call it directly.
+    A credential of another profile is Blocked before anything is built.
+    """
+    require_profile(credential, profile)
+    return run_supervised(
+        input_dir, run_dir, profile, seconds, relay,
+        lambda port: build_policy(input_dir, run_dir, Path(claude), port),
+        lambda policy_file: build_command(runtime, policy_file, claude, prompt,
+                                          permission_mode),
+        build_environment(parent, run_dir, credential), credential, permission_mode)
+
+
+def positive_seconds(value: str) -> float:
+    seconds = float(value)
+    if not math.isfinite(seconds) or seconds <= 0:
+        raise argparse.ArgumentTypeError("timeout must be a positive finite number")
+    return seconds
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--profile", required=True,
-                        choices=("claude-profile1", "claude-profile2"))
+    parser.add_argument("--profile", required=True, choices=PROFILES)
+    parser.add_argument("--input-dir", required=True, type=Path)
     parser.add_argument("--prompt-file", required=True, type=Path)
+    parser.add_argument("--run-dir", required=True, type=Path)
+    parser.add_argument("--runtime-prefix", type=Path,
+                        help=f"local npm prefix holding {SRT_PACKAGE}@{SRT_VERSION}")
+    parser.add_argument("--credential-file", type=Path,
+                        help=f"<dir>/<profile>/{CREDENTIAL_NAME} made by the user")
+    parser.add_argument("--permission-mode", choices=PERMISSION_MODES,
+                        default=DEFAULT_PERMISSION_MODE,
+                        help="Claude permission mode for the child; auto only changes "
+                             "this argument and is not measured")
+    parser.add_argument("--timeout", type=positive_seconds,
+                        default=DEFAULT_TIMEOUT_SECONDS,
+                        help="one wall-clock limit over the relay and the child")
+    parser.add_argument("--relay-repo", action="append", default=[],
+                        help="OWNER/NAME the read-only relay may read; repeat for more. "
+                             "Without it no relay starts")
+    parser.add_argument("--relay-request-budget", type=int, default=100)
+    parser.add_argument("--relay-max-response-bytes", type=int, default=4 * 1024 * 1024)
+    parser.add_argument("--relay-response-byte-budget", type=int, default=64 * 1024 * 1024)
+    parser.add_argument("--relay-timeout-seconds", type=float, default=30.0)
     arguments = parser.parse_args()
     try:
-        worktree = checked_worktree()
-        prompt = read_prompt(arguments.prompt_file, worktree)
-        environment = profile_environment(arguments.profile, Path.home())
-        return subprocess.run(
-            build_command(prompt), cwd=worktree, env=environment,
-            stdin=subprocess.DEVNULL, check=False,
-        ).returncode
-    except (OSError, UnicodeError, subprocess.SubprocessError, ValueError) as error:
+        input_dir, prompt = checked_input(
+            arguments.input_dir, arguments.prompt_file, Path.home())
+        run_dir = checked_run_dir(arguments.run_dir, input_dir)
+        relay_request = checked_relay_request(
+            arguments.relay_repo, arguments.relay_request_budget,
+            arguments.relay_max_response_bytes, arguments.relay_response_byte_budget,
+            arguments.relay_timeout_seconds) if arguments.relay_repo else None
+    except (OSError, UnicodeError, ValueError) as error:
         print(f"OSS research worker did not start: {error}", file=sys.stderr)
-        return 2
+        return EXIT_BAD_INPUT
+    try:
+        runtime, claude, credential = require_runtime(
+            arguments.profile, arguments.runtime_prefix, os.environ.get("PATH"),
+            arguments.credential_file, (input_dir, run_dir))
+        relay = relay_launch(relay_request, dict(os.environ)) if relay_request else None
+    except (Blocked, OSError) as error:
+        print(f"OSS research worker blocked: {error}", file=sys.stderr)
+        return EXIT_BLOCKED
+    try:
+        succeeded = run_research(runtime, claude, prompt, input_dir, run_dir, arguments.profile,
+                                 arguments.timeout, relay, dict(os.environ),
+                                 arguments.permission_mode, credential)
+    except (OSError, subprocess.SubprocessError) as error:
+        print(f"OSS research worker failed: {error}", file=sys.stderr)
+        return EXIT_FAILED
+    print(run_dir / "result/manifest.json")
+    return 0 if succeeded else EXIT_FAILED
 
 
 if __name__ == "__main__":

@@ -749,6 +749,22 @@ class CommandLineTests(unittest.TestCase):
             self.assertEqual((response.status, document["error"]), (400, "query_not_allowed"))
             self.assertNotIn("sources", document)
 
+    def test_server_bind_does_no_reverse_lookup(self):
+        # HTTPServer.server_bind would call socket.getfqdn(127.0.0.1); a slow
+        # resolver then holds the ready line back past the worker's deadline.
+        args = relay_module.build_parser().parse_args([
+            "--repo", "octo/demo", "--request-budget", "5", "--max-response-bytes", "1000",
+            "--response-byte-budget", "10000", "--timeout-seconds", "5",
+        ])
+        refused = AssertionError("no resolver lookup while binding")
+        with mock.patch.object(socket, "getfqdn", side_effect=refused), \
+                mock.patch.object(socket, "gethostbyaddr", side_effect=refused):
+            server = relay_module.build_server(args, opener=None, issues_module=issues_module)
+        self.addCleanup(server.server_close)
+        port = server.socket.getsockname()[1]
+        self.assertEqual(server.server_address, ("127.0.0.1", port))
+        self.assertEqual((server.server_name, server.server_port), ("127.0.0.1", port))
+
     def test_missing_installed_skills_fail_closed(self):
         (Path(self.temporary.name) / ".codex/skills").unlink()
         result = self.run_relay("--repo", "octo/demo", "--request-budget", "5", "--max-response-bytes", "1000",

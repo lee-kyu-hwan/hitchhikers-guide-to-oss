@@ -1,0 +1,8 @@
+{
+  "name": "oss-research-srt-runtime",
+  "private": true,
+  "description": "Pinned sandbox runtime install for oss-research-worker. Reproduce with npm ci --ignore-scripts.",
+  "dependencies": {
+    "@anthropic-ai/sandbox-runtime": "0.0.77"
+  }
+}
