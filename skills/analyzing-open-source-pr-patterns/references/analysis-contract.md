@@ -108,7 +108,7 @@ Create a pattern only for genuinely recurring behavior, and state both applicabi
 
 - `evidence_pr_ids` cites at least two distinct PR-* IDs of analyzed records. Behavior seen in one PR stays an observation in the extraction artifacts.
 - `confidence.evidence` contains at least one quote entry `PR-<id> "<verbatim text>"` for every evidence PR, and quote entries cite only evidence PRs. Other evidence strings are free text.
-- A quote is 20–300 characters and sits inside one source text of that record: title, body, diff excerpt, commit message, discussion excerpt, or linked issue of the PR's own repository. HTML comments are dropped and whitespace is collapsed before comparison, and nothing else is normalized.
+- A quote is 20–300 characters and sits inside one source text of that record: title, body, diff excerpt, commit message, discussion excerpt, or linked issue of the PR's own repository or of a repository passed with `--reference-repo`. HTML comments are dropped and whitespace is collapsed before comparison, and nothing else is normalized.
 - Each evidence record lists the pattern in `analysis.pattern_ids`. A record lists a current pattern only when it is that pattern's evidence, and never lists an unknown pattern.
 
 Only an existing pattern may be superseded, and `superseded_by` names a current pattern in the same output. Superseded patterns keep their history and are exempt from these rules.

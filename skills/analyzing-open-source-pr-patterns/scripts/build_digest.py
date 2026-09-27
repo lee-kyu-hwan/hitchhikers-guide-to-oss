@@ -27,8 +27,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from validate_corpus import (  # noqa: E402
     DISCUSSION_CATEGORIES,
     HTML_COMMENT,
+    ReferenceRepositoryError,
+    _linked_issues,
     _validate_document,
-    own_repository_issues,
+    issue_repository,
+    linked_issue_scope,
+    linked_issue_visibility,
+    normalize_reference_repositories,
 )
 
 DEFAULT_MAX_BYTES = 160_000
@@ -41,6 +46,7 @@ DISCUSSION_ITEMS = 30
 # Cross-reference events, and linked issues outside the PR's repository (the
 # collector derives them from cross-references), are left out: authenticated
 # snapshots can reach private repositories, and the digest is sent to model services.
+# Only repositories named with --reference-repo add their linked issues back.
 TIMELINE_EXCERPT_KINDS = ("closed", "merged", "reopened", "labeled")
 TIMELINE_LIMIT = 200
 LINKED_ISSUE_LIMIT = 600
@@ -135,7 +141,7 @@ def _indent(text, prefix="  "):
     return prefix + text.replace("\n", "\n" + prefix)
 
 
-def render_section(key, record):
+def render_section(key, record, reference_repositories=()):
     pull_request = record.get("pull_request") if isinstance(record.get("pull_request"), dict) else {}
     snapshot = record.get("evidence_snapshot") if isinstance(record.get("evidence_snapshot"), dict) else {}
     full_name, _ = _repository_and_number(record)
@@ -206,19 +212,83 @@ def render_section(key, record):
                 "- " + str(event.get("kind")) + " [" + str(event.get("author")) + "] "
                 + _indent(text, "    ").lstrip()
             )
-    issues = own_repository_issues(record)
+    issues = [
+        (issue, linked_issue_scope(record, issue, reference_repositories))
+        for issue in _linked_issues(record)
+    ]
+    issues = [(issue, scope) for issue, scope in issues if scope is not None]
+    private = 0
     if issues:
         lines.append("linked_issues:")
-        for issue in issues:
+        for issue, scope in issues:
             title = excerpt(issue.get("title"), 300).replace("\n", " ")
-            lines.append("- #" + str(issue.get("number")) + " " + title)
+            if scope == "own":
+                lines.append("- #" + str(issue.get("number")) + " " + title)
+            else:
+                # Own-repository issues keep their original line; reference
+                # issues name their repository and carry their visibility.
+                visibility = linked_issue_visibility(record, issue)
+                private += visibility == "private"
+                marker = {"private": " [private]", "unknown": " [visibility unknown]"}.get(visibility, "")
+                lines.append(
+                    "- " + issue_repository(issue["url"]) + "#" + str(issue.get("number")) + " " + title + marker
+                )
             body = excerpt(issue.get("body_excerpt"), LINKED_ISSUE_LIMIT)
             if body:
                 lines.append(_indent(body))
+        if private:
+            lines.append("private_references: " + str(private))
     partial = snapshot.get("partial_categories")
     if partial:
         lines.append("partial_categories: " + json.dumps(partial, ensure_ascii=False))
     return "\n".join(lines)
+
+
+def reference_manifest(records, reference_repositories):
+    """Allowlist and what it actually let into the digest, for keymap.json and the ledger."""
+    included, reference_issues, excluded = set(), 0, 0
+    visibility = {"private": 0, "public": 0, "unknown": 0}
+    for record in records:
+        for issue in _linked_issues(record):
+            scope = linked_issue_scope(record, issue, reference_repositories)
+            if scope is None:
+                excluded += 1
+            elif scope == "reference":
+                reference_issues += 1
+                included.add(issue_repository(issue["url"]))
+                visibility[linked_issue_visibility(record, issue)] += 1
+    limitations = [
+        "reference repositories allowed by --reference-repo: "
+        + (", ".join(reference_repositories) if reference_repositories else "none")
+        + "; corpus content and model answers never extend the list"
+    ]
+    if excluded:
+        limitations.append(
+            str(excluded) + " linked issues outside each PR's repository and the reference list were left out"
+            " of the digest and quotable text; their snapshots stay in the local corpus"
+        )
+    unused = [name for name in reference_repositories if name not in included]
+    if unused:
+        limitations.append("allowed reference repositories with no linked issue in the corpus: " + ", ".join(unused))
+    if visibility["private"]:
+        limitations.append(
+            str(visibility["private"]) + " digested reference issues are private in the snapshot;"
+            " the digest marks them [private] and they are sent with the prompts"
+        )
+    if visibility["unknown"]:
+        limitations.append(
+            str(visibility["unknown"]) + " digested reference issues have unknown visibility"
+            " (no repository.private in the snapshot); they are not assumed public"
+        )
+    return {
+        "allowed": list(reference_repositories),
+        "included": sorted(included),
+        "reference_issues": reference_issues,
+        "excluded_linked_issues": excluded,
+        "private_references": visibility["private"],
+        "unknown_visibility_references": visibility["unknown"],
+        "limitations": limitations,
+    }
 
 
 def _interleave_by_repository(keys, records):
@@ -254,7 +324,11 @@ def plan_shards(keys, records, sections, max_bytes):
     return shards
 
 
-def build(corpus_path, out_dir, max_bytes=DEFAULT_MAX_BYTES):
+def build(corpus_path, out_dir, max_bytes=DEFAULT_MAX_BYTES, reference_repositories=()):
+    try:
+        reference_repositories = normalize_reference_repositories(reference_repositories)
+    except ReferenceRepositoryError as error:
+        raise DigestError(str(error))
     try:
         corpus = json.loads(Path(corpus_path).read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
@@ -266,7 +340,10 @@ def build(corpus_path, out_dir, max_bytes=DEFAULT_MAX_BYTES):
     if not records:
         raise DigestError("corpus has no records to digest")
     keys = section_keys(records)
-    sections = {key: render_section(key, record) for key, record in zip(keys, records)}
+    sections = {
+        key: render_section(key, record, reference_repositories) for key, record in zip(keys, records)
+    }
+    references = reference_manifest(records, reference_repositories)
     shards = plan_shards(keys, records, sections, max_bytes)
 
     out_dir = Path(out_dir)
@@ -289,6 +366,7 @@ def build(corpus_path, out_dir, max_bytes=DEFAULT_MAX_BYTES):
         "max_bytes": max_bytes,
         "section_regex": "^### (\\S+) — ",
         "shards": names,
+        "reference_repositories": references,
         "sections": {},
     }
     for key, record in zip(keys, records):
@@ -311,6 +389,7 @@ def build(corpus_path, out_dir, max_bytes=DEFAULT_MAX_BYTES):
         "bytes": sum(shard["bytes"] for shard in summary_shards),
         "max_bytes": max_bytes,
         "shards": summary_shards,
+        "reference_repositories": references,
     }
 
 
@@ -324,11 +403,22 @@ def main(argv=None):
         default=DEFAULT_MAX_BYTES,
         help="largest digest one worker reads (UTF-8 bytes); above it the digest is sharded",
     )
+    parser.add_argument(
+        "--reference-repo",
+        action="append",
+        default=[],
+        metavar="OWNER/REPO",
+        help="repeatable; also digest linked issues of this repository (default: none)",
+    )
     args = parser.parse_args(argv)
     if args.max_bytes <= 0:
         parser.error("--max-bytes must be positive")
     try:
-        summary = build(args.current, args.out, args.max_bytes)
+        reference_repositories = normalize_reference_repositories(args.reference_repo)
+    except ReferenceRepositoryError as error:
+        parser.error(str(error))
+    try:
+        summary = build(args.current, args.out, args.max_bytes, reference_repositories)
     except DigestError as error:
         print(str(error), file=sys.stderr)
         return 2

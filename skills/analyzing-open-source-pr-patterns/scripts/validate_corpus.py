@@ -33,6 +33,9 @@ MAX_QUOTE_LENGTH = 300
 EXTRACTION_LEDGER_PREFIX = "pattern-extraction: "
 HTML_COMMENT = re.compile(r"<!--.*?-->", re.S)
 DISCUSSION_CATEGORIES = ("issue_comments", "reviews", "review_comments", "timeline_events")
+# --reference-repo takes a bare GitHub owner/repo; the issue URL is matched exactly.
+REFERENCE_REPOSITORY = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]{0,38}/[A-Za-z0-9._-]{1,100}")
+ISSUE_URL = re.compile(r"https://github\.com/([A-Za-z0-9][A-Za-z0-9-]{0,38}/[A-Za-z0-9._-]{1,100})/issues/[1-9][0-9]*")
 OUTPUT_KEYS = {
     "schema_version",
     "generated_by",
@@ -90,33 +93,117 @@ def _dict_items(value):
     return [item for item in value if isinstance(item, dict)] if isinstance(value, list) else []
 
 
-def own_repository_issues(record):
-    """Linked issues in the PR's own repository.
+class ReferenceRepositoryError(ValueError):
+    pass
 
-    The collector derives linked issues from cross-reference events, which can
-    point into private repositories. Only issues of the public PR's own
-    repository are readable or quotable.
+
+def normalize_reference_repositories(values):
+    """Return the --reference-repo values as a sorted tuple of lowercase `owner/repo`.
+
+    Only the command line grants a reference repository. A URL, a host, a path
+    with more or fewer than two parts, or any other character is rejected
+    rather than guessed at, so a lookalike cannot widen the list.
     """
+    normalized = set()
+    for value in values or ():
+        if not isinstance(value, str) or not REFERENCE_REPOSITORY.fullmatch(value):
+            raise ReferenceRepositoryError(
+                "--reference-repo must be owner/repo (letters, digits, '-', '_', '.'): " + repr(value)
+            )
+        if value.split("/")[1] in (".", ".."):
+            raise ReferenceRepositoryError("--reference-repo names no repository: " + repr(value))
+        normalized.add(value.lower())
+    return tuple(sorted(normalized))
+
+
+def issue_repository(url):
+    """The lowercase `owner/repo` of an exact https://github.com issue URL, else None."""
+    match = ISSUE_URL.fullmatch(url) if isinstance(url, str) else None
+    return match.group(1).lower() if match else None
+
+
+def _own_issue_prefix(record):
     pull_request = record.get("pull_request")
     url = pull_request.get("url") if isinstance(pull_request, dict) else None
     if not isinstance(url, str) or "/pull/" not in url:
-        return []
-    prefix = url.split("/pull/", 1)[0].lower() + "/issues/"
+        return None
+    return url.split("/pull/", 1)[0].lower() + "/issues/"
+
+
+def _linked_issues(record):
     snapshot = record.get("evidence_snapshot")
-    issues = _dict_items(snapshot.get("linked_issues")) if isinstance(snapshot, dict) else []
+    return _dict_items(snapshot.get("linked_issues")) if isinstance(snapshot, dict) else []
+
+
+def linked_issue_scope(record, issue, reference_repositories=()):
+    """Return "own", "reference", or None when the linked issue may not be read.
+
+    The issue URL is the only authority. Own-repository issues keep the original
+    prefix rule; a reference issue needs an exact github.com issue URL whose
+    repository is in the already normalized command-line allowlist.
+    """
+    url = issue.get("url")
+    if not isinstance(url, str):
+        return None
+    prefix = _own_issue_prefix(record)
+    if prefix is not None and url.lower().startswith(prefix):
+        return "own"
+    if reference_repositories and issue_repository(url) in reference_repositories:
+        return "reference"
+    return None
+
+
+def allowed_linked_issues(record, reference_repositories=()):
+    """Linked issues that may enter the digest and be quoted.
+
+    The collector derives linked issues from cross-reference events, which can
+    point into private repositories. Only issues of the public PR's own
+    repository, plus issues of repositories named with --reference-repo, are
+    readable or quotable.
+    """
     return [
         issue
-        for issue in issues
-        if isinstance(issue.get("url"), str) and issue["url"].lower().startswith(prefix)
+        for issue in _linked_issues(record)
+        if linked_issue_scope(record, issue, reference_repositories) is not None
     ]
 
 
-def quotable_texts(record):
+def own_repository_issues(record):
+    """Linked issues in the PR's own repository."""
+    return allowed_linked_issues(record)
+
+
+def linked_issue_visibility(record, issue):
+    """Return "private", "public", or "unknown" for a linked issue.
+
+    Visibility comes only from the snapshot: the `repository.private` boolean of
+    the cross-reference timeline source whose issue URL equals the linked issue
+    URL. Any `true` wins; without a boolean the answer is "unknown", never public.
+    """
+    url = issue.get("url")
+    snapshot = record.get("evidence_snapshot")
+    events = _dict_items(snapshot.get("timeline_events")) if isinstance(snapshot, dict) else []
+    observed = set()
+    for event in events:
+        source = event.get("source")
+        source_issue = source.get("issue") if isinstance(source, dict) else None
+        if not isinstance(source_issue, dict) or source_issue.get("html_url") != url:
+            continue
+        repository = source_issue.get("repository")
+        private = repository.get("private") if isinstance(repository, dict) else None
+        if isinstance(private, bool):
+            observed.add(private)
+    if True in observed:
+        return "private"
+    return "public" if observed == {False} else "unknown"
+
+
+def quotable_texts(record, reference_repositories=()):
     """Return the cleaned source texts of a record that a verbatim quote may come from.
 
     A quote must sit inside one of these texts. Digest scaffolding such as keys,
     URLs, state lines, or author markers is not source text, and neither are
-    linked issues outside the PR's own repository.
+    linked issues outside the PR's own repository and the reference allowlist.
     """
     texts = []
     pull_request = record.get("pull_request")
@@ -129,14 +216,16 @@ def quotable_texts(record):
         texts.extend(item.get("message") for item in _dict_items(snapshot.get("commits")))
         for category in DISCUSSION_CATEGORIES:
             texts.extend(item.get("excerpt") for item in _dict_items(snapshot.get(category)))
-        for issue in own_repository_issues(record):
+        for issue in allowed_linked_issues(record, reference_repositories):
             texts.extend((issue.get("title"), issue.get("body_excerpt")))
     return [clean_text(text) for text in texts if _is_nonempty_string(text)]
 
 
-def quote_in_record(record, quote):
+def quote_in_record(record, quote, reference_repositories=()):
     cleaned = clean_text(quote)
-    return bool(cleaned) and any(cleaned in text for text in quotable_texts(record))
+    return bool(cleaned) and any(
+        cleaned in text for text in quotable_texts(record, reference_repositories)
+    )
 
 
 def _record_url(record):
@@ -747,7 +836,7 @@ def _validate_pattern_record(pattern, previous_pattern, generator, revision, pre
                 errors.append(snapshot_prefix + ".conclusion must equal current pattern")
 
 
-def _validate_analysis_output(current, output, existing, revision):
+def _validate_analysis_output(current, output, existing, revision, reference_repositories=()):
     errors = []
     if not _validate_exact_keys(output, OUTPUT_KEYS, "analysis output", errors):
         if not isinstance(output, dict):
@@ -846,7 +935,9 @@ def _validate_analysis_output(current, output, existing, revision):
             errors.append("existing pattern was removed: " + pattern_id)
 
     if isinstance(output_records, list):
-        _validate_pattern_links(output_records, output_patterns, previous_patterns, errors)
+        _validate_pattern_links(
+            output_records, output_patterns, previous_patterns, errors, reference_repositories
+        )
     return errors
 
 
@@ -866,7 +957,9 @@ def _validate_extraction_ledger(limitations, errors):
         )
 
 
-def _validate_pattern_links(output_records, output_patterns, previous_patterns, errors):
+def _validate_pattern_links(
+    output_records, output_patterns, previous_patterns, errors, reference_repositories=()
+):
     """Tie current patterns to analyzed records and their verbatim source text."""
     records_by_pr_id = {}
     for record in output_records:
@@ -915,7 +1008,7 @@ def _validate_pattern_links(output_records, output_patterns, previous_patterns, 
                     + str(MAX_QUOTE_LENGTH)
                     + " characters"
                 )
-            elif not quote_in_record(record, quote):
+            elif not quote_in_record(record, quote, reference_repositories):
                 errors.append(item_prefix + " quote is not verbatim in " + pr_id)
             else:
                 quoted.add(pr_id)
@@ -972,7 +1065,20 @@ def main(argv=None):
     parser.add_argument(
         "--print-revision", action="store_true", help="print the canonical skill revision"
     )
+    parser.add_argument(
+        "--reference-repo",
+        action="append",
+        default=[],
+        metavar="OWNER/REPO",
+        help="repeatable; linked issues of this repository may also be quoted (--analysis-output only)",
+    )
     args = parser.parse_args(argv)
+    try:
+        reference_repositories = normalize_reference_repositories(args.reference_repo)
+    except ReferenceRepositoryError as error:
+        parser.error(str(error))
+    if reference_repositories and not args.analysis_output:
+        parser.error("--reference-repo requires --analysis-output")
 
     if args.print_revision:
         if args.current or args.existing or args.analysis_output or args.existing_analysis:
@@ -1023,7 +1129,7 @@ def main(argv=None):
             else:
                 errors.extend(
                     _validate_analysis_output(
-                        current, output, existing_analysis, revision
+                        current, output, existing_analysis, revision, reference_repositories
                     )
                 )
 

@@ -30,6 +30,8 @@ from validate_corpus import (  # noqa: E402
     MIN_QUOTE_LENGTH,
     _validate_document,
     clean_text,
+    ReferenceRepositoryError,
+    normalize_reference_repositories,
     quote_in_record,
 )
 
@@ -44,7 +46,7 @@ def _walk(value, path="$"):
             yield from _walk(child, path + "[" + str(index) + "]")
 
 
-def _check_quote(records, key, quote):
+def _check_quote(records, key, quote, reference_repositories=()):
     if not isinstance(key, str) or key not in records:
         return "unknown-key"
     cleaned = clean_text(quote) if isinstance(quote, str) else ""
@@ -52,7 +54,7 @@ def _check_quote(records, key, quote):
         return "empty-quote"
     if not MIN_QUOTE_LENGTH <= len(cleaned) <= MAX_QUOTE_LENGTH:
         return "length"
-    if not quote_in_record(records[key], cleaned):
+    if not quote_in_record(records[key], cleaned, reference_repositories):
         return "not-verbatim"
     return None
 
@@ -64,12 +66,12 @@ def _grounding(keys, records):
     return {"prs": with_ids, "repositories": len(repositories), "grounded": len(with_ids) >= 2}
 
 
-def check_result(path, result, records):
+def check_result(path, result, records, reference_repositories=()):
     verified, failures, evidence = {}, [], []
     for location, item in _walk(result):
         if "pr" not in item or "quote" not in item:
             continue
-        reason = _check_quote(records, item["pr"], item["quote"])
+        reason = _check_quote(records, item["pr"], item["quote"], reference_repositories)
         if reason:
             failures.append({"path": location, "pr": item["pr"], "reason": reason,
                              "quote": str(item["quote"])[:200]})
@@ -121,7 +123,18 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("current", help="the corpus the digest was built from")
     parser.add_argument("results", nargs="+", help="worker result JSON files (<prompt>.result.json)")
+    parser.add_argument(
+        "--reference-repo",
+        action="append",
+        default=[],
+        metavar="OWNER/REPO",
+        help="repeatable; the same list the digest was built with",
+    )
     args = parser.parse_args(argv)
+    try:
+        reference_repositories = normalize_reference_repositories(args.reference_repo)
+    except ReferenceRepositoryError as error:
+        parser.error(str(error))
     try:
         corpus = json.loads(Path(args.current).read_text(encoding="utf-8"))
         errors = _validate_document(corpus, "current")
@@ -139,7 +152,7 @@ def main(argv=None):
         except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
             print("result could not be read as JSON: " + path + ": " + str(error), file=sys.stderr)
             return 2
-        report, verified = check_result(path, result, records)
+        report, verified = check_result(path, result, records, reference_repositories)
         files.append(report)
         evidence.extend(verified)
     totals = {

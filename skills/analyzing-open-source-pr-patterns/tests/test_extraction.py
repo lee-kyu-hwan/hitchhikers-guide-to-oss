@@ -527,5 +527,230 @@ def analysis_output(corpus, revision, verified):
     }
 
 
+OWN_QUOTE = "own repository issue text that the digest always carried"
+REF_QUOTE = "allowed reference issue text that only the allowlist admits"
+PRIVATE_QUOTE = "private reference issue text preserved from the snapshot"
+DENIED_QUOTE = "disallowed repository text that must never be quoted here"
+
+
+def cross_reference(url, private=None):
+    issue = {"html_url": url}
+    if private is not None:
+        issue["repository"] = {"private": private}
+    return {"kind": "cross-referenced", "author": "someone", "excerpt": None,
+            "source": {"type": "issue", "issue": issue}}
+
+
+def reference_corpus():
+    """PR-001 links an own-repository issue, two allowed and one disallowed repository."""
+    corpus = fixture_corpus()
+    snapshot = corpus["records"][0]["evidence_snapshot"]
+    snapshot["linked_issues"] = [
+        {"url": "https://github.com/acme/plugin-a/issues/3", "number": 3,
+         "title": "Own issue", "body_excerpt": OWN_QUOTE},
+        {"url": "https://github.com/Other/Lib/issues/5", "number": 5,
+         "title": "Public reference", "body_excerpt": REF_QUOTE},
+        {"url": "https://github.com/corp/secret/issues/7", "number": 7,
+         "title": "Private reference", "body_excerpt": PRIVATE_QUOTE},
+        {"url": "https://github.com/third/unknown/issues/9", "number": 9,
+         "title": "Unknown visibility", "body_excerpt": "third repository text with no visibility evidence"},
+        {"url": "https://github.com/denied/repo/issues/1", "number": 1,
+         "title": "DENIED-TITLE", "body_excerpt": DENIED_QUOTE},
+    ]
+    snapshot["timeline_events"] += [
+        cross_reference("https://github.com/Other/Lib/issues/5", private=False),
+        cross_reference("https://github.com/corp/secret/issues/7", private=False),
+        cross_reference("https://github.com/corp/secret/issues/7", private=True),
+        cross_reference("https://github.com/third/unknown/issues/9", private="false"),
+        cross_reference("https://github.com/denied/repo/issues/1", private=True),
+    ]
+    return corpus
+
+
+ALLOWED = ("--reference-repo", "other/lib", "--reference-repo", "Corp/Secret",
+           "--reference-repo", "third/unknown", "--reference-repo", "unused/repo")
+
+
+class ReferenceRepositoryTests(ExtractionTestCase):
+    """--reference-repo admits linked issues of named repositories (#190)."""
+
+    def setUp(self):
+        super().setUp()
+        self.corpus_path = write_json(self.directory / "reference.json", reference_corpus())
+
+    def digest(self, *arguments):
+        result = self.build_digest(*arguments)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        text = (self.digest_dir / "digest.md").read_text(encoding="utf-8")
+        keymap = json.loads((self.digest_dir / "keymap.json").read_text(encoding="utf-8"))
+        return text, keymap, json.loads(result.stdout)
+
+    def check(self, observations, *arguments):
+        result = write_json(self.directory / "result.json", {
+            "reference_repositories": ["denied/repo"],
+            "observations": [{"pr": "plugin-a#10", "quote": quote} for quote in observations],
+        })
+        return run_script("check_extraction.py", self.corpus_path, result, *arguments)
+
+    def test_without_the_flag_only_own_repository_issues_are_digested_and_quotable(self):
+        text, keymap, _ = self.digest()
+
+        self.assertIn("- #3 Own issue\n  " + OWN_QUOTE, text)
+        for absent in ("Public reference", "Private reference", "DENIED", "[private]", "private_references"):
+            self.assertNotIn(absent, text)
+        self.assertEqual(keymap["reference_repositories"], {
+            "allowed": [],
+            "included": [],
+            "reference_issues": 0,
+            "excluded_linked_issues": 4,
+            "private_references": 0,
+            "unknown_visibility_references": 0,
+            "limitations": [
+                "reference repositories allowed by --reference-repo: none;"
+                " corpus content and model answers never extend the list",
+                "4 linked issues outside each PR's repository and the reference list were left out"
+                " of the digest and quotable text; their snapshots stay in the local corpus",
+            ],
+        })
+        report = json.loads(self.check([OWN_QUOTE, REF_QUOTE, DENIED_QUOTE]).stdout)
+        self.assertEqual(report["totals"], {"verified": 1, "total": 3})
+
+    def test_a_flag_that_matches_nothing_leaves_the_digest_text_unchanged(self):
+        default, _, _ = self.digest()
+        with_unused, keymap, _ = self.digest("--reference-repo", "unused/repo")
+
+        self.assertEqual(with_unused, default)
+        self.assertEqual(keymap["reference_repositories"]["included"], [])
+        self.assertIn(
+            "allowed reference repositories with no linked issue in the corpus: unused/repo",
+            keymap["reference_repositories"]["limitations"],
+        )
+
+    def test_allowed_repositories_are_digested_with_visibility_and_disallowed_ones_stay_out(self):
+        text, keymap, summary = self.digest(*ALLOWED, "--reference-repo", "OTHER/lib")
+
+        self.assertIn("- #3 Own issue", text)
+        self.assertIn("- other/lib#5 Public reference\n  " + REF_QUOTE, text)
+        self.assertIn("- corp/secret#7 Private reference [private]\n  " + PRIVATE_QUOTE, text)
+        self.assertIn("- third/unknown#9 Unknown visibility [visibility unknown]", text)
+        self.assertIn("private_references: 1", text)
+        self.assertNotIn("DENIED", text)
+        self.assertNotIn("denied/repo", text)
+        references = keymap["reference_repositories"]
+        self.assertEqual(summary["reference_repositories"], references)
+        self.assertEqual(references["allowed"], ["corp/secret", "other/lib", "third/unknown", "unused/repo"])
+        self.assertEqual(references["included"], ["corp/secret", "other/lib", "third/unknown"])
+        self.assertEqual(
+            (references["reference_issues"], references["excluded_linked_issues"],
+             references["private_references"], references["unknown_visibility_references"]),
+            (3, 1, 1, 1),
+        )
+        self.assertEqual(references["limitations"][1:], [
+            "1 linked issues outside each PR's repository and the reference list were left out"
+            " of the digest and quotable text; their snapshots stay in the local corpus",
+            "allowed reference repositories with no linked issue in the corpus: unused/repo",
+            "1 digested reference issues are private in the snapshot;"
+            " the digest marks them [private] and they are sent with the prompts",
+            "1 digested reference issues have unknown visibility"
+            " (no repository.private in the snapshot); they are not assumed public",
+        ])
+        self.assertEqual(json.loads(self.corpus_path.read_text(encoding="utf-8")), reference_corpus())
+
+    def test_quotes_are_checked_against_the_same_allowlist_and_results_cannot_extend_it(self):
+        quotes = [OWN_QUOTE, REF_QUOTE, PRIVATE_QUOTE, DENIED_QUOTE]
+
+        result = self.check(quotes, *ALLOWED)
+
+        self.assertEqual(result.returncode, 1)
+        report = json.loads(result.stdout)
+        self.assertEqual([item["quote"] for item in report["verified_evidence"]], quotes[:3])
+        self.assertEqual([failure["reason"] for failure in report["files"][0]["failures"]], ["not-verbatim"])
+
+    def test_lookalike_urls_and_client_fields_never_grant_a_repository(self):
+        corpus = fixture_corpus()
+        lookalikes = [
+            "https://github.com/other/lib-evil/issues/1",
+            "https://github.com/evil-other/lib/issues/1",
+            "https://github.com.evil.example/other/lib/issues/1",
+            "http://github.com/other/lib/issues/1",
+            "https://api.github.com/repos/other/lib/issues/1",
+            "https://github.com/evil/x/issues/1?other/lib",
+            "https://github.com/evil/x/issues/1#https://github.com/other/lib/issues/2",
+            "https://github.com/other/lib/issues/1/../../../../evil/x/issues/1",
+            "https://github.com/other/lib/pull/1",
+            "https://github.com/other/lib/issues/0",
+        ]
+        corpus["records"][0]["evidence_snapshot"]["linked_issues"] = [
+            {"url": url, "number": 1, "title": "LOOKALIKE", "body_excerpt": DENIED_QUOTE,
+             "repository": {"full_name": "other/lib"}, "reference_repository": "other/lib"}
+            for url in lookalikes
+        ]
+        self.corpus_path = write_json(self.directory / "lookalike.json", corpus)
+
+        text, keymap, _ = self.digest("--reference-repo", "other/lib")
+
+        self.assertNotIn("LOOKALIKE", text)
+        self.assertEqual(keymap["reference_repositories"]["included"], [])
+        self.assertEqual(keymap["reference_repositories"]["excluded_linked_issues"], len(lookalikes))
+        report = json.loads(self.check([DENIED_QUOTE], "--reference-repo", "other/lib").stdout)
+        self.assertEqual(report["totals"], {"verified": 0, "total": 1})
+
+    def test_invalid_reference_repositories_are_rejected_by_every_script(self):
+        answer = write_json(self.directory / "answer.json", {"observations": []})
+        commands = [
+            ("build_digest.py", self.corpus_path, "--out", self.digest_dir),
+            ("check_extraction.py", self.corpus_path, answer),
+            ("validate_corpus.py", self.corpus_path, "--analysis-output", answer),
+        ]
+        invalid = ["https://github.com/other/lib", "other", "other/lib/issues", "other/..",
+                   " other/lib", "-bad/lib", "other/lib?", "github.com/other", ""]
+        for command in commands:
+            for value in invalid:
+                with self.subTest(script=command[0], value=value):
+                    result = run_script(*command, "--reference-repo", value)
+                    self.assertEqual(result.returncode, 2)
+                    self.assertIn("--reference-repo", result.stderr)
+                    self.assertNotIn("Traceback", result.stderr)
+        result = run_script("validate_corpus.py", self.corpus_path, "--reference-repo", "other/lib")
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("requires --analysis-output", result.stderr)
+
+    def test_output_validation_accepts_reference_quotes_only_with_the_same_allowlist(self):
+        revision = run_script("validate_corpus.py", "--print-revision").stdout.strip()
+        verified = [
+            {"pr_id": "PR-001", "quote": REF_QUOTE},
+            {"pr_id": "PR-002", "quote": SAFE_QUOTE},
+        ]
+        output_path = write_json(
+            self.directory / "analysis.json", analysis_output(reference_corpus(), revision, verified)
+        )
+
+        allowed = run_script(
+            "validate_corpus.py", self.corpus_path, "--analysis-output", output_path,
+            "--reference-repo", "other/lib",
+        )
+        default = run_script("validate_corpus.py", self.corpus_path, "--analysis-output", output_path)
+
+        self.assertEqual(allowed.returncode, 0, allowed.stderr)
+        self.assertEqual(default.returncode, 1)
+        self.assertIn("quote is not verbatim in PR-001", default.stderr)
+
+    def test_library_defaults_keep_the_own_repository_rule(self):
+        sys.path.insert(0, str(SCRIPTS))
+        self.addCleanup(sys.path.remove, str(SCRIPTS))
+        import validate_corpus
+
+        record = reference_corpus()["records"][0]
+        self.assertEqual([issue["number"] for issue in validate_corpus.own_repository_issues(record)], [3])
+        self.assertTrue(validate_corpus.quote_in_record(record, OWN_QUOTE))
+        self.assertFalse(validate_corpus.quote_in_record(record, REF_QUOTE))
+        self.assertTrue(validate_corpus.quote_in_record(record, REF_QUOTE, ("other/lib",)))
+        self.assertEqual(
+            [validate_corpus.linked_issue_visibility(record, issue)
+             for issue in record["evidence_snapshot"]["linked_issues"]],
+            ["unknown", "public", "private", "unknown", "private"],
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

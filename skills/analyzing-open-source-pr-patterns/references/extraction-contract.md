@@ -17,9 +17,21 @@ Pattern extraction means reading PR text and judging what recurs. Scripts do eve
 
 The output validator used to check only shape, so an envelope serialized with `patterns: []` passed without anyone reading the PRs. It now rejects a current pattern without two distinct evidence PRs and a verbatim quote for each, and an output without the extraction ledger. An empty `patterns` array remains valid only as a recorded outcome of this procedure.
 
-## Digest and split rule
+## Digest
 
-`build_digest.py CURRENT --out DIR` renders one section per PR headed `### <key> — <title>`. The key is `<repository name>#<number>`, or `<owner>/<name>#<number>` when two repositories share a name. It keeps the title, the body up to 1,500 characters, the first 20 non-lockfile diff excerpts up to 900 characters each, commit subject lines, up to 30 items per discussion category at 700 characters each, timeline event counts with closed, merged, reopened, and labeled excerpts, and linked issues of the PR's own repository. Cross-reference events and linked issues from other repositories never enter the digest or count as quotable text: the collector derives linked issues from cross-references, authenticated snapshots can reach private repositories, and the digest leaves the machine whenever a model service answers a prompt. HTML comments are dropped, cuts are marked `…[+N chars]`, and free text is indented so that only section headers start a line with `### `. Keys, `url:`/`repository:`/`state:` lines, file-list headers, author markers, and cut markers are digest scaffolding, not source text, so they can never be quoted.
+`build_digest.py CURRENT --out DIR` renders one section per PR headed `### <key> — <title>`. The key is `<repository name>#<number>`, or `<owner>/<name>#<number>` when two repositories share a name. It keeps the title, the body up to 1,500 characters, the first 20 non-lockfile diff excerpts up to 900 characters each, commit subject lines, up to 30 items per discussion category at 700 characters each, timeline event counts with closed, merged, reopened, and labeled excerpts, and linked issues of the PR's own repository. Cross-reference events and linked issues from other repositories never enter the digest or count as quotable text unless the user names the repository: the collector derives linked issues from cross-references, authenticated snapshots can reach private repositories, and the digest leaves the machine whenever a model service answers a prompt. HTML comments are dropped, cuts are marked `…[+N chars]`, and free text is indented so that only section headers start a line with `### `. Keys, `url:`/`repository:`/`state:` lines, file-list headers, author markers, and cut markers are digest scaffolding, not source text, so they can never be quoted.
+
+## Reference repositories
+
+`--reference-repo OWNER/REPO` is repeatable and empty by default. Each value is a bare GitHub `owner/repo`; URLs, hosts, extra path parts, and other characters are rejected, and names are compared lowercase. A linked issue of a listed repository enters the digest and becomes quotable only when its `url` is exactly `https://github.com/<owner>/<repo>/issues/<number>`; no other field of the issue, the record, or the corpus names its repository, and nothing in the corpus or a worker result adds to the list. Own-repository issues keep their original line `- #<number> <title>`; a reference issue is rendered `- <owner>/<repo>#<number> <title>` with ` [private]` or ` [visibility unknown]` appended, and a section with private reference issues ends its linked issues with `private_references: N`.
+
+Visibility comes only from the snapshot: the `repository.private` boolean of a cross-reference timeline source whose issue URL equals the linked issue URL. Any `true` makes the issue private, only `false` makes it public, and anything else is unknown, never public. A private reference issue the user allowed is kept and sent with the prompts, marked as private.
+
+`keymap.json` and the printed summary carry `reference_repositories`: `allowed` (the normalized list), `included` (listed repositories with at least one digested issue), `reference_issues`, `excluded_linked_issues`, `private_references`, `unknown_visibility_references`, and `limitations`. Copy those limitations into the output `limitations`. The list does not change collection: the local corpus can still hold snapshots of issues in unlisted repositories.
+
+`check_extraction.py` and `validate_corpus.py --analysis-output` take the same `--reference-repo` values as the digest. Without them, a quote from a reference issue fails as `not-verbatim`.
+
+## Split rule
 
 The split criterion is size, never repository or corpus:
 
@@ -45,7 +57,7 @@ A missing executor never skips extraction. Record the executor in the ledger.
 
 ## Checking
 
-`check_extraction.py CURRENT RUN/extract/results/*.result.json` checks every `pr` + `quote` pair against that PR's source text in the corpus, with the same comparison the output validator uses. A quote is 20–300 characters inside one title, body, diff excerpt, commit message, discussion excerpt, or own-repository linked issue after HTML comments are dropped and whitespace is collapsed. Stitched (`...`), reworded, or re-quoted text fails. Exit 1 means some quotes failed. Drop those quotes and never repair them. The report lists, per extraction pattern, the distinct PRs whose supporting quote verified, and per verification, the PRs whose `holds: true` check verified. `verified_evidence` lists every verified quote with its PR-* ID.
+`check_extraction.py CURRENT RUN/extract/results/*.result.json` checks every `pr` + `quote` pair against that PR's source text in the corpus, with the same comparison the output validator uses. A quote is 20–300 characters inside one title, body, diff excerpt, commit message, discussion excerpt, or linked issue of the PR's own or an allowed reference repository after HTML comments are dropped and whitespace is collapsed. Stitched (`...`), reworded, or re-quoted text fails. Exit 1 means some quotes failed. Drop those quotes and never repair them. The report lists, per extraction pattern, the distinct PRs whose supporting quote verified, and per verification, the PRs whose `holds: true` check verified. `verified_evidence` lists every verified quote with its PR-* ID.
 
 ## Candidate synthesis
 
