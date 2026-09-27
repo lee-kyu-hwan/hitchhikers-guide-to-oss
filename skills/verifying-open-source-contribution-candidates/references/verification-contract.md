@@ -5,6 +5,7 @@ This document defines the persisted candidate and verification state. All JSON e
 Every pre-cap repository-pattern combination appears in exactly one of records, skipped_by_cap, or failed_scopes.
 A request-failed policy observation cannot support issue-ready or pr-ready.
 A policy result recorded as unreviewed cannot support a ready status.
+A ready absence claim must match the observed absence, and an AI or CLA/DCO absence needs hand-reviewed evidence for every found file.
 A ready status requires a locus and a completed search repeated at that locus.
 A failed recheck makes an actionable candidate unverified with status_reason insufficient-evidence.
 record and render preserve partial, failed, and unknown run states instead of defaulting them to complete.
@@ -115,6 +116,15 @@ An assessment contains `schema_version`, `discovery_sha256`, and `assessments`. 
 `found` is three-valued and the three values are not interchangeable. `true` means the policy was observed, `false` means it was looked for and is not there, and `null` means it was never reviewed. A ready status — `issue-ready`, `pr-ready`, or `private-report-ready` — requires every key except `program_rules` to be `true` or `false`; a `null` is a gate failure, so a candidate can no longer reach a ready status without any policy observation at all. A `request-failed` observation of a mapped path is likewise a gate failure for those statuses, whether the failure was in the target repository or in `{owner}/.github`.
 
 A `found: true` value needs a non-empty `source` and a `sha256` bound to bytes the run actually holds. Two bindings are accepted. The first is a policy file that discovery fetched, matched by the paths mapped to that key. The second is a hand-reviewed policy supplied to `record` through `--policy-evidence`, a local JSON document `{schema_version, observations}` whose observations have exactly `repository`, `policy_key`, `path`, `source_repository`, `source_url`, and `content_path`. `content_path` must be a local file, never a URL; the script hashes its bytes and only that digest is accepted, only for the named repository and policy key. The observation, its digest, and an untrusted excerpt are recorded in the manifest run inputs. This is the path for a policy that lives outside the ten conventional paths, such as an assistance policy kept in a repository's own documentation tree.
+
+`found` must be exactly a boolean or `null`; numbers such as `0` or `1` are rejected even though they compare equal to booleans.
+
+For a ready status, a `found: false` value is an absence claim bound to observations, and its `sha256` must be `null`. Every path mapped to the key must have a `found` or `absent` observation in the target repository and in `{owner}/.github`; the organization pass is skipped only when the target is `{owner}/.github` itself. A 404 for `{owner}/.github` counts as absent. A missing observation, any other status, or a `request-failed` observation leaves the absence unobserved and fails the gate.
+
+- Path-specific keys (`contributing`, `issue_template`, `pr_template`, `security_policy`, `code_of_conduct`) are absent only when every mapped path is absent. A found file at a mapped path, or a `--policy-evidence` observation naming the key, contradicts the claim and fails the gate.
+- `cla_or_dco` and `ai_policy` are mapped to all ten paths because such a policy can live in any of those documents. File presence therefore neither proves nor refutes them, and the script never infers semantic absence. A ready absence claim requires a `--policy-evidence` observation for the same repository and key that has the same `source_repository`, the same `path`, and a local digest equal to the discovery `sha256` for every found file in the mapped scope. When every mapped path is absent there is nothing that binds the reviewed scope, so the claim fails the gate even with unrelated evidence.
+
+This binding proves which bytes were read and where they came from. It does not prove that the policy is absent: that remains the assessment's own review judgment, recorded in `assessment` and `evidence_links`, and it covers only the conventional paths plus the hand-reviewed files. When the scope is ambiguous, keep the candidate at `policy-review`; non-ready statuses keep accepting unbound `false` values.
 
 Recheck re-observes only the conventional paths. A hand-reviewed digest therefore cannot be reproduced by recheck, and the resulting policy-signature change moves the candidate to `policy-review` rather than silently keeping it ready.
 

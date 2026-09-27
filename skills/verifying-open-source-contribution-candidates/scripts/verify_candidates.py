@@ -272,6 +272,10 @@ POLICY_CHECK_PATHS = {
     "ai_policy": tuple(POLICY_PATHS),
 }
 
+# Keys whose policy may live inside any conventional document, so a file at a
+# mapped path neither proves nor refutes the policy.
+SEMANTIC_POLICY_KEYS = ("cla_or_dco", "ai_policy")
+
 ASSESSMENT_FIELDS = {
     "pattern_id", "repository", "locus", "status", "status_reason",
     "sensitivity", "summary", "impact", "readiness_checks",
@@ -2772,15 +2776,83 @@ def _policy_request_failure_keys(
     }
 
 
+def _policy_absence_violations(
+    key: str,
+    repository: object,
+    policy_files: object,
+    manual_shas: set,
+    manual_observations: set,
+) -> List[str]:
+    """Bind a ready-status ``found: false`` claim to observed absence.
+
+    Every mapped path in the target repository and in ``{owner}/.github`` must
+    have a found or absent observation. A path-specific key is absent only when
+    all of them are absent and no hand-reviewed evidence names the key. A
+    semantic key is never inferred from file presence or absence: each found
+    file must be covered by a hand-reviewed observation with the same source
+    repository, path, and digest, and an all-absent scope stays unproven.
+    """
+    prefix = "policy_checks.%s.found: " % key
+    if not isinstance(repository, str) or not isinstance(policy_files, list):
+        return [prefix + "absence not observed"]
+    owner = repository.split("/", 1)[0]
+    sources = [repository]
+    if owner + "/.github" != repository:
+        sources.append(owner + "/.github")
+    observed = {}  # type: Dict[Tuple[object, object], List[Dict[str, object]]]
+    for item in policy_files:
+        if isinstance(item, dict):
+            observed.setdefault(
+                (item.get("source_repository"), item.get("path")), []
+            ).append(item)
+    violations = set()
+    found_items = []
+    for source in sources:
+        for path in POLICY_CHECK_PATHS[key]:
+            items = observed.get((source, path))
+            if not items:
+                violations.add(prefix + "absence not observed")
+                continue
+            for item in items:
+                if item.get("status") == "absent" and item.get("found") is False:
+                    continue
+                if (
+                    item.get("status") == "found"
+                    and item.get("found") is True
+                    and isinstance(item.get("sha256"), str)
+                ):
+                    found_items.append(item)
+                    continue
+                violations.add(prefix + "absence not observed")
+    if key in SEMANTIC_POLICY_KEYS:
+        if not found_items:
+            violations.add(prefix + "absence not proven by policy evidence")
+        for item in found_items:
+            if (
+                item.get("source_repository"),
+                item.get("path"),
+                item.get("sha256"),
+            ) not in manual_observations:
+                violations.add(prefix + "absence not proven by policy evidence")
+    else:
+        if found_items:
+            violations.add(prefix + "absence contradicted by discovery")
+        if manual_shas:
+            violations.add(prefix + "absence contradicted by policy evidence")
+    return sorted(violations)
+
+
 def _assessment_gate_violations(
     assessment: Dict[str, object],
     discovery_record: Dict[str, object],
     program_rules_sha256: Optional[str],
     manual_policy_shas: Optional[Dict[str, set]] = None,
     locus_search_index: Optional[Dict[Tuple[object, object, object], object]] = None,
+    manual_policy_observations: Optional[Dict[str, set]] = None,
 ) -> List[str]:
     violations = []
     manual_policy_shas = manual_policy_shas or {}
+    manual_policy_observations = manual_policy_observations or {}
     status = assessment.get("status")
     reason = assessment.get("status_reason")
     if status not in STATUS_REASON_TABLE or reason not in STATUS_REASON_TABLE.get(status, ()):
@@ -2924,7 +2996,9 @@ def _assessment_gate_violations(
         if not isinstance(item, dict) or set(item) != {"found", "source", "sha256", "assessment", "evidence_links"}:
             violations.append("policy_checks.%s" % key)
             continue
-        if item.get("found") not in (True, False, None):
+        # Exact bool or null: 0/1/0.0 compare equal to False/True but skip
+        # the identity checks below.
+        if item.get("found") is not None and not isinstance(item.get("found"), bool):
             violations.append("policy_checks.%s.found" % key)
         if item.get("source") is not None and not isinstance(item.get("source"), str):
             violations.append("policy_checks.%s.source" % key)
@@ -2936,6 +3010,22 @@ def _assessment_gate_violations(
             and item.get("found") is None
         ):
             violations.append("policy_checks.%s.found: policy not reviewed" % key)
+        if (
+            status in READY_STATUSES
+            and key != "program_rules"
+            and item.get("found") is False
+        ):
+            if item.get("sha256") is not None:
+                violations.append("policy_checks.%s.sha256" % key)
+            violations.extend(
+                _policy_absence_violations(
+                    key,
+                    discovery_record.get("repository"),
+                    discovery_record.get("policy_files"),
+                    set(manual_policy_shas.get(key, set())),
+                    set(manual_policy_observations.get(key, set())),
+                )
+            )
         if item.get("sha256") is not None and (
             not isinstance(item.get("sha256"), str)
             or re.fullmatch(r"[0-9a-f]{64}", item["sha256"]) is None
@@ -2956,7 +3046,7 @@ def _assessment_gate_violations(
         if program_rules_sha256 is None:
             if program.get("found") is not None:
                 violations.append("policy_checks.program_rules.found")
-        elif program.get("found") not in (True, False):
+        elif not isinstance(program.get("found"), bool):
             violations.append("policy_checks.program_rules.found")
         elif program.get("sha256") != program_rules_sha256:
             violations.append("policy_checks.program_rules.sha256")
@@ -3832,12 +3922,19 @@ def run_record(arguments: argparse.Namespace, *, clock: Callable[[], float]) -> 
             for (repository, key), values in manual_policy_shas.items()
             if repository == assessment.get("repository")
         }
+        repository_policy_observations = {}  # type: Dict[str, set]
+        for entry in policy_evidence_input or []:
+            if entry["repository"] == assessment.get("repository"):
+                repository_policy_observations.setdefault(
+                    entry["policy_key"], set()
+                ).add((entry["source_repository"], entry["path"], entry["sha256"]))
         for violation in _assessment_gate_violations(
             assessment,
             record,
             program_rules_sha256,
             repository_policy_shas,
             locus_search_index,
+            repository_policy_observations,
         ):
             gate_violations.append("assessments[%d].%s" % (index, violation))
     if gate_violations:

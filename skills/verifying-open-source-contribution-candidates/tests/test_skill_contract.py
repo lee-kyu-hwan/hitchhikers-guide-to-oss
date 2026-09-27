@@ -211,6 +211,10 @@ class SkillContractTests(unittest.TestCase):
             "content_path",
             "never means no duplicate exists",
             "missing or incomplete locus search → new locus-search run, then record",
+            "a `found: false` value is an absence claim bound to observations",
+            "the script never infers semantic absence",
+            "It does not prove that the policy is absent",
+            "numbers such as `0` or `1` are rejected",
         ):
             self.assertIn(phrase, contract)
 

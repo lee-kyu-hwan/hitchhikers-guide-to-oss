@@ -48,6 +48,10 @@ POLICY_PATHS = (
     ".github/CODE_OF_CONDUCT.md",
 )
 FIXTURE_TIME = "2000" + "-01-01T00:00:00Z"
+FIXTURE_SEMANTIC_POLICY_TEXT = (
+    "AI-assisted contributions are allowed. "
+    "Every commit requires a DCO sign-off."
+)
 POSITIVE_LOCUS = json.loads(
     (SKILL_DIR / "tests/fixtures/positive/assessment-issue-ready.json").read_text(
         encoding="utf-8"
@@ -400,15 +404,23 @@ def policy_checks_for(record, program_rules=None):
         "pr_template": ".github/PULL_REQUEST_TEMPLATE.md",
         "security_policy": "SECURITY.md",
         "code_of_conduct": "CODE_OF_CONDUCT.md",
+        # discovery_record() writes FIXTURE_SEMANTIC_POLICY_TEXT into this file.
+        "cla_or_dco": "CONTRIBUTING.md",
+        "ai_policy": "CONTRIBUTING.md",
     }
     result = {}
     for key in verify_candidates.POLICY_CHECK_KEYS:
         policy = by_path.get(path_map.get(key, ""))
+        semantic = key in verify_candidates.SEMANTIC_POLICY_KEYS
         result[key] = {
             "found": True if policy is not None else (None if key == "program_rules" else False),
             "source": policy.get("url") if policy is not None else None,
             "sha256": policy.get("sha256") if policy is not None else None,
-            "assessment": "reviewed fixture evidence",
+            "assessment": (
+                "fixture policy text states this policy"
+                if semantic and policy is not None
+                else "reviewed fixture evidence"
+            ),
             "evidence_links": ["https://docs.github.com/policy"] if policy is not None else [],
         }
     if program_rules is not None:
@@ -528,7 +540,11 @@ def discovery_record(repository="example-org/example-repo", pattern_id="PAT-001"
     owner = repository.split("/", 1)[0]
     for source_repository in (repository, owner + "/.github"):
         for policy_path in POLICY_PATHS:
-            content = ("fixture " + source_repository + " " + policy_path).encode("utf-8")
+            text = "fixture " + source_repository + " " + policy_path
+            if source_repository == repository and policy_path == "CONTRIBUTING.md":
+                # Synthetic policy text that the default semantic checks cite.
+                text += "\n" + FIXTURE_SEMANTIC_POLICY_TEXT
+            content = text.encode("utf-8")
             policy_files.append(
                 {
                 "path": policy_path,
@@ -548,7 +564,11 @@ def discovery_record(repository="example-org/example-repo", pattern_id="PAT-001"
                 },
                 "truncated": False,
                 "url": "https://docs.github.com/policy",
-                "keyword_hits": [],
+                "keyword_hits": [
+                    label
+                    for label, pattern in verify_candidates.POLICY_KEYWORD_PATTERNS
+                    if pattern.search(text)
+                ],
                 }
             )
     duplicate_queries = []
@@ -4665,6 +4685,569 @@ class VerifyCandidatesTests(unittest.TestCase):
             self.assertEqual(2, missing_source[0])
             self.assertIn("policy_checks.contributing.source", missing_source[2])
 
+    @staticmethod
+    def absent_claims(record, *keys, sha256=None):
+        checks = policy_checks_for(record)
+        for key in keys:
+            checks[key] = {
+                "found": False,
+                "source": None,
+                "sha256": sha256,
+                "assessment": "claimed absent",
+                "evidence_links": [],
+            }
+        return checks
+
+    @staticmethod
+    def mark_policy_paths(record, paths, sources=None, **fields):
+        for item in record["policy_files"]:
+            if item["path"] in paths and (
+                sources is None or item["source_repository"] in sources
+            ):
+                item.update(
+                    {
+                        "status": "absent",
+                        "found": False,
+                        "sha256": None,
+                        "size": None,
+                        "excerpt": None,
+                        "url": None,
+                        "keyword_hits": [],
+                    }
+                )
+                item.update(fields)
+
+    @staticmethod
+    def write_policy_evidence(root, repository, observations):
+        """Write local policy evidence; observations are (key, source, path, bytes)."""
+        root.mkdir(parents=True, exist_ok=True)
+        entries = []
+        for index, (key, source, path, content) in enumerate(observations):
+            content_path = root / ("policy-%d.txt" % index)
+            content_path.write_bytes(content)
+            entries.append(
+                {
+                    "repository": repository,
+                    "policy_key": key,
+                    "path": path,
+                    "source_repository": source,
+                    "source_url": None,
+                    "content_path": str(content_path),
+                }
+            )
+        evidence = root / "policy-evidence.json"
+        evidence.write_text(
+            json.dumps({"schema_version": "1.0.0", "observations": entries}),
+            encoding="utf-8",
+        )
+        return evidence
+
+    @staticmethod
+    def coverage_for(record, key):
+        return [
+            (key, item["source_repository"], item["path"], item["excerpt"]["text"].encode("utf-8"))
+            for item in record["policy_files"]
+            if item["found"] is True
+        ]
+
+    def test_absence_claim_contradicted_by_discovery_blocks_ready(self):
+        record = discovery_record()
+        security = json.loads(
+            (SKILL_DIR / "tests/fixtures/security/assessments.json").read_text(
+                encoding="utf-8"
+            )
+        )["valid"]
+        private_changes = {
+            "status": security["status"],
+            "status_reason": security["status_reason"],
+            "sensitivity": security["sensitivity"],
+            "private_evidence_reference": security["private_evidence_reference"],
+            "reproduction": {
+                "method": "static",
+                "evidence_links": ["https://docs.github.com/evidence"],
+                "public_steps": None,
+            },
+        }
+        ready_kinds = {
+            "issue-ready": {"status": "issue-ready", "status_reason": "ready"},
+            "pr-ready": {"status": "pr-ready", "status_reason": "ready"},
+            "private-report-ready": private_changes,
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for name, changes in ready_kinds.items():
+                with self.subTest(status=name):
+                    single = self.run_record(
+                        root / name,
+                        [record],
+                        [
+                            assessment_for(
+                                record,
+                                policy_checks=self.absent_claims(record, "contributing"),
+                                **changes
+                            )
+                        ],
+                    )[0]
+                    self.assertEqual(2, single[0], single[2])
+                    self.assertIn(
+                        "policy_checks.contributing.found: absence contradicted by discovery",
+                        single[2],
+                    )
+                    self.assertNotIn("policy_checks.pr_template.found", single[2])
+            path_keys = [
+                key
+                for key in verify_candidates.REVIEWABLE_POLICY_KEYS
+                if key not in verify_candidates.SEMANTIC_POLICY_KEYS
+            ]
+            all_false = self.run_record(
+                root / "all-false",
+                [record],
+                [
+                    assessment_for(
+                        record,
+                        policy_checks=self.absent_claims(
+                            record, *verify_candidates.REVIEWABLE_POLICY_KEYS
+                        ),
+                    )
+                ],
+            )[0]
+            self.assertEqual(2, all_false[0], all_false[2])
+            for key in path_keys:
+                self.assertIn(
+                    "policy_checks.%s.found: absence contradicted by discovery" % key,
+                    all_false[2],
+                )
+            for key in verify_candidates.SEMANTIC_POLICY_KEYS:
+                self.assertIn(
+                    "policy_checks.%s.found: absence not proven by policy evidence" % key,
+                    all_false[2],
+                )
+            kept = self.run_record(
+                root / "policy-review",
+                [record],
+                [
+                    assessment_for(
+                        record,
+                        status="policy-review",
+                        status_reason="policy-unknown",
+                        policy_checks=self.absent_claims(
+                            record, *verify_candidates.REVIEWABLE_POLICY_KEYS
+                        ),
+                    )
+                ],
+            )[0]
+            self.assertEqual(0, kept[0], kept[2])
+            with_sha = self.run_record(
+                root / "sha",
+                [record],
+                [
+                    assessment_for(
+                        record,
+                        policy_checks=self.absent_claims(
+                            record, "contributing", sha256="a" * 64
+                        ),
+                    )
+                ],
+            )[0]
+            self.assertEqual(2, with_sha[0])
+            self.assertIn("policy_checks.contributing.sha256", with_sha[2])
+            unknown = self.absent_claims(record, "contributing")
+            unknown["contributing"]["found"] = "unknown"
+            unknown_result = self.run_record(
+                root / "unknown-claim", [record], [assessment_for(record, policy_checks=unknown)]
+            )[0]
+            self.assertEqual(2, unknown_result[0])
+            self.assertIn("policy_checks.contributing.found", unknown_result[2])
+            # 0/1/0.0 compare equal to False/True; only exact bool or null passes.
+            for value in (0, 1, 0.0, 1.0):
+                with self.subTest(found=value):
+                    numeric = self.absent_claims(record, "contributing", "ai_policy")
+                    numeric["contributing"]["found"] = value
+                    numeric["ai_policy"]["found"] = value
+                    numeric_result = self.run_record(
+                        root / ("numeric-%r" % value),
+                        [record],
+                        [assessment_for(record, policy_checks=numeric)],
+                    )[0]
+                    self.assertEqual(2, numeric_result[0])
+                    self.assertIn(
+                        "assessments[0].policy_checks.contributing.found",
+                        numeric_result[2],
+                    )
+                    self.assertIn(
+                        "assessments[0].policy_checks.ai_policy.found",
+                        numeric_result[2],
+                    )
+                    kept_numeric = self.run_record(
+                        root / ("numeric-review-%r" % value),
+                        [record],
+                        [
+                            assessment_for(
+                                record,
+                                status="policy-review",
+                                status_reason="policy-unknown",
+                                policy_checks=numeric,
+                            )
+                        ],
+                    )[0]
+                    self.assertEqual(2, kept_numeric[0])
+                    self.assertIn(
+                        "policy_checks.contributing.found", kept_numeric[2]
+                    )
+
+    def test_observed_absence_supports_a_ready_status(self):
+        conduct = verify_candidates.POLICY_CHECK_PATHS["code_of_conduct"]
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            record = discovery_record()
+            self.mark_policy_paths(record, conduct)
+            checks = self.absent_claims(record, "code_of_conduct")
+            accepted, _, _, output, _ = self.run_record(
+                root / "absent", [record], [assessment_for(record, policy_checks=checks)]
+            )
+            self.assertEqual(0, accepted[0], accepted[2])
+            candidate = json.loads(output.read_text(encoding="utf-8"))["records"][0]
+            self.assertEqual("issue-ready", candidate["status"])
+            self.assertIs(False, candidate["policy_checks"]["code_of_conduct"]["found"])
+
+            organization_only = discovery_record()
+            self.mark_policy_paths(
+                organization_only, conduct, {"example-org/example-repo"}
+            )
+            contradicted = self.run_record(
+                root / "organization-found",
+                [organization_only],
+                [assessment_for(organization_only, policy_checks=checks)],
+            )[0]
+            self.assertEqual(2, contradicted[0])
+            self.assertIn(
+                "policy_checks.code_of_conduct.found: absence contradicted by discovery",
+                contradicted[2],
+            )
+
+            organization_404 = discovery_record()
+            self.mark_policy_paths(
+                organization_404, verify_candidates.POLICY_PATHS, {"example-org/.github"}, ref=None
+            )
+            self.mark_policy_paths(organization_404, conduct)
+            source_absent = self.run_record(
+                root / "organization-404",
+                [organization_404],
+                [assessment_for(organization_404, policy_checks=checks)],
+            )[0]
+            self.assertEqual(0, source_absent[0], source_absent[2])
+
+            evidence = self.write_policy_evidence(
+                root / "evidence",
+                record["repository"],
+                [("code_of_conduct", record["repository"], "docs/CONDUCT.md", b"Be kind.")],
+            )
+            manual = self.run_record(
+                root / "manual",
+                [record],
+                [assessment_for(record, policy_checks=checks)],
+                extra=["--policy-evidence", str(evidence)],
+            )[0]
+            self.assertEqual(2, manual[0])
+            self.assertIn(
+                "policy_checks.code_of_conduct.found: absence contradicted by policy evidence",
+                manual[2],
+            )
+
+    def test_unobserved_absence_blocks_ready(self):
+        conduct = verify_candidates.POLICY_CHECK_PATHS["code_of_conduct"]
+        cases = {
+            "missing-organization": lambda record: record.update(
+                policy_files=[
+                    item
+                    for item in record["policy_files"]
+                    if not (
+                        item["source_repository"] == "example-org/.github"
+                        and item["path"] in conduct
+                    )
+                ]
+            ),
+            "unknown-status": lambda record: self.mark_policy_paths(
+                record, conduct[:1], status="unknown", found=None
+            ),
+            "inconsistent-found": lambda record: self.mark_policy_paths(
+                record, conduct[:1], found=None
+            ),
+            "request-failed": lambda record: self.mark_policy_paths(
+                record, conduct[:1], {"example-org/.github"},
+                status="request-failed", found=None,
+            ),
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for name, mutate in cases.items():
+                with self.subTest(case=name):
+                    record = discovery_record()
+                    self.mark_policy_paths(record, conduct)
+                    mutate(record)
+                    result = self.run_record(
+                        root / name,
+                        [record],
+                        [
+                            assessment_for(
+                                record,
+                                policy_checks=self.absent_claims(record, "code_of_conduct"),
+                            )
+                        ],
+                    )[0]
+                    self.assertEqual(2, result[0], result[2])
+                    self.assertIn(
+                        "policy_checks.code_of_conduct.found: absence not observed",
+                        result[2],
+                    )
+                    self.assertNotIn("policy_checks.contributing.found", result[2])
+            self.assertIn(
+                "policy_files_reviewed: request-failed policy observation", result[2]
+            )
+
+    def test_self_organization_repository_needs_no_second_policy_pass(self):
+        repository = "example-org/.github"
+        record = discovery_record(repository=repository)
+        record["policy_files"] = record["policy_files"][: len(POLICY_PATHS)]
+        conduct = verify_candidates.POLICY_CHECK_PATHS["code_of_conduct"]
+        self.mark_policy_paths(record, conduct)
+        with tempfile.TemporaryDirectory() as temporary:
+            result = self.run_record(
+                Path(temporary),
+                [record],
+                [
+                    assessment_for(
+                        record,
+                        policy_checks=self.absent_claims(record, "code_of_conduct"),
+                    )
+                ],
+            )[0]
+            self.assertEqual(0, result[0], result[2])
+
+        analysis = json.loads(
+            (SKILL_DIR / "tests/fixtures/common/analysis.json").read_text(encoding="utf-8")
+        )
+        analysis["patterns"] = analysis["patterns"][:1]
+        clues = analysis["patterns"][0]["search_clues"][:1]
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            fixture = root / "fixture"
+            write_fixture(fixture, make_responses(repository, clues), analysis)
+            output = root / "discovery.json"
+            code, _, stderr, _ = self.run_main(
+                [
+                    "discover",
+                    "--analysis", str(fixture / "analysis.json"),
+                    "--repo", repository,
+                    "--max-clues-per-pattern", "1",
+                    "--fixture-dir", str(fixture),
+                    "--output", str(output),
+                    "--manifest", str(root / "manifest.json"),
+                ]
+            )
+            self.assertEqual(0, code, stderr)
+            policy_files = json.loads(output.read_text(encoding="utf-8"))["records"][0][
+                "policy_files"
+            ]
+            self.assertEqual(list(POLICY_PATHS), [item["path"] for item in policy_files])
+            self.assertEqual({repository}, {item["source_repository"] for item in policy_files})
+
+    @staticmethod
+    def neutral_policy_record():
+        """A discovery record whose reviewed files carry no AI or CLA/DCO policy."""
+        record = discovery_record()
+        for item in record["policy_files"]:
+            text = item["excerpt"]["text"]
+            if FIXTURE_SEMANTIC_POLICY_TEXT in text:
+                text = text.replace(
+                    FIXTURE_SEMANTIC_POLICY_TEXT,
+                    "Send patches with a short description of the change.",
+                )
+                digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
+                item["excerpt"].update(text=text, sha256=digest)
+                item.update(sha256=digest, size=len(text.encode("utf-8")), keyword_hits=[])
+        for item in record["policy_files"]:
+            assert "AI" not in item["excerpt"]["text"]
+            assert "DCO" not in item["excerpt"]["text"]
+        return record
+
+    def test_semantic_absence_requires_hand_review_of_every_found_file(self):
+        record = self.neutral_policy_record()
+        repository = record["repository"]
+        checks = self.absent_claims(record, "ai_policy", "cla_or_dco")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            # File presence alone must not stand in for a reviewed absence.
+            unproven = self.run_record(
+                root / "unproven", [record], [assessment_for(record, policy_checks=checks)]
+            )[0]
+            self.assertEqual(2, unproven[0])
+            for key in verify_candidates.SEMANTIC_POLICY_KEYS:
+                self.assertIn(
+                    "policy_checks.%s.found: absence not proven by policy evidence" % key,
+                    unproven[2],
+                )
+            coverage = self.coverage_for(record, "ai_policy")
+            self.assertEqual(2 * len(POLICY_PATHS), len(coverage))
+            dco_coverage = self.coverage_for(record, "cla_or_dco")
+            full = self.write_policy_evidence(
+                root / "full", repository, coverage + dco_coverage
+            )
+            accepted, _, _, output, manifest = self.run_record(
+                root / "accepted",
+                [record],
+                [assessment_for(record, policy_checks=checks)],
+                extra=["--policy-evidence", str(full)],
+            )
+            self.assertEqual(0, accepted[0], accepted[2])
+            candidate = json.loads(output.read_text(encoding="utf-8"))["records"][0]
+            self.assertEqual("issue-ready", candidate["status"])
+            recorded = json.loads(manifest.read_text(encoding="utf-8"))["runs"][-1][
+                "inputs"
+            ]["policy_evidence"]
+            self.assertEqual(len(coverage) + len(dco_coverage), len(recorded))
+            self.assertTrue(all(item["excerpt"]["untrusted"] for item in recorded))
+
+            first = coverage[0]
+            variants = {
+                "partial": coverage[:-1],
+                "other-path": [(first[0], first[1], "README.md", first[3])] + coverage[1:],
+                "other-source": [(first[0], "example-org/.github", first[2], first[3])]
+                + coverage[1:],
+                "other-key": [("cla_or_dco",) + first[1:]] + coverage[1:],
+                "other-bytes": [first[:3] + (first[3] + b" edited",)] + coverage[1:],
+            }
+            for name, observations in variants.items():
+                with self.subTest(variant=name):
+                    evidence = self.write_policy_evidence(
+                        root / name, repository, observations + dco_coverage
+                    )
+                    result = self.run_record(
+                        root / (name + "-record"),
+                        [record],
+                        [assessment_for(record, policy_checks=checks)],
+                        extra=["--policy-evidence", str(evidence)],
+                    )[0]
+                    self.assertEqual(2, result[0], name)
+                    self.assertIn(
+                        "policy_checks.ai_policy.found: absence not proven by policy evidence",
+                        result[2],
+                    )
+                    self.assertNotIn("policy_checks.cla_or_dco.found", result[2])
+            other_repository = self.write_policy_evidence(
+                root / "other-repository", "example-org/other-repo", coverage + dco_coverage
+            )
+            scoped = self.run_record(
+                root / "other-repository-record",
+                [record],
+                [assessment_for(record, policy_checks=checks)],
+                extra=["--policy-evidence", str(other_repository)],
+            )[0]
+            self.assertEqual(2, scoped[0])
+            self.assertIn(
+                "policy_checks.ai_policy.found: absence not proven by policy evidence",
+                scoped[2],
+            )
+
+            failed = self.neutral_policy_record()
+            self.mark_policy_paths(
+                failed, ("docs/SECURITY.md",), {"example-org/.github"},
+                status="request-failed", found=None,
+            )
+            failed_evidence = self.write_policy_evidence(
+                root / "failed",
+                repository,
+                self.coverage_for(failed, "ai_policy")
+                + self.coverage_for(failed, "cla_or_dco"),
+            )
+            not_observed = self.run_record(
+                root / "failed-record",
+                [failed],
+                [
+                    assessment_for(
+                        failed,
+                        policy_checks=self.absent_claims(failed, "ai_policy", "cla_or_dco"),
+                    )
+                ],
+                extra=["--policy-evidence", str(failed_evidence)],
+            )[0]
+            self.assertEqual(2, not_observed[0])
+            self.assertIn(
+                "policy_checks.ai_policy.found: absence not observed", not_observed[2]
+            )
+
+    def test_all_absent_scope_never_proves_semantic_absence(self):
+        record = discovery_record()
+        self.mark_policy_paths(record, POLICY_PATHS)
+        repository = record["repository"]
+        checks = self.absent_claims(
+            record, *verify_candidates.REVIEWABLE_POLICY_KEYS
+        )
+        evidence_blocks = {
+            "no-evidence": None,
+            "unrelated-evidence": [
+                ("ai_policy", repository, "README.md", b"Project readme."),
+                ("cla_or_dco", repository, "README.md", b"Project readme."),
+            ],
+        }
+        blocking = ["AI and CLA/DCO policy absence was not proven"]
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for name, observations in evidence_blocks.items():
+                with self.subTest(case=name):
+                    extra = []
+                    if observations is not None:
+                        evidence = self.write_policy_evidence(
+                            root / name, repository, observations
+                        )
+                        extra = ["--policy-evidence", str(evidence)]
+                    result = self.run_record(
+                        root / (name + "-record"),
+                        [record],
+                        [assessment_for(record, policy_checks=checks)],
+                        extra=extra,
+                    )[0]
+                    self.assertEqual(2, result[0])
+                    for key in verify_candidates.SEMANTIC_POLICY_KEYS:
+                        self.assertIn(
+                            "policy_checks.%s.found: absence not proven by policy evidence"
+                            % key,
+                            result[2],
+                        )
+                    self.assertNotIn("policy_checks.contributing.found", result[2])
+            readiness = confirmed_readiness()
+            readiness["ai_policy_allowed"] = {
+                "result": "not-confirmed",
+                "evidence_links": [],
+                "note": "no assistance policy was found or proven absent",
+            }
+            markdown = root / "policy-review.md"
+            kept, _, _, output, _ = self.run_record(
+                root / "policy-review",
+                [record],
+                [
+                    assessment_for(
+                        record,
+                        status="policy-review",
+                        status_reason="policy-unknown",
+                        ai_policy_status="unknown",
+                        readiness_checks=readiness,
+                        blocking_gaps=blocking,
+                        policy_checks=checks,
+                    )
+                ],
+                extra=["--markdown-output", str(markdown)],
+            )
+            self.assertEqual(0, kept[0], kept[2])
+            candidate = json.loads(output.read_text(encoding="utf-8"))["records"][0]
+            self.assertEqual("policy-review", candidate["status"])
+            rendered = markdown.read_text(encoding="utf-8")
+            self.assertIn("### Blocking gaps\n\n| gap |\n|---|\n| %s |" % blocking[0], rendered)
+            self.assertIn(
+                "### Unconfirmed readiness checks\n\n- `ai_policy_allowed`", rendered
+            )
+            self.assertNotIn("`recheck` 필수", rendered)
+
     def test_private_report_ready_also_requires_reviewed_policy(self):
         record = discovery_record()
         security = json.loads(
@@ -5173,8 +5756,15 @@ class VerifyCandidatesTests(unittest.TestCase):
                 self.assertIn("| %s |" % key, rendered)
             self.assertIn("not-reviewed", rendered)
             self.assertIn("| contributing | true |", rendered)
-            self.assertIn("| cla_or_dco | false |", rendered)
+            self.assertIn("| cla_or_dco | true |", rendered)
             self.assertIn("### Duplicate search", rendered)
+            self.assertIn("### Blocking gaps\n\n- none", rendered)
+            self.assertIn("### Unconfirmed readiness checks\n\n- none", rendered)
+            self.assertIn(
+                "`recheck` 필수 — verified_at: `%s`, verified_base_sha: `%s`"
+                % (FIXTURE_TIME, record["head_sha"]),
+                rendered,
+            )
             self.assertIn(verify_candidates.SEARCH_COMPLETENESS_LIMITATION, rendered)
             self.assertIn("No duplicate found.", rendered)
             self.assertIn(record["head_sha"], rendered)
