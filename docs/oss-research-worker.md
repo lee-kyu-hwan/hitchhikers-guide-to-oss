@@ -18,6 +18,11 @@ Anthropic sandbox runtime(`srt`)으로 감싸고, 결과와 종료 상태를 검
 - 실제 Claude 바이너리는 이 정책 안에서 `--version`·`--help` **기동만** 확인했다
   (네트워크 허용 없음, 인증 없음, 새 HOME). 모델 요청·인증·스킬·auto는 실행하지
   않았으므로 게이트는 닫혀 있다.
+- 게이트 뒤에 조사 스킬 실행 구성기(`--execution-profile corpus-extract|deep-research`)가
+  있다(「조사 스킬 실행 구성」). 검토된 원본 스킬·워크플로를 hash로 고정해 run 전용
+  설정 디렉터리에 복사하고 srt로 쓰기를 막는다. 인자·정책·manifest는 오프라인으로,
+  staged 설정 변경 거부와 `output/` 쓰기는 실제 srt 비AI probe로 확인했다. 스킬을
+  실제로 실행한 적은 없다.
 - 이 문서의 어떤 결과도 정상 조사, 인증 성공, 인증 방식의 최종 선택, 계정
   바인딩, 스킬 호환성, auto 차단의 증거가 아니다.
 
@@ -59,9 +64,88 @@ python3 dot_local/bin/executable_oss-research-worker \
   이 값들은 게이트보다 먼저 검사한다. 잘못되면 종료 코드 2다. relay 경로와
   인터프리터는 인자로 받지 않는다.
 
+- `--execution-profile read-only|corpus-extract|deep-research`: 기본 `read-only`는
+  위 도구 표면 그대로다. 나머지 둘은 별도 staged run이다(「조사 스킬 실행 구성」).
+  잘못된 값은 종료 코드 2다. 게이트가 닫혀 있어 어느 값이든 종료 코드 3이다.
+- `--web-domain HOST`(반복): deep-research에서 WebFetch가 닿을 수 있는 호스트.
+  기본은 없음이다. 소문자 호스트 이름만 받고(포트·scheme·wildcard·IP·`localhost`
+  거부), GitHub 계열(`github.com`·`githubusercontent.com`·`github.io`·
+  `githubassets.com`·`github.dev`·`githubapp.com`·`ghcr.io`와 그 하위)은 거부한다.
+  GitHub 조회는 relay로만 한다. 다른 프로필에서 주면 종료 코드 2다.
+
 종료 코드는 다음과 같다. 0은 결과 검증 통과, 2는 입력 거부, 3은 격리 실행
 불가(blocker), 4는 실행했으나 결과 검증 실패다. 3이면 run 디렉터리를 만들지
 않고, `srt`·`claude`도 시작하지 않는다. 비격리 재시작은 없다.
+
+## 조사 스킬 실행 구성
+
+기준: `docs/research/2026-09-27-78-research-skill-runtime-contract.md`(#82 worktree)
+§3·§8. 스킬을 새로 쓰지 않고, 검토된 source checkout의 원본을 그대로 staging한다.
+`read-only` 실행의 인자·정책·환경은 바뀌지 않는다(회귀 시험으로 고정).
+
+| 프로필 | `--tools` | `--allowedTools` | `--disallowedTools` | 빼는 플래그 | staging |
+|---|---|---|---|---|---|
+| `read-only`(기본) | `Read,Glob,Grep` | 같음 | 기존 목록 | 없음 | 없음 |
+| `corpus-extract` | `Read,Glob,Grep,Agent,Write` | `Read Glob Grep Agent(corpus-extractor) Write` | `Bash,PowerShell,WebFetch,WebSearch,Edit,NotebookEdit,Skill,Workflow` | `--safe-mode`(custom agent를 끄므로) | 부모가 쓴 `--agents` 파일(`corpus-extractor`, 도구 `Read`만, model 지정 없음), `--add-dir <run>/output` |
+| `deep-research` | `Read,Skill,Workflow,WebSearch,WebFetch` | `Read Skill(deep-research) Workflow(deep-research) WebSearch` + 도메인마다 `WebFetch(domain:<host>)` | `Bash,PowerShell,Edit,Write,NotebookEdit` | `--safe-mode`, `--disable-slash-commands` | `dot_agents/skills/deep-research/SKILL.md`(`a330b11e…`), `dot_claude/workflows/deep-research.js`(`4d7392eb…`) |
+
+- 두 staged 프로필 모두 `--restricted`, `--strict-mcp-config`, `--no-chrome`,
+  `--setting-sources ""`, `--permission-prompts none`, `--max-turns 20`을 유지하고
+  `--settings <run>/home/.claude/settings.json`을 더한다. 권한 모드는 기존과 같이
+  `dontAsk`|`auto`만 받는다.
+- `auto`에서는 허용 규칙이 경계가 아니다. 거부 목록에 없는 도구 사용을 분류기가
+  허가할 수 있다. 그래서 도구 존재는 `--tools`로, 파일·네트워크는 srt로 막는
+  것을 경계로 본다. WebFetch를 어떤 도메인에 쓰든 srt `allowedDomains`(모델 도메인 +
+  `--web-domain` 목록 + ready를 확인한 relay port)를 벗어나지 못한다.
+- Agent·Workflow 자식을 만들 수 있다는 것은 격리 증거가 아니다. 자식이 같은 경계에
+  남는지는 계약 문서 §3.2 수락 조건으로 live에서 따로 판정한다.
+
+staging(`stage_research_config`)은 `prepare_run` 뒤, 자식 시작 전에 부모가 한다.
+
+1. 원본 위치는 이 스크립트의 chezmoi source checkout(`reviewed_source_root`)이다.
+   설치본(`~/.local/bin/oss-research-worker`)이나 `~/.claude`·프로필 디렉터리·동기화
+   스킬은 쓰지 않는다. 설치본에서 staged 프로필을 고르면 Blocked다.
+2. 원본마다 source root·중간 디렉터리·파일이 symlink가 아닌지 보고 `O_NOFOLLOW`로
+   읽는다. 내용 SHA-256이 코드에 고정한 pin과 다르거나, 파일이 없거나, 일반 파일이
+   아니면 Blocked다. 모두 확인한 뒤에만 복사한다.
+3. `run/home/.claude/{skills,workflows,agents,commands,rules,output-styles,plugins}`를
+   만들고(staging 대상이 아니면 빈 채로), 원본을 0444로 복사한다. 복사본은 다시 읽어
+   hash를 대조하고 다르면 Blocked다. 설정 파일
+   `settings.json`(argv와 같은 allow/deny 규칙, `disableAllHooks: true`)도 부모가
+   0444로 쓴다. corpus-extract의 agent 정의는 `run/policy/claude-agents.json`(0400)이다.
+4. 기록(원본 경로·staged 경로·hash, 프로필, 도메인, agents 파일 hash)은
+   `run/policy/staged-manifest.json`(0400)과 결과 manifest의 `staged`에 남는다.
+   manifest에는 `execution_profile`도 들어간다.
+5. srt 정책의 `denyWrite`에 위 디렉터리 7개와 `settings.json`·`settings.local.json`·
+   `CLAUDE.md`를 더한다. `run/policy`·`run/result`는 원래 거부다.
+   `run/home/.claude` 자체는 막지 않는다(Claude가 `projects/` 등을 쓴다).
+6. 수거 때(`staged_problems`) staged 파일 hash, 보호 디렉터리에 추가된 항목, 보호
+   파일의 새 생성, staged manifest·agents 파일 변경을 다시 본다. 하나라도 있으면
+   실패다(`staged-changed:`·`staged-added:`·`staged-manifest-changed`).
+   staging이 Blocked면 `staging-blocked:`로 기록하고 자식을 시작하지 않는다.
+
+입력 검사: `--safe-mode`를 빼면 Claude가 작업 디렉터리의 `CLAUDE.md`·프로젝트 설정을
+읽으므로, staged 프로필은 입력 어디에든 `CLAUDE.md`·`CLAUDE.local.md`·`.claude`·
+`.mcp.json`이 있으면 종료 코드 2로 거부한다. 목록을 읽을 수 없는 하위 디렉터리가
+있어도 거부한다(건너뛰지 않는다). 환경은 `read-only`와 같은 허용 목록이다
+(부모 `HOME`·`CLAUDE_CONFIG_DIR`·SSH·GH·Orca·MCP 비상속).
+
+실측(srt 0.0.77, Python `/opt/homebrew/bin/python3`, 비AI probe,
+`StagedBoundaryTests` 2건): 두 프로필에서 staged 파일 덮어쓰기·chmod·삭제·rename·
+hard link, 스킬 디렉터리 rename·`rmtree`, `skills`·`workflows`·`.claude`·`home` 상위
+디렉터리 rename, `settings.json` 교체·삭제, `settings.local.json`·`CLAUDE.md` 생성과
+symlink, 새 skill·workflow·agent·command·rule·output style·plugin 생성, 빈 보호
+디렉터리 `rmdir`, staged manifest·agents 파일 교체가 모두 `EPERM`이었다. 전후 hash가
+같았다. `output/`·`tmp/`·`home/` 쓰기와 `home/.claude/projects` 생성은 성공했다.
+대조군으로 staged `denyWrite`를 뺀 정책에서는 같은 시험이 실패했다(0444 mode만으로는
+막히지 않는다).
+
+미검증(live 필요, 계약 문서 R1~R5): Claude가 `--restricted`·`--setting-sources ""`
+아래에서 staged 스킬·워크플로를 실제로 로드하는지와 같은 이름의 번들
+`/deep-research` 중 어느 쪽을 쓰는지, `--agents` 파일이 `--safe-mode` 없이 적용되는지,
+`Agent(corpus-extractor)`·`Workflow(deep-research)` 규칙이 실제로 그 대상만 허용하는지,
+워크플로 자식이 받는 도구 목록, 실행된 스크립트 사본 hash, 계정 동기화 스킬 유입,
+WebSearch 실행 위치. 인자 생성 성공은 스킬 실행 성공이 아니다.
 
 ## 실행 순서와 경계
 
@@ -552,7 +636,7 @@ Linux 게스트 안의 별도 로그인(`.credentials.json`), API key·`apiKeyHe
 
 | 기능 | 코드 상태 | live 증거 | 독립 구현 계획(제안) |
 |---|---|---|---|
-| 스킬·Agent(deep-research) | **미구현**. `Read,Glob,Grep`만 제공하고 `--disable-slash-commands`·`--safe-mode`로 스킬·Agent·검색을 끈다 | 없음 | ① 필요한 도구 목록(Agent, WebSearch/WebFetch 여부, 스킬 로딩 경로)을 스킬 원문으로 확정한다. ② 스킬 파일을 입력 디렉터리에 복사해 run 전용 `CLAUDE_CONFIG_DIR`에서 읽게 하는 새 실행 경로를 만든다. 부모 `~/.claude`는 열지 않는다. ③ 검색이 필요하면 #192 중계 host:port만 허용한다. ④ 격리 안에서 스킬이 실제로 Agent를 띄우고 결과를 남기는지 실측한다. 새 실행 경로이므로 착수 전에 ask한다 |
+| 스킬·Agent(deep-research) | **닫힌 게이트 뒤 구성기**. `read-only`는 그대로다. `corpus-extract`·`deep-research` 프로필이 도구 표면, 검토된 원본 staging(hash pin, manifest), staged 경로 `denyWrite`, 수거 때 변경 검사를 만든다(「조사 스킬 실행 구성」) | 없음. staged 변경 거부는 실제 srt 비AI probe만 | ① 도구 목록 확정(계약 문서). ② 구성기 완료(오프라인 + srt probe). ③ live에서 staged 로드·자식 경계(계약 §3.2, R1~R5)를 판정한다. ④ WebFetch 도메인과 relay 후보는 사용자·조정자 결정이다 |
 | 인증 sentinel 바인딩 | **닫힌 게이트 뒤 최소 준비**. 게이트는 메타데이터만 검사. 게이트 뒤 `load_credential`(1회 읽기)·자식 환경 전달·시작 전 argv/relay 거부·수거 노출 검사가 있고 가짜 sentinel 오프라인 시험만 있다(`test_oss_research_worker_auth.py`) | 없음(sentinel 파일만) | ① 완료(오프라인). ② 가짜 토큰으로 실제 Claude가 명시적 인증 실패를 내는지 실측한다. 모델 도메인 접속이 필요하므로 조정자 승인 후에 한다. ③ 사용자가 발급한 실제 토큰으로 1회 호출하는 것은 사용자 단계다 |
 | auto CLI 선택 | **CLI 준비만**. `--permission-mode dontAsk|auto`(기본 `dontAsk`)를 `build_command`에 넘긴다. 도구 표면은 같다 | 없음. auto로 AI를 실행하지 않아 auto 차단은 미검증 | ① 완료(오프라인). ② auto에서 위 차단 시험을 Claude 도구 경로로 반복한다. OS 경계는 srt가 맡으므로 auto에서도 같아야 하지만 실측 전에는 주장하지 않는다 |
 | Claude 바이너리 기동 | 정책에 필요한 읽기 경로 반영 | `--version`·`--help`만 | 모델 요청 경로의 추가 읽기·네트워크 요구는 인증 단계에서 측정한다 |
@@ -582,7 +666,9 @@ Linux 게스트 안의 별도 로그인(`.credentials.json`), API key·`apiKeyHe
 | Keychain | **미검증(부분 관찰)** | 파일형 fixture는 파일 deny로만 막힘. srt 설정으로 mach-lookup 거부 불가, 중첩 불가. 로그인·XPC 경로 미증명 |
 | Claude 실행 파일 기동 | PASS (실측, 기동만) | `--version`·`--help` exit 0, 네트워크·인증 없음. 모델 요청 미검증 |
 | 정상 조사(모델 호출·결과 반환) | 미검증 | 모델 호출 안 함 |
-| 스킬·서브에이전트 호환성 | 미지원 (미검증) | Agent·검색·스킬이 꺼져 있어 deep-research 흐름은 실행되지 않는다. 필수 조건이며 후속 구현 대상 |
+| staged 프로필 인자·정책·manifest | PASS (오프라인) | `test_oss_research_worker_skills.py`: read-only argv·정책 불변, 프로필별 도구·규칙, 도메인 검사(GitHub 계열 거부), pin 불일치·누락·symlink(파일·디렉터리·root) Blocked, 설치본 Blocked, 입력의 Claude 설정 거부, 부모 비밀 비상속, 수거 때 변경 실패, `main` 모든 프로필 exit 3 |
+| staged 설정 보호 | PASS (실측, 비AI probe) | `StagedBoundaryTests` 2건. 상위 디렉터리 rename·삭제 포함 변경 거부, `output/` 쓰기 허용. denyWrite를 뺀 대조군은 실패 |
+| 스킬·서브에이전트 호환성 | 미검증 | 구성기만 있다. Claude가 staged 스킬·워크플로를 로드해 실행하는지, 자식 경계는 live 필요 |
 | auto 모드 | 미검증 | AI를 실행하지 않았다. 실행기 기본은 `dontAsk`이고 `auto`는 CLI 인자 준비만 했다 |
 
 ## 남은 실제 시험 게이트

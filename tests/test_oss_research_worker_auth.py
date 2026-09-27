@@ -172,7 +172,8 @@ class ClosedGateTests(Fixture):
         options = set(worker.re.findall(r'add_argument\("(--[a-z-]+)"', source))
         self.assertEqual(options, {
             "--profile", "--input-dir", "--prompt-file", "--run-dir", "--runtime-prefix",
-            "--credential-file", "--permission-mode", "--timeout", "--relay-repo",
+            "--credential-file", "--permission-mode", "--execution-profile",
+            "--web-domain", "--timeout", "--relay-repo",
             "--relay-request-budget", "--relay-max-response-bytes",
             "--relay-response-byte-budget", "--relay-timeout-seconds"})
         self.assertNotIn("os.environ.get(\"OSS", source)

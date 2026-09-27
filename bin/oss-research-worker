@@ -5,7 +5,9 @@ The real launch is closed. The pinned srt install and the shape of a
 profile-bound credential file are checked, but no real launch has been
 measured with them. The code that hands the credential to the child and
 checks it was not exposed sits behind that gate and runs only in tests with
-fake sentinels. See docs/research/oss-research-worker.md.
+fake sentinels. The corpus-extract and deep-research profiles (reviewed
+skill sources staged under a hash pin, writes to them denied) sit behind the
+same gate. See docs/research/oss-research-worker.md.
 """
 
 from __future__ import annotations
@@ -85,6 +87,74 @@ EXPOSURE_SECONDS = 30.0
 PERMISSION_MODES = ("dontAsk", "auto")
 DEFAULT_PERMISSION_MODE = "dontAsk"
 
+
+class StagedSource(NamedTuple):
+    source: str   # path in the reviewed source checkout
+    staged: str   # path under run/home/.claude
+    sha256: str   # the reviewed content; anything else is Blocked
+
+
+class ExecutionProfile(NamedTuple):
+    tools: str                  # --tools
+    allowed: tuple[str, ...]    # --allowedTools rules (web domains are added)
+    denied: str                 # --disallowedTools
+    dropped: tuple[str, ...]    # read-only flags this profile cannot keep
+    sources: tuple[StagedSource, ...]
+    agents: dict | None         # --agents file content, written by the parent
+    writes_output: bool         # --add-dir output
+    web: bool                   # takes --web-domain
+
+
+# read-only is build_command as it was. The other two exist only as a separate
+# staged run: they reuse the reviewed skill, workflow and agent sources as-is.
+EXECUTION_PROFILES = ("read-only", "corpus-extract", "deep-research")
+DEFAULT_EXECUTION_PROFILE = "read-only"
+STAGED_PROFILES = {
+    # The analyzer's extract step: every generated prompt file answered by a
+    # tool-less (Read only) sub-agent, results written under output/.
+    # --safe-mode also disables custom agents, so it is dropped; skills stay off.
+    "corpus-extract": ExecutionProfile(
+        tools="Read,Glob,Grep,Agent,Write",
+        allowed=("Read", "Glob", "Grep", "Agent(corpus-extractor)", "Write"),
+        denied="Bash,PowerShell,WebFetch,WebSearch,Edit,NotebookEdit,Skill,Workflow",
+        dropped=("--safe-mode",),
+        sources=(),
+        agents={"corpus-extractor": {
+            "description": "Answers one generated extraction prompt file.",
+            "prompt": "Read the one prompt file you are given and answer exactly as it "
+                      "instructs. Use no other file and no other tool.",
+            "tools": ["Read"]}},
+        writes_output=True, web=False),
+    # dotfiles deep-research: the skill calls Workflow({name: "deep-research"}).
+    "deep-research": ExecutionProfile(
+        tools="Read,Skill,Workflow,WebSearch,WebFetch",
+        allowed=("Read", "Skill(deep-research)", "Workflow(deep-research)", "WebSearch"),
+        denied="Bash,PowerShell,Edit,Write,NotebookEdit",
+        dropped=("--safe-mode", "--disable-slash-commands"),
+        sources=(
+            StagedSource("dot_agents/skills/deep-research/SKILL.md",
+                         "skills/deep-research/SKILL.md",
+                         "a330b11edcbaf34942595d4f947a9f201a52895a064b4a5e5f2bb57d2398cedc"),
+            StagedSource("dot_claude/workflows/deep-research.js",
+                         "workflows/deep-research.js",
+                         "4d7392eb5495115e8e1b29b5450774cf18d1f0318d619a5ec774c91ddd4c8fd4"),
+        ),
+        agents=None, writes_output=False, web=True),
+}
+# Everything Claude may load from CLAUDE_CONFIG_DIR as configuration. The
+# parent creates these (empty unless staged) and srt denies writes to them.
+PROTECTED_CONFIG_DIRECTORIES = ("skills", "workflows", "agents", "commands", "rules",
+                                "output-styles", "plugins")
+PROTECTED_CONFIG_FILES = ("settings.json", "settings.local.json", "CLAUDE.md")
+# Names that make Claude load configuration or memory from the input directory.
+INPUT_CONFIG_NAMES = ("CLAUDE.md", "CLAUDE.local.md", ".claude", ".mcp.json")
+MAX_WEB_DOMAINS = 50
+WEB_DOMAIN = re.compile(r"\A(?=.{4,253}\Z)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+"
+                        r"[a-z]{2,63}\Z")
+# WebFetch never reaches these; GitHub is read through the relay only.
+GITHUB_DOMAINS = ("github.com", "githubusercontent.com", "github.io", "githubassets.com",
+                  "github.dev", "githubapp.com", "ghcr.io")
+
 # Output bounds: past one, the supervisor stops both groups and the run fails.
 MAX_STDOUT_BYTES = 8 * 1024 * 1024
 MAX_STDERR_BYTES = 1024 * 1024
@@ -112,6 +182,52 @@ EXIT_FAILED = 4
 
 class Blocked(Exception):
     """The isolated launch cannot start; never fall back to an unisolated one."""
+
+
+class StagedRun(NamedTuple):
+    """A corpus-extract or deep-research run: its profile, the reviewed source
+    checkout its files are staged from, and the WebFetch domains (default none)."""
+
+    profile: str
+    source_root: Path
+    web_domains: tuple[str, ...] = ()
+
+    @property
+    def spec(self) -> ExecutionProfile:
+        return STAGED_PROFILES[self.profile]
+
+    def check(self) -> "StagedRun":
+        """Raise ValueError unless the profile is staged and every domain is allowed."""
+        if self.profile not in STAGED_PROFILES:
+            raise ValueError("staged execution profile must be one of "
+                             + ", ".join(STAGED_PROFILES))
+        if self.web_domains and not self.spec.web:
+            raise ValueError("web domains are for the deep-research profile only")
+        if len(self.web_domains) > MAX_WEB_DOMAINS:
+            raise ValueError(f"at most {MAX_WEB_DOMAINS} web domains")
+        if len(set(self.web_domains)) != len(self.web_domains):
+            raise ValueError("web domains must be unique")
+        for domain in self.web_domains:
+            if WEB_DOMAIN.match(domain) is None:
+                raise ValueError(f"web domain must be a lowercase host name: {domain!r}")
+            if any(domain == name or domain.endswith("." + name) for name in GITHUB_DOMAINS):
+                raise ValueError(f"GitHub domains are read through the relay only: {domain}")
+        return self
+
+
+def checked_staged_input(input_dir: Path) -> None:
+    """Without --safe-mode Claude loads CLAUDE.md and project config from the
+    working directory, so a staged run refuses input that holds any. A
+    directory that cannot be listed fails the check instead of being skipped."""
+
+    def unreadable(error: OSError) -> None:
+        raise ValueError(f"input cannot be fully listed: {error.strerror}")
+
+    for current, directories, files in os.walk(input_dir, onerror=unreadable):
+        for name in directories + files:
+            if name in INPUT_CONFIG_NAMES:
+                raise ValueError("input holds Claude configuration: "
+                                 f"{(Path(current) / name).relative_to(input_dir)}")
 
 
 def reject_symlinks(root: Path) -> None:
@@ -349,14 +465,24 @@ def build_environment(parent: dict[str, str], run_dir: Path,
 
 
 def build_policy(input_dir: Path, run_dir: Path, claude: Path,
-                 relay_port: int | None = None, model: bool = True) -> dict:
+                 relay_port: int | None = None, model: bool = True,
+                 staged: StagedRun | None = None) -> dict:
     """srt settings using only keys documented in the sandbox-runtime README.
 
     The model endpoint is allowed only for a model run (model=False is the
     non-AI relay-only probe); the relay port only after its ready line checked.
     srt 0.0.77 rejects a network section without deniedDomains.
+    A staged run adds its WebFetch domains and denies writes to every
+    configuration path under run/home/.claude; srt 0.0.77 also refused
+    renaming their parent directories (measured, test_oss_research_worker_skills).
     """
     domains = list(ALLOWED_DOMAINS) if model else []
+    deny_write = [str(run_dir / "policy"), str(run_dir / "result")]
+    if staged is not None:
+        domains += staged.check().web_domains
+        config = run_dir / "home/.claude"
+        deny_write += [str(config / name)
+                       for name in (*PROTECTED_CONFIG_DIRECTORIES, *PROTECTED_CONFIG_FILES)]
     if relay_port is not None:
         domains.append(f"127.0.0.1:{relay_port}")
     return {
@@ -364,7 +490,7 @@ def build_policy(input_dir: Path, run_dir: Path, claude: Path,
             "denyRead": ["/"],
             "allowRead": [*SYSTEM_READ, str(input_dir), str(run_dir), str(claude)],
             "allowWrite": [str(run_dir / name) for name in WRITABLE_AREAS],
-            "denyWrite": [str(run_dir / "policy"), str(run_dir / "result")],
+            "denyWrite": deny_write,
         },
         "network": {
             "allowedDomains": domains,
@@ -523,6 +649,45 @@ def build_command(runtime: list[str], policy: Path, claude: str, prompt: str,
     ])
 
 
+def staged_rules(staged: StagedRun) -> tuple[list[str], list[str]]:
+    """(allow, deny) permission rules: the profile's plus one WebFetch rule per domain."""
+    allow = [*staged.spec.allowed, *(f"WebFetch(domain:{domain})"
+                                     for domain in staged.web_domains)]
+    return allow, staged.spec.denied.split(",")
+
+
+def build_staged_command(runtime: list[str], policy: Path, claude: str, prompt: str,
+                         run_dir: Path, staged: StagedRun,
+                         permission_mode: str = DEFAULT_PERMISSION_MODE) -> list[str]:
+    """The argv of a corpus-extract or deep-research run.
+
+    It is build_command's argv without the profile's dropped flags, plus the
+    parent-written settings (and agents) files and the profile's tools and
+    rules. --restricted, --strict-mcp-config and --setting-sources "" stay.
+    Building it says nothing about what Claude then loads or exposes.
+    """
+    if permission_mode not in PERMISSION_MODES:
+        raise ValueError(f"permission mode must be one of {', '.join(PERMISSION_MODES)}")
+    spec = staged.check().spec
+    allow, _ = staged_rules(staged)
+    base = build_command(runtime, policy, claude, prompt, permission_mode)
+    head = base[:base.index("--permission-mode")]
+    head = [argument for argument in head if argument not in spec.dropped]
+    extra = ["--settings", str(run_dir / "home/.claude/settings.json")]
+    if spec.agents is not None:
+        extra += ["--agents", str(run_dir / "policy/claude-agents.json")]
+    if spec.writes_output:
+        extra += ["--add-dir", str(run_dir / "output")]
+    return [*head, *extra,
+            "--permission-mode", permission_mode,
+            "--permission-prompts", "none",
+            "--tools", spec.tools,
+            "--allowedTools", " ".join(allow),
+            "--disallowedTools", spec.denied,
+            "--max-turns", "20",
+            "--", prompt]
+
+
 def prepare_run(run_dir: Path, policy: dict) -> Path:
     run_dir.mkdir(mode=0o700)
     for name in (*WRITABLE_AREAS, "policy", "result"):
@@ -532,6 +697,138 @@ def prepare_run(run_dir: Path, policy: dict) -> Path:
     policy_file.write_text(json.dumps(policy, indent=2), encoding="utf-8")
     policy_file.chmod(0o400)
     return policy_file
+
+
+def reviewed_source_root(script: Path) -> Path:
+    """The chezmoi source checkout this worker runs from. An installed copy
+    (~/.local/bin) has no reviewed source beside it, so nothing is staged."""
+    if not script.name.startswith("executable_"):
+        raise Blocked("staged profiles run only from the reviewed source checkout; "
+                      "installed skills are never staged")
+    return script.resolve().parents[2]
+
+
+def read_reviewed(root: Path, source: StagedSource) -> bytes:
+    """The pinned source's bytes, read without following any link below root."""
+    if root.is_symlink():
+        raise Blocked(f"staged source root must not be a symlink: {root}")
+    current = root
+    for part in Path(source.source).parts[:-1]:
+        current = current / part
+        if current.is_symlink():
+            raise Blocked(f"staged source directory must not be a symlink: {source.source}")
+    try:
+        descriptor = os.open(root / source.source, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError as error:
+        if error.errno == errno.ELOOP:
+            raise Blocked(f"staged source must not be a symlink: {source.source}")
+        raise Blocked(f"staged source {source.source} is unusable: {error.strerror}")
+    try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise Blocked(f"staged source is not a regular file: {source.source}")
+        data = b""
+        while chunk := os.read(descriptor, 1024 * 1024):
+            data += chunk
+    finally:
+        os.close(descriptor)
+    if hashlib.sha256(data).hexdigest() != source.sha256:
+        raise Blocked(f"staged source {source.source} differs from the reviewed pin")
+    return data
+
+
+def write_staged(path: Path, data: bytes, mode: int) -> str:
+    """Write a new file, read it back, and return its hash; Blocked if the copy differs."""
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    try:
+        view = memoryview(data)
+        while view:
+            view = view[os.write(descriptor, view):]
+    finally:
+        os.close(descriptor)
+    path.chmod(mode)
+    expected = hashlib.sha256(data).hexdigest()
+    if hashlib.sha256(path.read_bytes()).hexdigest() != expected:
+        raise Blocked(f"staged copy differs from its source: {path.name}")
+    return expected
+
+
+def stage_research_config(run_dir: Path, staged: StagedRun) -> dict:
+    """Copy the profile's reviewed sources into run/home/.claude and record them.
+
+    Every source must match its pin; a symlink, a missing file or another
+    hash is Blocked before anything is copied. The parent also writes the
+    settings file (the same rules as the argv, hooks off) and, for
+    corpus-extract, the agents file. The record goes to
+    policy/staged-manifest.json; the child cannot write any of these (build_policy).
+    """
+    staged.check()
+    spec = staged.spec
+    contents = [(source, read_reviewed(staged.source_root, source)) for source in spec.sources]
+    config = run_dir / "home/.claude"
+    for name in PROTECTED_CONFIG_DIRECTORIES:
+        (config / name).mkdir(mode=0o700)
+    files = []
+    for source, data in contents:
+        files.append({"source": source.source, "staged": source.staged,
+                      "sha256": write_staged(config / source.staged, data, 0o444)})
+    allow, deny = staged_rules(staged)
+    settings = json.dumps({"permissions": {"allow": allow, "deny": deny},
+                           "disableAllHooks": True}, indent=2).encode()
+    files.append({"source": None, "staged": "settings.json",
+                  "sha256": write_staged(config / "settings.json", settings, 0o444)})
+    record = {"profile": staged.profile, "source_root": str(staged.source_root.resolve()),
+              "web_domains": list(staged.web_domains), "files": files}
+    if spec.agents is not None:
+        record["agents_sha256"] = write_staged(
+            run_dir / "policy/claude-agents.json",
+            json.dumps(spec.agents, indent=2).encode(), 0o400)
+    write_staged(run_dir / "policy/staged-manifest.json",
+                 json.dumps(record, indent=2).encode(), 0o400)
+    return record
+
+
+def staged_problems(run_dir: Path, record: dict) -> list[str]:
+    """After the run: every staged file unchanged, nothing added to the
+    protected configuration, and the parent's manifest and agents file intact."""
+    config = run_dir / "home/.claude"
+    problems = []
+
+    def digest(path: Path) -> str | None:
+        try:
+            if path.is_symlink() or not path.is_file():
+                return None
+            return hashlib.sha256(path.read_bytes()).hexdigest()
+        except OSError:
+            return None
+
+    expected = {entry["staged"]: entry["sha256"] for entry in record["files"]}
+    parents = {parent.as_posix() for name in expected
+               for parent in Path(name).parents if parent != Path(".")}
+    for name, sha in expected.items():
+        if digest(config / name) != sha:
+            problems.append(f"staged-changed: {name}")
+    for name in PROTECTED_CONFIG_DIRECTORIES:
+        directory = config / name
+        if directory.is_symlink() or not directory.is_dir():
+            problems.append(f"staged-changed: {name}")
+            continue
+        for path in sorted(directory.rglob("*")):
+            relative = path.relative_to(config).as_posix()
+            staged_directory = relative in parents and path.is_dir() and not path.is_symlink()
+            if relative not in expected and not staged_directory:
+                problems.append(f"staged-added: {relative}")
+    for name in PROTECTED_CONFIG_FILES:
+        path = config / name
+        if name not in expected and (path.exists() or path.is_symlink()):
+            problems.append(f"staged-added: {name}")
+    manifest = json.dumps(record, indent=2).encode()
+    if digest(run_dir / "policy/staged-manifest.json") != hashlib.sha256(manifest).hexdigest():
+        problems.append("staged-manifest-changed")
+    if "agents_sha256" in record and \
+            digest(run_dir / "policy/claude-agents.json") != record["agents_sha256"]:
+        problems.append("staged-changed: agents file")
+    return problems
 
 
 class Supervisor:
@@ -854,14 +1151,15 @@ def result_problems(exit_code: int | None, stdout: str) -> tuple[list[str], str 
 def collect(run_dir: Path, profile: str, exit_code: int | None,
             stdout: str, stderr: str, failures: list[str] = (),
             relay: dict | None = None, credential: Credential | None = None,
-            permission_mode: str | None = None) -> bool:
+            permission_mode: str | None = None, staged: dict | None = None) -> bool:
     """Record the outcome. The report is data: it is never executed here.
 
     failures are the supervisor's reasons (timeout, output bound, relay
     ready or exit, cleanup); any one of them fails the run. With a credential,
     a stream or writable-area file holding its exact value fails the run and
     no stream file or report is written; the manifest is written only if it
-    does not hold the value either.
+    does not hold the value either. staged is stage_research_config's record:
+    a staged file changed or a configuration file added fails the run.
     """
     moved = parent_path_problems(run_dir)
     if moved:
@@ -888,6 +1186,8 @@ def collect(run_dir: Path, profile: str, exit_code: int | None,
         if relay_stderr is not None:
             (result_dir / "relay.log").write_text(relay_stderr, encoding="utf-8")
     problems = exposed + list(failures) + problems + area_problems(run_dir)
+    if staged is not None:
+        problems += staged_problems(run_dir, staged)
     if credential is not None:
         # A path in a problem may itself hold the value; keep only the fact.
         problems = [item if credential.reveal() not in item
@@ -905,6 +1205,9 @@ def collect(run_dir: Path, profile: str, exit_code: int | None,
     }
     if permission_mode is not None:
         manifest["permission_mode"] = permission_mode
+    if staged is not None:
+        manifest["execution_profile"] = staged["profile"]
+        manifest["staged"] = staged
     if credential is not None:
         manifest["credential"] = {"variable": CREDENTIAL_VARIABLE,
                                   "exact_value_check": "failed" if exposed else "clean"}
@@ -927,7 +1230,7 @@ def collect(run_dir: Path, profile: str, exit_code: int | None,
 def run_supervised(input_dir: Path, run_dir: Path, profile: str, seconds: float,
                    relay: RelayLaunch | None, policy_for, command_for,
                    environment: dict[str, str], credential: Credential | None = None,
-                   permission_mode: str | None = None) -> bool:
+                   permission_mode: str | None = None, stage=None) -> bool:
     """Start the relay (if any) and the sandboxed child under one deadline.
 
     policy_for(port) builds the policy once the relay's ready line checked out
@@ -938,10 +1241,13 @@ def run_supervised(input_dir: Path, run_dir: Path, profile: str, seconds: float,
     A credential loaded for another profile is Blocked before any directory,
     process or value use. A credential is refused anywhere but the child's environment: in the relay's
     argv or environment, or in the child's argv, nothing of that process starts.
+    stage(run_dir), when given, stages the configuration after prepare_run and
+    returns its record; a Blocked from it is recorded and the child never starts.
     """
     require_profile(credential, profile)
     supervisor = Supervisor(seconds)
     port, relay_record, relay_process, exit_code = None, None, None, None
+    staged_record = None
     value = credential.reveal() if credential is not None else None
 
     def holds(strings) -> bool:
@@ -968,6 +1274,11 @@ def run_supervised(input_dir: Path, run_dir: Path, profile: str, seconds: float,
                     supervisor.fail(f"relay-not-ready: {error}")
             relay_record["port"] = port
         policy_file = prepare_run(run_dir, policy_for(port))
+        if stage is not None and not supervisor.failures:
+            try:
+                staged_record = stage(run_dir)
+            except Blocked as error:
+                supervisor.fail(f"staging-blocked: {error}")
         command = command_for(policy_file)
         if holds(command):
             supervisor.fail("credential-in-argv")
@@ -988,26 +1299,39 @@ def run_supervised(input_dir: Path, run_dir: Path, profile: str, seconds: float,
         exit_code = None
     return collect(run_dir, profile, exit_code, text(supervisor.data["stdout"]),
                    text(supervisor.data["stderr"]), supervisor.failures, relay_record,
-                   credential, permission_mode)
+                   credential, permission_mode, staged_record)
 
 
 def run_research(runtime: list[str], claude: str, prompt: str, input_dir: Path,
                  run_dir: Path, profile: str, seconds: float,
                  relay: RelayLaunch | None, parent: dict[str, str],
                  permission_mode: str = DEFAULT_PERMISSION_MODE,
-                 credential: Credential | None = None) -> bool:
+                 credential: Credential | None = None,
+                 staged: StagedRun | None = None) -> bool:
     """The Claude run: model endpoint plus the relay port once it is ready.
 
     Reached only past require_runtime, which is closed; tests call it directly.
     A credential of another profile is Blocked before anything is built.
+    Without staged it is the read-only run exactly as before; with it, the
+    profile's configuration is staged and its argv and policy are used.
     """
     require_profile(credential, profile)
+    if staged is None:
+        return run_supervised(
+            input_dir, run_dir, profile, seconds, relay,
+            lambda port: build_policy(input_dir, run_dir, Path(claude), port),
+            lambda policy_file: build_command(runtime, policy_file, claude, prompt,
+                                              permission_mode),
+            build_environment(parent, run_dir, credential), credential, permission_mode)
+    staged.check()
+    checked_staged_input(input_dir)
     return run_supervised(
         input_dir, run_dir, profile, seconds, relay,
-        lambda port: build_policy(input_dir, run_dir, Path(claude), port),
-        lambda policy_file: build_command(runtime, policy_file, claude, prompt,
-                                          permission_mode),
-        build_environment(parent, run_dir, credential), credential, permission_mode)
+        lambda port: build_policy(input_dir, run_dir, Path(claude), port, staged=staged),
+        lambda policy_file: build_staged_command(runtime, policy_file, claude, prompt,
+                                                 run_dir, staged, permission_mode),
+        build_environment(parent, run_dir, credential), credential, permission_mode,
+        lambda directory: stage_research_config(directory, staged))
 
 
 def positive_seconds(value: str) -> float:
@@ -1031,6 +1355,13 @@ def main() -> int:
                         default=DEFAULT_PERMISSION_MODE,
                         help="Claude permission mode for the child; auto only changes "
                              "this argument and is not measured")
+    parser.add_argument("--execution-profile", choices=EXECUTION_PROFILES,
+                        default=DEFAULT_EXECUTION_PROFILE,
+                        help="read-only (default) is the restricted run; corpus-extract "
+                             "and deep-research stage reviewed skill sources in a separate run")
+    parser.add_argument("--web-domain", action="append", default=[],
+                        help="a host deep-research may WebFetch; repeat for more. "
+                             "Default none; GitHub domains are refused")
     parser.add_argument("--timeout", type=positive_seconds,
                         default=DEFAULT_TIMEOUT_SECONDS,
                         help="one wall-clock limit over the relay and the child")
@@ -1050,6 +1381,15 @@ def main() -> int:
             arguments.relay_repo, arguments.relay_request_budget,
             arguments.relay_max_response_bytes, arguments.relay_response_byte_budget,
             arguments.relay_timeout_seconds) if arguments.relay_repo else None
+        if arguments.execution_profile == DEFAULT_EXECUTION_PROFILE:
+            if arguments.web_domain:
+                raise ValueError("web domains are for the deep-research profile only")
+            staged = None
+        else:
+            # The reviewed source root is resolved past the gate (reviewed_source_root).
+            staged = StagedRun(arguments.execution_profile, Path(),
+                               tuple(arguments.web_domain)).check()
+            checked_staged_input(input_dir)
     except (OSError, UnicodeError, ValueError) as error:
         print(f"OSS research worker did not start: {error}", file=sys.stderr)
         return EXIT_BAD_INPUT
@@ -1058,13 +1398,15 @@ def main() -> int:
             arguments.profile, arguments.runtime_prefix, os.environ.get("PATH"),
             arguments.credential_file, (input_dir, run_dir))
         relay = relay_launch(relay_request, dict(os.environ)) if relay_request else None
+        if staged is not None:
+            staged = staged._replace(source_root=reviewed_source_root(Path(__file__)))
     except (Blocked, OSError) as error:
         print(f"OSS research worker blocked: {error}", file=sys.stderr)
         return EXIT_BLOCKED
     try:
         succeeded = run_research(runtime, claude, prompt, input_dir, run_dir, arguments.profile,
                                  arguments.timeout, relay, dict(os.environ),
-                                 arguments.permission_mode, credential)
+                                 arguments.permission_mode, credential, staged)
     except (OSError, subprocess.SubprocessError) as error:
         print(f"OSS research worker failed: {error}", file=sys.stderr)
         return EXIT_FAILED
