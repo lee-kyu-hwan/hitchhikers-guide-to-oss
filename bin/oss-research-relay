@@ -1,0 +1,688 @@
+#!/usr/bin/env python3
+"""Serve a loopback, read-only GitHub relay for sandboxed OSS research workers.
+
+The parent starts this relay and lets a sandboxed child reach only its
+127.0.0.1 port. The relay is not a proxy: it accepts a fixed set of
+repository read endpoints and one fixed GraphQL operation, then calls the
+existing #192 clients (``GhApiClient`` and ``GraphqlQueryClient``) without a
+credential. See docs/research/oss-research-relay.md for the contract.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import http.server
+import importlib.util
+import json
+from pathlib import Path
+import re
+import signal
+import socket
+import sys
+import threading
+import time
+from typing import Any, Callable, Optional
+import urllib.error
+import urllib.parse
+import urllib.request
+
+
+HOST = "127.0.0.1"
+GITHUB_API = "https://api.github.com"
+MAX_REQUEST_BYTES = 8 * 1024
+MAX_REQUEST_BUDGET = 10_000
+MAX_RESPONSE_BYTES = 64 * 1024 * 1024
+MAX_RESPONSE_BYTE_BUDGET = 1024 * 1024 * 1024
+MAX_TIMEOUT_SECONDS = 300.0
+MAX_PAGE = 1000
+MAX_ISSUE_NUMBER = 2**31 - 1
+MAX_SEARCH_QUERY = 256
+MAX_CONCURRENT_CONNECTIONS = 8
+CLIENT_SOCKET_TIMEOUT_SECONDS = 10
+READ_CHUNK_BYTES = 64 * 1024
+# Only the trusted parent picks the client source, with --skills-dir; no HTTP
+# field, upstream result, or environment variable can point it elsewhere.
+ISSUES_SCRIPT = Path("collecting-open-source-issues/scripts/collect_open_source_issues.py")
+SIBLING_SCRIPT = Path("collecting-recent-closed-prs/scripts/collect_recent_closed_prs.py")
+INSTALLED_SKILLS_DIR = Path(".codex/skills")
+
+REPOSITORY = re.compile(r"\A([A-Za-z0-9][A-Za-z0-9-]{0,38})/([A-Za-z0-9_.-]{1,100})\Z")
+_REPO = r"/repos/(?P<owner>[^/]+)/(?P<name>[^/]+)"
+_NUMBER = r"(?P<number>[1-9][0-9]{0,9})"
+_SHA = r"(?P<sha>[0-9a-f]{40}|[0-9a-f]{64})"
+_CONTENT_SEGMENT = r"[A-Za-z0-9_-][A-Za-z0-9_.-]{0,254}|\.[A-Za-z0-9_-][A-Za-z0-9_.-]{0,253}"
+_CONTENT_PATH = r"(?P<path>(?:" + _CONTENT_SEGMENT + r")(?:/(?:" + _CONTENT_SEGMENT + r")){0,19})"
+# Each entry: (kind, pattern). The kind selects the response scope check.
+REST_ENDPOINTS = tuple((kind, re.compile(r"\A" + pattern + r"\Z")) for kind, pattern in (
+    ("repository", _REPO),
+    ("license", _REPO + r"/license"),
+    ("item", _REPO + r"/issues/" + _NUMBER),
+    ("list", _REPO + r"/issues/" + _NUMBER + r"/(?:comments|timeline)"),
+    ("item", _REPO + r"/pulls/" + _NUMBER),
+    ("list", _REPO + r"/pulls/" + _NUMBER + r"/(?:files|commits|reviews|comments)"),
+    ("commit", _REPO + r"/commits/" + _SHA),
+    ("contents", _REPO + r"/contents/" + _CONTENT_PATH),
+))
+SEARCH_ENDPOINT = "/search/issues"
+FORBIDDEN_REQUEST_HEADERS = frozenset({
+    "authorization", "cookie", "proxy-authorization", "transfer-encoding",
+    "if-none-match", "if-modified-since", "expect",
+})
+FORWARDED_RESPONSE_HEADERS = ("etag", "link", "x-ratelimit-limit", "x-ratelimit-remaining", "x-ratelimit-reset")
+_SEARCH_SCOPE_WORD = re.compile(r"(?:repo|org|user|owner)\s*:", re.IGNORECASE)
+_SEARCH_OPERATOR = frozenset({"or", "and", "not"})
+
+
+class RelayError(Exception):
+    """A refusal or failure that becomes one JSON error response."""
+
+    def __init__(self, status: int, code: str, message: str, **extra: object) -> None:
+        super().__init__(message)
+        self.status = status
+        self.code = code
+        self.extra = extra
+
+
+class ResponseTooLarge(Exception):
+    """Raised by the bounded opener; not an OSError, so the client does not retry it."""
+
+
+class ByteBudgetExhausted(Exception):
+    """Raised when a body would pass the relay-lifetime response byte budget."""
+
+
+class DeadlineExceeded(Exception):
+    """Raised before an attempt, a read, or a retry wait that would pass the deadline."""
+
+
+def _sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def load_issues_module(skills_dir: Path) -> tuple[Any, list[dict[str, str]]]:
+    """Load the issue collector and its closed-PR sibling, with a provenance manifest.
+
+    Each source is hashed before and after loading; a change in between, or a
+    sibling loaded from anywhere but ``skills_dir``, fails the load.
+    """
+    paths = {"issues": (skills_dir / ISSUES_SCRIPT).resolve(strict=True),
+             "sibling": (skills_dir / SIBLING_SCRIPT).resolve(strict=True)}
+    before = {role: _sha256(path) for role, path in paths.items()}
+    spec = importlib.util.spec_from_file_location("_oss_research_relay_issues", paths["issues"])
+    if spec is None or spec.loader is None:
+        raise ImportError("could not load collecting-open-source-issues")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    loaded = {"issues": Path(module.__file__).resolve(), "sibling": Path(module._sibling.__file__).resolve()}
+    if loaded != paths or {role: _sha256(path) for role, path in paths.items()} != before:
+        raise ImportError("client sources changed or came from another directory while loading")
+    manifest = [{"role": role, "path": str(path), "sha256": before[role]} for role, path in paths.items()]
+    return module, manifest
+
+
+def _unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    """Refuse duplicate JSON keys, which different parsers resolve differently."""
+    document = dict(pairs)
+    if len(document) != len(pairs):
+        raise ValueError("duplicate JSON key")
+    return document
+
+
+def _refuse_constant(name: str) -> object:
+    raise ValueError("non-standard JSON constant " + name)
+
+
+def _no_credential() -> None:
+    """The relay never reads GH_TOKEN, GITHUB_TOKEN, or ``gh auth token``."""
+    return None
+
+
+def _response_socket(response: Any) -> Optional[socket.socket]:
+    """Find the socket under an http.client response, if one is reachable."""
+    stream = getattr(response, "fp", None)
+    stream = getattr(stream, "fp", stream)  # HTTPError wraps the HTTPResponse
+    raw = getattr(stream, "raw", None)
+    sock = getattr(raw, "_sock", None)
+    return sock if isinstance(sock, socket.socket) else None
+
+
+class _BoundedResponse:
+    """Expose only what the client reads, reading the body in deadline-checked chunks."""
+
+    def __init__(self, response: Any, opener: "BoundedOpener") -> None:
+        self._response = response
+        self._opener = opener
+        self.status = response.status if getattr(response, "status", None) is not None else response.code
+        self.headers = response.headers
+
+    def geturl(self) -> str:
+        return self._response.geturl()
+
+    def read(self) -> bytes:
+        opener = self._opener
+        sock = _response_socket(self._response)
+        body = bytearray()
+        while True:
+            remaining = opener.remaining()
+            if remaining is not None and remaining <= 0:
+                raise DeadlineExceeded("relay request deadline passed while reading")
+            if sock is not None and remaining is not None and sock.fileno() != -1:
+                # http.client closes the socket once a sized body is read.
+                sock.settimeout(remaining)
+            # read1 returns after one socket read, so a dripping body cannot hold the deadline.
+            read = getattr(self._response, "read1", self._response.read)
+            chunk = read(READ_CHUNK_BYTES)
+            if not chunk:
+                return bytes(body)
+            body.extend(chunk)
+            opener.bytes_consumed += len(chunk)
+            if len(body) > opener.max_response_bytes:
+                raise ResponseTooLarge("upstream response exceeds the relay size limit")
+            if opener.bytes_consumed > opener.response_byte_budget:
+                raise ByteBudgetExhausted("relay response byte budget is exhausted")
+
+    def close(self) -> None:
+        self._response.close()
+
+
+class BoundedOpener:
+    """Wrap an opener with per-response and lifetime byte caps and the request deadline."""
+
+    def __init__(self, inner: Any, *, max_response_bytes: int, response_byte_budget: int,
+                 clock: Callable[[], float]) -> None:
+        self._inner = inner
+        self._clock = clock
+        self.max_response_bytes = max_response_bytes
+        self.response_byte_budget = response_byte_budget
+        self.bytes_consumed = 0
+        self.deadline: Optional[float] = None
+
+    def remaining(self) -> Optional[float]:
+        return None if self.deadline is None else self.deadline - self._clock()
+
+    def open(self, request: urllib.request.Request, timeout: float) -> _BoundedResponse:
+        if self.bytes_consumed >= self.response_byte_budget:
+            raise ByteBudgetExhausted("relay response byte budget is exhausted")
+        remaining = self.remaining()
+        if remaining is not None and remaining <= 0:
+            raise DeadlineExceeded("relay request deadline passed")
+        if remaining is not None:
+            timeout = min(timeout, remaining)
+        try:
+            response = self._inner.open(request, timeout=timeout)
+        except urllib.error.HTTPError as error:
+            response = error
+        return _BoundedResponse(response, self)
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *args: object) -> None:
+        return None
+
+
+def production_opener() -> Any:
+    """Ignore proxy environment variables and never follow redirects."""
+    return urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect)
+
+
+def _within_repository(url: object, repository: str) -> bool:
+    if not isinstance(url, str):
+        return False
+    prefix = (GITHUB_API + "/repos/" + repository).lower()
+    lowered = url.lower()
+    return lowered == prefix or lowered.startswith(prefix + "/") or lowered.startswith(prefix + "?")
+
+
+class Relay:
+    """Validate relay requests and run the allowed ones through the #192 clients."""
+
+    def __init__(
+        self,
+        *,
+        issues_module: Any,
+        repositories: list[str],
+        request_budget: int,
+        max_response_bytes: int,
+        response_byte_budget: int,
+        timeout_seconds: float,
+        opener: Any,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self.repositories = {repository.lower(): repository for repository in repositories}
+        self.timeout_seconds = timeout_seconds
+        self._clock = clock
+        self._lock = threading.Lock()
+        self._opener = BoundedOpener(opener, max_response_bytes=max_response_bytes,
+                                     response_byte_budget=response_byte_budget, clock=clock)
+        sibling = issues_module._sibling
+        self.budget = sibling.RequestBudget(request_budget)
+        common = dict(
+            budget=self.budget, opener=self._opener, token_provider=_no_credential,
+            sleeper=self._sleep_within_deadline,
+        )
+        self.rest = sibling.GhApiClient(**common)
+        self.graphql = issues_module.GraphqlQueryClient(**common)
+        self.graphql.request_events = self.rest.request_events
+        self._sibling = sibling
+        self._operations = {"IssueEvidence": issues_module.ISSUE_EVIDENCE_QUERY}
+
+    def _sleep_within_deadline(self, seconds: float) -> None:
+        remaining = self._opener.remaining()
+        if remaining is not None and seconds >= remaining:
+            raise DeadlineExceeded("retry wait would pass the relay request deadline")
+        time.sleep(seconds)
+
+    def budget_state(self) -> dict[str, int]:
+        return {"limit": self.budget.limit, "consumed": self.budget.consumed,
+                "response_bytes_limit": self._opener.response_byte_budget,
+                "response_bytes_consumed": self._opener.bytes_consumed}
+
+    def _allowed_repository(self, owner: str, name: str) -> str:
+        repository = "{0}/{1}".format(owner, name)
+        if REPOSITORY.match(repository) is None or repository.lower() not in self.repositories:
+            raise RelayError(403, "repository_not_allowed", "repository is not in the relay allowlist")
+        return self.repositories[repository.lower()]
+
+    def check_rest(self, target: str) -> tuple[str, dict[str, object], str, dict[str, str]]:
+        """Return endpoint, params, and scope facts, or raise before any upstream call."""
+        if not target.startswith("/v1/rest/"):
+            raise RelayError(404, "not_found", "unknown relay route")
+        path, _, query = target[len("/v1/rest"):].partition("?")
+        if any(character in path for character in "%\\;#\r\n\0") or "//" in path:
+            raise RelayError(400, "bad_path", "encoded, empty, or escaped path segments are refused")
+        if any(segment in ("", ".", "..") for segment in path.split("/")[1:]):
+            raise RelayError(400, "bad_path", "empty or dot path segments are refused")
+        if any(character in query for character in "#\r\n\0"):
+            raise RelayError(400, "bad_query", "query string holds a forbidden character")
+        try:
+            pairs = urllib.parse.parse_qsl(query, keep_blank_values=True, strict_parsing=bool(query))
+        except ValueError as error:
+            raise RelayError(400, "bad_query", "query string is malformed") from error
+        names = [name for name, _value in pairs]
+        if len(set(names)) != len(names):
+            raise RelayError(400, "bad_query", "query parameters must not repeat")
+        values = dict(pairs)
+        params: dict[str, object] = {}
+        facts: dict[str, str] = {}
+        if path == SEARCH_ENDPOINT:
+            kind, allowed = "search", {"q", "page"}
+            params["q"] = values.get("q")
+            facts["repository"] = self._check_search_query(values.get("q"))
+        else:
+            kind, match = next(
+                ((kind, pattern.match(path)) for kind, pattern in REST_ENDPOINTS if pattern.match(path)),
+                ("", None),
+            )
+            if match is None:
+                raise RelayError(403, "endpoint_not_allowed", "endpoint is not in the relay allowlist")
+            canonical = self._allowed_repository(match.group("owner"), match.group("name"))
+            facts["repository"] = canonical
+            suffix = path[len("/repos/{0}/{1}".format(match.group("owner"), match.group("name"))):]
+            path = "/repos/" + canonical + suffix
+            allowed = {"page"}
+            if kind == "commit":
+                facts["sha"] = match.group("sha")
+                allowed = set()
+            elif kind == "contents":
+                facts["path"] = match.group("path")
+                allowed = {"ref"}
+                ref = values.get("ref")
+                if ref is None or re.fullmatch(_SHA, ref) is None:
+                    raise RelayError(400, "bad_query", "contents needs ref set to a full lowercase commit SHA")
+                params["ref"] = ref
+            elif kind in ("repository", "license", "item"):
+                allowed = set()
+        if set(values) - allowed:
+            raise RelayError(400, "query_not_allowed", "query parameter is not in the relay allowlist")
+        if "page" in values:
+            page = values["page"]
+            if re.fullmatch(r"[1-9][0-9]{0,3}", page) is None or int(page) > MAX_PAGE:
+                raise RelayError(400, "bad_query", "page must be an integer from 1 to 1000")
+            params["page"] = int(page)
+        return path, params, kind, facts
+
+    def _check_search_query(self, query: Optional[str]) -> str:
+        """Accept only a flat query with exactly one allowed ``repo:`` qualifier.
+
+        Boolean operators, parentheses, negation, and any second scope word are
+        refused because they can widen the search past the repository.
+        """
+        if (
+            not isinstance(query, str) or not query.strip() or len(query) > MAX_SEARCH_QUERY
+            or any(ord(character) < 0x20 or ord(character) == 0x7F for character in query)
+        ):
+            raise RelayError(400, "bad_query", "search q must be short printable text")
+        tokens = query.split()
+        # Quotes are refused outright: a qualifier inside a quoted phrase is
+        # text to GitHub, so it would not scope the search.
+        if (
+            any(character in query for character in "()\\\"'")
+            or any(token.startswith(("-", "~", "!")) for token in tokens)
+            or any(token.lower() in _SEARCH_OPERATOR for token in tokens)
+        ):
+            raise RelayError(403, "search_grammar_not_allowed",
+                             "search q must not use boolean operators, grouping, or negation")
+        scoped = [token for token in tokens if re.fullmatch(r"repo:\S+", token, re.IGNORECASE)]
+        if len(_SEARCH_SCOPE_WORD.findall(query)) != 1 or len(scoped) != 1:
+            raise RelayError(403, "search_scope_not_allowed", "search q must hold exactly one repo: qualifier")
+        owner, _, name = scoped[0][len("repo:"):].partition("/")
+        return self._allowed_repository(owner, name)
+
+    def check_graphql(self, body: bytes) -> dict[str, object]:
+        try:
+            document = json.loads(body.decode("utf-8"), object_pairs_hook=_unique_object,
+                                  parse_constant=_refuse_constant)
+        except (UnicodeDecodeError, ValueError) as error:
+            raise RelayError(400, "bad_json", "GraphQL relay body must be JSON without duplicate keys") from error
+        if not isinstance(document, dict) or set(document) != {"operation", "variables"}:
+            raise RelayError(400, "bad_graphql", "body must hold exactly operation and variables")
+        if not isinstance(document["operation"], str):
+            raise RelayError(400, "bad_graphql", "operation must be a string")
+        if document["operation"] not in self._operations:
+            raise RelayError(403, "operation_not_allowed", "only fixed read operations are relayed")
+        variables = document["variables"]
+        if not isinstance(variables, dict) or set(variables) != {"owner", "name", "number"}:
+            raise RelayError(400, "bad_variables", "variables must be exactly owner, name, and number")
+        owner, name, number = variables["owner"], variables["name"], variables["number"]
+        if not isinstance(owner, str) or not isinstance(name, str):
+            raise RelayError(400, "bad_variables", "owner and name must be strings")
+        if not isinstance(number, int) or isinstance(number, bool) or not 1 <= number <= MAX_ISSUE_NUMBER:
+            raise RelayError(400, "bad_variables", "number must be a positive integer")
+        canonical_owner, _, canonical_name = self._allowed_repository(owner, name).partition("/")
+        return {"operation": document["operation"],
+                "variables": {"owner": canonical_owner, "name": canonical_name, "number": number}}
+
+    @staticmethod
+    def check_scope(kind: str, facts: dict[str, str], payload: object) -> Optional[str]:
+        """Return why a successful payload is outside the requested scope, or None."""
+        repository = facts.get("repository", "")
+        if kind == "repository":
+            if not isinstance(payload, dict) or not isinstance(payload.get("full_name"), str) \
+                    or payload["full_name"].lower() != repository.lower():
+                return "repository response names another repository"
+        elif kind in ("license", "item"):
+            if not isinstance(payload, dict) or not _within_repository(payload.get("url"), repository):
+                return "response url is outside the repository"
+        elif kind == "list":
+            if not isinstance(payload, list):
+                return "list endpoint did not return an array"
+        elif kind == "commit":
+            if not isinstance(payload, dict) or payload.get("sha") != facts["sha"] \
+                    or not _within_repository(payload.get("url"), repository):
+                return "commit response names another commit or repository"
+        elif kind == "contents":
+            entries = payload if isinstance(payload, list) else [payload]
+            if not all(isinstance(entry, dict) and _within_repository(entry.get("url"), repository)
+                       for entry in entries):
+                return "contents response is outside the repository"
+            if isinstance(payload, dict) and payload.get("path") != facts["path"]:
+                return "contents response names another path"
+        elif kind == "search":
+            items = payload.get("items") if isinstance(payload, dict) else None
+            if not isinstance(items, list) or not all(
+                isinstance(item, dict) and isinstance(item.get("repository_url"), str)
+                and item["repository_url"].lower() == (GITHUB_API + "/repos/" + repository).lower()
+                for item in items
+            ):
+                return "search result holds an item from another repository"
+        elif kind == "graphql":
+            if not isinstance(payload, dict) or not set(payload) & {"data", "errors"}:
+                return "GraphQL response has neither data nor errors"
+        return None
+
+    def call(self, fetch: Callable[[], Any], endpoint: str, kind: str, facts: dict[str, str]) -> dict[str, object]:
+        """Run one checked call under the request deadline and map failures to relay errors."""
+        deadline = self._clock() + self.timeout_seconds
+        if not self._lock.acquire(timeout=self.timeout_seconds):
+            raise RelayError(504, "relay_busy_timeout", "relay request deadline passed while queued")
+        try:
+            self._opener.deadline = deadline
+            try:
+                response = fetch()
+            except ResponseTooLarge as error:
+                raise RelayError(502, "upstream_too_large", str(error), endpoint=endpoint) from error
+            except ByteBudgetExhausted as error:
+                raise RelayError(429, "byte_budget_exhausted", str(error), endpoint=endpoint) from error
+            except DeadlineExceeded as error:
+                raise RelayError(504, "upstream_timeout", str(error), endpoint=endpoint) from error
+            except self._sibling.BudgetExhausted as error:
+                raise RelayError(429, "budget_exhausted", "relay request budget is exhausted") from error
+            except self._sibling.ApiFailure as error:
+                if self._clock() >= deadline:
+                    raise RelayError(504, "upstream_timeout", "relay request deadline passed",
+                                     endpoint=endpoint) from error
+                raise RelayError(502, "upstream_failed", str(error), endpoint=endpoint,
+                                 upstream_status=error.status) from error
+            finally:
+                self._opener.deadline = None
+        finally:
+            self._lock.release()
+        problem = self.check_scope(kind, facts, response.payload)
+        if problem is not None:
+            raise RelayError(502, "upstream_out_of_scope", problem, endpoint=endpoint)
+        headers = {name: response.headers[name] for name in FORWARDED_RESPONSE_HEADERS if name in response.headers}
+        return {"ok": True, "status": response.status, "headers": headers, "payload": response.payload}
+
+    def rest_get(self, target: str) -> dict[str, object]:
+        endpoint, params, kind, facts = self.check_rest(target)
+        return self.call(lambda: self.rest.get_json(endpoint, params or None), "GET " + endpoint, kind, facts)
+
+    def graphql_post(self, body: bytes) -> dict[str, object]:
+        checked = self.check_graphql(body)
+        document = self._operations[checked["operation"]]
+        return self.call(lambda: self.graphql.query(document, checked["variables"]),
+                         "GraphQL query " + checked["operation"], "graphql", {})
+
+
+class RelayHandler(http.server.BaseHTTPRequestHandler):
+    server_version = "oss-research-relay"
+    sys_version = ""
+    protocol_version = "HTTP/1.1"
+    timeout = CLIENT_SOCKET_TIMEOUT_SECONDS
+
+    @property
+    def relay(self) -> Relay:
+        return self.server.relay  # type: ignore[attr-defined]
+
+    def log_message(self, format: str, *args: object) -> None:
+        return None
+
+    def _send(self, status: int, document: dict[str, object]) -> None:
+        body = json.dumps(document, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.wfile.write(body)
+        self.close_connection = True
+
+    def _send_error(self, error: RelayError) -> None:
+        document: dict[str, object] = {"ok": False, "error": error.code, "message": str(error)}
+        document.update(error.extra)
+        document["budget"] = self.relay.budget_state()
+        self._send(error.status, document)
+
+    def _check_common(self) -> None:
+        expected_host = "{0}:{1}".format(HOST, self.server.server_address[1])
+        if self.headers.get_all("Host") != [expected_host]:
+            raise RelayError(400, "bad_host", "Host header must name the relay loopback address")
+        if any(name.lower() in FORBIDDEN_REQUEST_HEADERS for name in self.headers.keys()):
+            raise RelayError(400, "header_not_allowed",
+                             "credential, cookie, conditional, expect, and chunked headers are refused")
+        if not self.path.startswith("/"):
+            raise RelayError(400, "bad_target", "absolute-form and authority-form targets are refused")
+
+    def _read_body(self) -> bytes:
+        length = self.headers.get("Content-Length")
+        if length is None or re.fullmatch(r"[0-9]{1,6}", length) is None:
+            raise RelayError(411, "length_required", "POST needs a Content-Length")
+        if int(length) > MAX_REQUEST_BYTES:
+            raise RelayError(413, "request_too_large", "relay request body is too large")
+        return self.rfile.read(int(length))
+
+    def _handle(self, method: str) -> None:
+        try:
+            self._check_common()
+            route = self.path.partition("?")[0]
+            if route == "/v1/health":
+                if method != "GET" or self.path != route:
+                    raise RelayError(405, "method_not_allowed", "health accepts only GET without a query")
+                self._send(200, {"ok": True, "budget": self.relay.budget_state()})
+            elif route == "/v1/graphql":
+                if method != "POST" or self.path != route:
+                    raise RelayError(405, "method_not_allowed", "GraphQL relay accepts only POST without a query")
+                if self.headers.get_content_type() != "application/json":
+                    raise RelayError(415, "bad_content_type", "GraphQL relay body must be application/json")
+                result = self.relay.graphql_post(self._read_body())
+                self._send(200, dict(result, budget=self.relay.budget_state()))
+            elif route.startswith("/v1/rest/"):
+                if method != "GET":
+                    raise RelayError(405, "method_not_allowed", "REST relay accepts only GET")
+                if self.headers.get("Content-Length") not in (None, "0"):
+                    raise RelayError(400, "unexpected_body", "GET must not carry a body")
+                result = self.relay.rest_get(self.path)
+                self._send(200, dict(result, budget=self.relay.budget_state()))
+            else:
+                raise RelayError(404, "not_found", "unknown relay route")
+        except RelayError as error:
+            self._send_error(error)
+
+    def do_GET(self) -> None:
+        self._handle("GET")
+
+    def do_POST(self) -> None:
+        self._handle("POST")
+
+    def _refuse(self) -> None:
+        self._send_error(RelayError(405, "method_not_allowed", "method is not relayed"))
+
+    do_HEAD = do_PUT = do_PATCH = do_DELETE = do_OPTIONS = do_TRACE = do_CONNECT = _refuse
+
+
+class RelayServer(http.server.ThreadingHTTPServer):
+    """Loopback-only server with a hard cap on concurrent connection threads."""
+
+    daemon_threads = True
+    allow_reuse_address = False
+
+    def __init__(self, relay: Relay) -> None:
+        super().__init__((HOST, 0), RelayHandler)
+        self.relay = relay
+        self._slots = threading.BoundedSemaphore(MAX_CONCURRENT_CONNECTIONS)
+
+    def verify_request(self, request: Any, client_address: Any) -> bool:
+        return client_address[0] == HOST
+
+    def process_request(self, request: Any, client_address: Any) -> None:
+        if not self._slots.acquire(blocking=False):
+            self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            self._slots.release()
+            raise
+
+    def process_request_thread(self, request: Any, client_address: Any) -> None:
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._slots.release()
+
+
+def _positive_int(limit: int) -> Callable[[str], int]:
+    def parse(value: str) -> int:
+        if re.fullmatch(r"[1-9][0-9]*", value) is None or int(value) > limit:
+            raise argparse.ArgumentTypeError("must be an integer from 1 to {0}".format(limit))
+        return int(value)
+    return parse
+
+
+def _timeout(value: str) -> float:
+    try:
+        seconds = float(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("must be a number of seconds") from error
+    if not 0 < seconds <= MAX_TIMEOUT_SECONDS:
+        raise argparse.ArgumentTypeError("must be above 0 and at most 300")
+    return seconds
+
+
+def _absolute_directory(value: str) -> Path:
+    path = Path(value)
+    if not path.is_absolute():
+        raise argparse.ArgumentTypeError("must be an absolute path")
+    return path
+
+
+def _repository(value: str) -> str:
+    if REPOSITORY.match(value) is None:
+        raise argparse.ArgumentTypeError("must be OWNER/NAME")
+    return value
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="oss-research-relay",
+        description="Serve a read-only GitHub relay on 127.0.0.1 for one research run.",
+    )
+    parser.add_argument("--repo", dest="repositories", action="append", required=True, type=_repository,
+                        help="allowed OWNER/NAME; repeat for more")
+    parser.add_argument("--request-budget", required=True, type=_positive_int(MAX_REQUEST_BUDGET),
+                        help="upstream attempts allowed for the relay lifetime, retries included")
+    parser.add_argument("--max-response-bytes", required=True, type=_positive_int(MAX_RESPONSE_BYTES),
+                        help="largest upstream response body accepted")
+    parser.add_argument("--response-byte-budget", required=True, type=_positive_int(MAX_RESPONSE_BYTE_BUDGET),
+                        help="upstream response body bytes allowed for the relay lifetime")
+    parser.add_argument("--timeout-seconds", required=True, type=_timeout,
+                        help="deadline for one relay request after its body is read; see the docs for its limits")
+    parser.add_argument("--skills-dir", type=_absolute_directory, default=None,
+                        help="absolute directory holding the collecting-* skills to load "
+                             "(default: $HOME/.codex/skills)")
+    return parser
+
+
+def build_server(args: argparse.Namespace, *, opener: Any, issues_module: Any) -> RelayServer:
+    relay = Relay(
+        issues_module=issues_module, repositories=args.repositories, request_budget=args.request_budget,
+        max_response_bytes=args.max_response_bytes, response_byte_budget=args.response_byte_budget,
+        timeout_seconds=args.timeout_seconds, opener=opener,
+    )
+    return RelayServer(relay)
+
+
+def main(argv: Optional[list[str]] = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if len({repository.lower() for repository in args.repositories}) != len(args.repositories):
+        parser.error("--repo values must be unique")
+    skills_dir = args.skills_dir if args.skills_dir is not None else Path.home() / INSTALLED_SKILLS_DIR
+    try:
+        issues_module, sources = load_issues_module(skills_dir)
+    except (OSError, ImportError) as error:
+        print("error: could not load the installed collecting skills: {0}".format(type(error).__name__),
+              file=sys.stderr)
+        return 2
+    server = build_server(args, opener=production_opener(), issues_module=issues_module)
+
+    def stop(_signum: int, _frame: object) -> None:
+        threading.Thread(target=server.shutdown, daemon=True).start()
+
+    signal.signal(signal.SIGTERM, stop)
+    signal.signal(signal.SIGINT, stop)
+    port = server.server_address[1]
+    print(json.dumps({"event": "ready", "host": HOST, "port": port,
+                      "base_url": "http://{0}:{1}".format(HOST, port), "sources": sources}), flush=True)
+    try:
+        server.serve_forever()
+    finally:
+        server.server_close()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

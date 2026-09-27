@@ -1,0 +1,246 @@
+# OSS 조사 읽기 전용 relay
+
+`oss-research-relay`는 #192의 부모 소유 relay다. 부모가 실행하고, 샌드박스
+안의 조사 워커(child)는 이 relay의 `127.0.0.1` 포트만 목적지로 허용받는다.
+child는 GitHub에 직접 연결하지 않는다. relay는 범용 proxy가 아니다. 정해진
+저장소 읽기 endpoint와 고정 GraphQL operation 하나만 받는다. 받은 요청은
+기존 #192 클라이언트(`GhApiClient`, `GraphqlQueryClient`)로 인증 없이 보낸다.
+
+srt는 목적지 host:port만 제한한다. 허용된 서버가 GitHub 자체라면 REST
+POST, GraphQL mutation, git push 탐색 요청도 그 서버에 도달한다. 그래서
+허용 목적지를 이 relay로 바꾸고, 쓰기 요청은 relay가 upstream 호출 전에
+거부한다.
+
+이 문서와 테스트는 로컬 fixture만 사용한다. 실제 GitHub 호출 성공, 익명
+GraphQL 성공, 모델 인증의 증거가 아니다. GitHub GraphQL은 인증이 필요하므로
+익명 relay에서는 실패할 수 있다. 실제 제품 사용 전 launcher gate는 닫힌
+상태로 둔다. socket 서비스의 runtime 보호는 #189가 통합하여 검증한다.
+
+## 실행
+
+```bash
+oss-research-relay --repo OWNER/NAME [--repo OWNER/.github ...] \
+  --request-budget N --max-response-bytes N \
+  --response-byte-budget N --timeout-seconds S \
+  [--skills-dir /absolute/path/to/skills]
+```
+
+`--skills-dir`를 뺀 인자는 모두 필수이고 기본값이 없다. 부모가 경계를
+명시해야 한다.
+
+| 인자 | 의미 | 범위 |
+| --- | --- | --- |
+| `--repo` | 허용 저장소. 반복 가능. 대소문자 무시, 중복 거부 | `OWNER/NAME` |
+| `--request-budget` | relay 수명 전체의 upstream 시도 수. 재시도 포함 | 1–10000 |
+| `--max-response-bytes` | 응답 본문 하나의 최대 바이트 | 1–64MiB |
+| `--response-byte-budget` | relay 수명 전체의 응답 본문 바이트 합계 | 1–1GiB |
+| `--timeout-seconds` | relay 요청 하나의 부분 기한. 범위는 아래 "기한" 참고 | 0초 초과 300초 이하 |
+| `--skills-dir` | 클라이언트 source를 읽을 skills 디렉터리. 절대 경로만 | 기본 `$HOME/.codex/skills` |
+
+upstream URL과 opener를 바꾸는 인자는 없다. 클라이언트 source는 신뢰된
+부모가 `--skills-dir`로 고른 디렉터리에서만 읽는다. 생략하면
+`$HOME/.codex/skills`를 쓴다. 그 디렉터리의
+`collecting-open-source-issues/scripts/collect_open_source_issues.py`를
+불러오고, 그 파일이 같은 디렉터리의
+`collecting-recent-closed-prs/scripts/collect_recent_closed_prs.py`를
+불러온다.
+
+설치본(`~/.codex/skills`)은 새 #192 전송 코드보다 오래된 `gh` 기반 구현일 수
+있다. 그러면 relay 동작이 이 문서와 달라진다. #189 통합에서는 검토한
+worktree의 `dot_codex/skills` 절대 경로를 `--skills-dir`로 넘겨야 한다. relay는
+설치본을 편집하거나 배포하지 않는다.
+
+HTTP 요청, upstream 결과, fixture, 환경 변수로는 source 경로를 고를 수
+없다. 두 파일은 로드 전후에 SHA-256을 계산한다. 값이 바뀌었거나 sibling이
+다른 디렉터리에서 로드되면 실패한다. source가 없거나 로드에 실패하면 stdout
+없이 종료 코드 2로 끝난다.
+
+준비되면 stdout에 JSON 한 줄을 쓴다. `sources`는 실제로 로드한 두 파일의
+resolve된 경로와 SHA-256이다. 부모는 이 값을 provenance로 기록하고, 검토한
+커밋의 파일 hash와 대조한다. 이후 SIGTERM이나 SIGINT를 받을 때까지
+서비스하고 종료 코드 0으로 끝난다.
+
+```json
+{"event":"ready","host":"127.0.0.1","port":54321,"base_url":"http://127.0.0.1:54321",
+ "sources":[{"role":"issues","path":"/…/collect_open_source_issues.py","sha256":"…"},
+            {"role":"sibling","path":"/…/collect_recent_closed_prs.py","sha256":"…"}]}
+```
+
+bind 주소는 `127.0.0.1:0`으로 고정이다. 포트는 커널이 고른다.
+
+## HTTP 계약
+
+모든 요청의 `Host` 헤더는 정확히 `127.0.0.1:<port>`여야 한다. 응답은 항상
+`application/json`, `Connection: close`, `Cache-Control: no-store`다.
+
+### `GET /v1/health`
+
+upstream을 호출하지 않는다. `{"ok":true,"budget":{...}}`를 돌려준다.
+
+### `GET /v1/rest/<GitHub path>[?query]`
+
+허용 endpoint는 다음과 같다. `O/N`은 `--repo` 허용목록에 있어야 한다.
+`owner/.github`도 목록에 명시해야 읽을 수 있다.
+
+| endpoint | query | 응답 범위 검사 |
+| --- | --- | --- |
+| `/repos/O/N` | 없음 | `full_name`이 요청 저장소 |
+| `/repos/O/N/license` | 없음 | `url`이 요청 저장소 아래 |
+| `/repos/O/N/issues/K`, `/repos/O/N/pulls/K` | 없음 | `url`이 요청 저장소 아래 |
+| `/repos/O/N/issues/K/{comments,timeline}` | `page` | 배열 |
+| `/repos/O/N/pulls/K/{files,commits,reviews,comments}` | `page` | 배열 |
+| `/repos/O/N/commits/<SHA>` | 없음 | `sha` 일치, `url`이 요청 저장소 아래 |
+| `/repos/O/N/contents/<path>` | `ref=<SHA>` 필수 | 각 항목 `url`이 요청 저장소 아래, 파일이면 `path` 일치 |
+| `/search/issues` | `q`, `page` | 모든 `items[].repository_url`이 요청 저장소 |
+
+- `K`는 1–10자리 양의 정수다. `SHA`는 소문자 40자리 또는 64자리 hex다.
+  branch 이름 ref는 받지 않는다.
+- contents 경로는 `/`로 나뉜 1–20개 세그먼트다. 세그먼트는
+  `[A-Za-z0-9_.-]`이고 `.`, `..`는 안 된다. `.github` 같은 점 시작 이름은
+  허용한다.
+- `page`는 1–1000 정수다. `per_page`는 기존 클라이언트가 100으로 고정하므로
+  받지 않는다. 같은 query 이름을 반복하면 거부한다.
+- `search/issues`의 `q`는 256자 이하 출력 가능한 문자다. `repo:O/N` 토큰이
+  정확히 하나 있어야 한다. `repo|org|user|owner` 뒤에 `:`가 붙은 형태가 그
+  하나 말고는 없어야 한다. `OR`/`AND`/`NOT`, 괄호, 역슬래시, `-`·`~`·`!` 시작
+  토큰은 범위를 넓힐 수 있으므로 거부한다. 큰따옴표와 작은따옴표는 모두
+  거부한다. 인용 phrase 안의 `repo:`는 GitHub에서 범위가 아니라 텍스트이기
+  때문이다(예: `"foo repo:a/b bar"`). 그래서 공백이 든 label 같은 인용 검색은
+  지원하지 않는다.
+- path에 `%`, `\`, `;`, `#`, 제어문자, `//`, 빈 세그먼트, dot 세그먼트가 있으면
+  거부한다. 퍼센트 인코딩된 path는 디코딩하지 않고 그대로 거부한다.
+
+### `POST /v1/graphql`
+
+`Content-Type: application/json`이어야 하고, 본문은 8KiB 이하여야 한다.
+query string은 붙일 수 없다.
+
+```json
+{"operation":"IssueEvidence","variables":{"owner":"O","name":"N","number":1}}
+```
+
+`operation`은 `IssueEvidence` 하나만 받는다. relay는
+`collect_open_source_issues.ISSUE_EVIDENCE_QUERY` 문서를 그대로
+`GraphqlQueryClient.query`에 넘긴다. 변수는 정확히 `owner`, `name`,
+`number`(bool이 아닌 1–2^31-1 정수)여야 한다. `operation`, `owner`, `name`은
+문자열이어야 한다. 배열·객체·null·bool이면 upstream 호출 없이 400이다.
+저장소는 허용목록에 있어야 한다. JSON 어느 깊이에서든 같은 키가 두 번
+나오면 해석이 갈릴 수 있으므로 400 `bad_json`으로 거부한다. `NaN`,
+`Infinity` 같은 비표준 상수도 같다. `query` 키나 다른 키가 있으면 거부하므로 child가 임의의 GraphQL
+문서를 보낼 수 없다. relay에 새 GraphQL parser는 없다. 응답은 `data` 또는
+`errors`를 가진 객체여야 한다.
+
+### 응답
+
+성공하면 HTTP 200이다.
+
+```json
+{"ok":true,"status":200,"headers":{"etag":"...","link":"..."},"payload":<JSON>,
+ "budget":{"limit":N,"consumed":n,"response_bytes_limit":B,"response_bytes_consumed":b}}
+```
+
+전달하는 응답 헤더는 `etag`, `link`, `x-ratelimit-limit`,
+`x-ratelimit-remaining`, `x-ratelimit-reset`뿐이다.
+
+실패 응답은 `{"ok":false,"error":<code>,"message":...,"budget":{...}}`다.
+upstream 실패에는 `endpoint`와 `upstream_status`가 붙을 수 있다.
+
+| HTTP | code | 원인 | upstream 호출 |
+| --- | --- | --- | --- |
+| 400 | `bad_host`, `bad_target`, `header_not_allowed`, `bad_path`, `bad_query`, `query_not_allowed`, `bad_json`, `bad_graphql`, `bad_variables`, `unexpected_body` | 형식·헤더·경로·query 거부 | 없음 |
+| 403 | `endpoint_not_allowed`, `repository_not_allowed`, `operation_not_allowed`, `search_scope_not_allowed`, `search_grammar_not_allowed` | 허용목록 밖 | 없음 |
+| 404 | `not_found` | 알 수 없는 relay 경로 | 없음 |
+| 405 | `method_not_allowed` | REST GET 외 method, CONNECT, HEAD, OPTIONS, TRACE | 없음 |
+| 411/413/415 | `length_required`, `request_too_large`, `bad_content_type` | GraphQL 본문 형식 | 없음 |
+| 429 | `budget_exhausted`, `byte_budget_exhausted` | 요청·바이트 예산 소진 | 소진 뒤 없음 |
+| 502 | `upstream_failed` | 비 2xx(redirect 포함), 잘못된 JSON, 전송 실패 | 있음 |
+| 502 | `upstream_too_large` | 응답 크기 상한 초과 | 있음 |
+| 502 | `upstream_out_of_scope` | 성공 응답이 요청 범위 밖 | 있음 |
+| 504 | `upstream_timeout`, `relay_busy_timeout` | 기한 초과 | 있을 수 있음 |
+
+## 보안 제약
+
+- 인증 없음: 두 클라이언트에 `token_provider`로 항상 `None`을 주입한다.
+  `GH_TOKEN`, `GITHUB_TOKEN`, `gh auth token`을 읽지 않는다. child가 보낸
+  `Authorization`, `Proxy-Authorization`, `Cookie`는 전달하지 않고 요청 자체를
+  400으로 거부한다. `If-None-Match`, `If-Modified-Since`, `Expect`,
+  `Transfer-Encoding`도 거부한다.
+- 목적지 고정: upstream은 기존 클라이언트가 만드는
+  `https://api.github.com`뿐이다. 기존 `_check_read_only_request`가 GET과
+  `/graphql` query POST만 통과시킨다. 제품 opener는 `ProxyHandler({})`로
+  `HTTPS_PROXY` 같은 환경 proxy를 무시하고 redirect를 따라가지 않는다.
+  3xx는 `upstream_failed`다. absolute-form·authority-form 요청 대상, CONNECT,
+  다른 `Host`는 거부한다.
+- 쓰기 없음: REST는 GET만 받는다. GraphQL은 고정 query 하나만 받는다.
+  clone, `git-upload-pack`, `git-receive-pack`, Git Data API, 모든 쓰기
+  endpoint는 허용목록에 없다.
+- 예산: 요청 예산은 재시도를 포함한 upstream 시도마다 차감되고 relay 수명
+  동안 공유된다. 응답 바이트 예산도 모든 요청의 합계다. upstream 호출은 lock
+  하나로 직렬화하므로 여러 연결이 동시에 와도 합계가 정확하다.
+- 기한: `--timeout-seconds`는 relay 요청 하나의 총 wall-clock 상한이
+  아니다. 기한은 child 요청의 헤더와 본문을 다 받고 검증을 통과한 뒤
+  upstream 호출에 들어갈 때 시작한다. 이 기한이 실제로 보장하는 것은 다음
+  세 가지다.
+  - lock 대기: 기한 안에 lock을 못 잡으면 504 `relay_busy_timeout`이다.
+  - 재시도 대기: 남은 시간을 넘기는 대기는 하지 않고 504를 낸다.
+  - 응답 본문 읽기: 본문은 `read1`으로 socket read 하나씩 읽는다. 매번 남은
+    시간으로 socket timeout을 다시 설정하므로 조금씩 흘려 보내는 본문도
+    기한 근처에서 끊긴다.
+
+  다음 구간에는 총 시간 상한이 없다.
+  - child 요청 수신: 연결별 socket timeout 10초는 recv 한 번마다 적용된다.
+    천천히 흘려 보내는 요청 헤더는 이보다 오래 스레드를 붙잡을 수 있다.
+    동시 연결 8개 상한만 적용된다.
+  - `urllib` open: DNS 조회에는 timeout이 없다. TCP 연결, TLS handshake, 응답
+    헤더 수신은 socket 연산 하나마다 `min(30초, 남은 시간)`만 적용된다.
+    헤더를 조금씩 흘리는 upstream은 기한을 넘길 수 있다.
+
+  따라서 relay 프로세스 전체의 wall-clock timeout은 #189 부모의 필수
+  계약이다. 부모는 조사 run의 총 기한이 지나면 relay 프로세스를 종료해야
+  한다. child의 relay 요청에도 자체 timeout을 둬야 한다.
+- 연결 수: 동시 연결 스레드는 최대 8개다. 초과 연결은 즉시 닫는다. 연결마다
+  client socket timeout은 10초다. `127.0.0.1` 밖 client 주소는 받지 않는다.
+- 결과 처리: relay는 upstream 본문을 JSON으로 파싱해 그대로 돌려줄 뿐이다.
+  실행하거나 해석하지 않는다. child도 결과를 데이터로만 다뤄야 한다.
+
+## 미지원
+
+- 인증 토큰, 모델 auth broker, 사용자 credential 전달
+- clone, `git-upload-pack`, archive(`tarball`/`zipball`)
+- `/search/code`, `/user`, `/versions`, 조직·사용자 endpoint
+- branch 이름 ref(`commits/main`, `contents?ref=main`). 먼저 SHA로 해석해야 한다
+- 조건부 요청(`If-None-Match`)과 캐시
+- 목록 endpoint의 `state`, `sort`, `since` 같은 추가 query
+- `IssueEvidence` 외 GraphQL operation
+- upstream override. 테스트만 모듈 함수에 로컬 opener를 주입한다
+
+## 테스트
+
+```bash
+python3 -m unittest tests.test_oss_research_relay
+```
+
+테스트는 `socket.connect`를 감싸 `127.0.0.1` 밖 연결을 모두 거부한다.
+CLI subprocess에는 `tests/fixtures/oss_research_relay/sitecustomize.py`를
+`PYTHONPATH`로 넣어 같은 보호를 건다. relay의 upstream은 테스트 전용
+opener가 로컬 fixture HTTP 서버로 보낸다. 이렇게 child→relay와
+relay→fixture 구간 모두 실제 HTTP로 검사한다. 부모 환경에
+`GH_TOKEN`/`GITHUB_TOKEN`/`HTTPS_PROXY`를 넣은 상태에서 다음을 확인한다.
+
+- 허용 읽기: REST 목록·단건·commit·contents·search와 GraphQL
+  `IssueEvidence`가 익명 GET·고정 POST로만 나간다.
+- 거부: 각 쓰기 method, 허용목록 밖 endpoint·저장소, 인코딩 path,
+  traversal, SSRF 형태, CONNECT, Host 위조, credential 헤더, 추가
+  query, 범위 이탈 search 문법, raw GraphQL·mutation, 잘못된 변수. 모두
+  upstream 호출 0회다.
+- upstream 실패: redirect 미추종, 크기 초과, 잘못된 JSON, 범위 밖 응답,
+  요청 예산(재시도 포함), 바이트 예산, 느린 응답, 조금씩 흘리는 본문,
+  대기열 기한, 연결 수 상한.
+- search 인용 거부: `"foo repo:a/b bar"` 같은 인용 phrase 안의 scope를
+  checker 단위와 HTTP 단위 모두에서 거부한다.
+- GraphQL 타입: `operation`이 배열·객체·null·bool·숫자이거나 변수 타입이
+  틀리면 400이다. 중복 키와 `NaN`/`Infinity`는 400 `bad_json`이다.
+- CLI: 경계 인자 필수, 알 수 없는 인자 거부, 상대 경로이거나 source가 없는
+  `--skills-dir` 거부, ready 줄, `sources` 경로·SHA-256 기록, 로드 중 hash
+  변경 시 실패, HTTP query로 source 지정 불가, health, SIGTERM 종료,
+  기본 스킬 경로가 없으면 종료 코드 2.
