@@ -9,11 +9,13 @@ what is recorded), not that any token authenticates or belongs to an account.
 
 import importlib.machinery
 import importlib.util
+import hashlib
 import json
 import os
 from pathlib import Path
 import pickle
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
@@ -22,10 +24,15 @@ from unittest import mock
 
 
 SCRIPT = Path(__file__).resolve().parents[1] / "dot_local/bin/executable_oss-research-worker"
+# srt's socket paths stay short; Linux has no /private.
+SHORT_TMP = "/tmp" if sys.platform == "linux" else "/private/tmp"
 LOADER = importlib.machinery.SourceFileLoader("oss_research_worker_auth", str(SCRIPT))
 SPEC = importlib.util.spec_from_loader(LOADER.name, LOADER)
 worker = importlib.util.module_from_spec(SPEC)
 LOADER.exec_module(worker)
+# The model endpoint as the platform's policy spells it (Linux adds :443).
+MODEL_DOMAINS = list(worker.ALLOWED_DOMAINS_LINUX if sys.platform == "linux"
+                     else worker.ALLOWED_DOMAINS)
 
 PYTHON = sys.executable
 FAKE_TOKEN = "sentinel-auth-token-" + "q" * 32
@@ -45,7 +52,7 @@ def result_json(text="# Summary\n"):
 
 class Fixture(unittest.TestCase):
     def setUp(self):
-        self.root = Path(tempfile.mkdtemp(prefix="osra-", dir="/private/tmp")).resolve()
+        self.root = Path(tempfile.mkdtemp(prefix="osra-", dir=SHORT_TMP)).resolve()
         self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
         self.input = self.root / "input"
         self.input.mkdir()
@@ -75,7 +82,8 @@ class Fixture(unittest.TestCase):
                                       self.input, self.run_dir)
 
     def research(self, body="", stdout=None, credential=None, relay=None,
-                 permission_mode=worker.DEFAULT_PERMISSION_MODE, prompt="prompt"):
+                 permission_mode=worker.DEFAULT_PERMISSION_MODE, prompt="prompt",
+                 selection=None):
         """The post-gate path (run_research) with a fake srt and child."""
         stdout = result_json() if stdout is None else stdout
         write_executable(self.bin / "claude", (
@@ -86,12 +94,51 @@ class Fixture(unittest.TestCase):
         ))
         parent = {"PATH": "/usr/bin:/bin", "HOME": str(self.root),
                   worker.CREDENTIAL_VARIABLE: PARENT_TOKEN}
+        # A live (credential) run needs an explicit selection; these fixture
+        # values are test data, not a model choice.
+        if selection is None and credential is not None:
+            selection = worker.Selection("fixture-model", "high")
         succeeded = worker.run_research(
             [str(self.bin / "srt")], str(self.bin / "claude"), prompt, self.input,
-            self.run_dir, "claude-profile1", 20, relay, parent, permission_mode, credential)
+            self.run_dir, "claude-profile1", 20, relay, parent, permission_mode, credential,
+            selection=selection)
         manifest_file = self.run_dir / "result/manifest.json"
         manifest = json.loads(manifest_file.read_text()) if manifest_file.exists() else None
         return succeeded, manifest
+
+    def test_manifest_binds_the_prompt_bytes_the_child_got(self):
+        prompt = "Summarize the corpus.\r\nLine two: caf\u00e9\n"
+        succeeded, manifest = self.research(prompt=prompt)
+        self.assertTrue(succeeded, manifest)
+        self.assertEqual(manifest["prompt_sha256"],
+                         hashlib.sha256(prompt.encode("utf-8")).hexdigest())
+        self.assertRegex(manifest["prompt_sha256"], r"^[0-9a-f]{64}$")
+        # The digest is of what the child got (its argv), not of a file read later.
+        argv = json.loads((self.run_dir / "output/argv.json").read_text())
+        self.assertEqual(hashlib.sha256(argv[-1].encode("utf-8")).hexdigest(), manifest["prompt_sha256"])
+
+    def test_a_crlf_prompt_is_sent_and_bound_byte_for_byte(self):
+        task = self.input / "task.txt"
+        task.write_bytes(b"line one\r\nline two\r\n")
+        _, prompt = worker.checked_input(self.input, task, self.root)
+        self.assertEqual(prompt.encode("utf-8"), task.read_bytes())
+        succeeded, manifest = self.research(prompt=prompt)
+        self.assertTrue(succeeded, manifest)
+        self.assertEqual(manifest["prompt_sha256"], hashlib.sha256(task.read_bytes()).hexdigest())
+        argv = json.loads((self.run_dir / "output/argv.json").read_text())
+        self.assertEqual(argv[-1], "line one\r\nline two\r\n")
+        task.write_bytes(b"caf\xe9\n")  # not UTF-8
+        with self.assertRaisesRegex(ValueError, "UTF-8"):
+            worker.checked_input(self.input, task, self.root)
+
+    def test_the_prompt_digest_is_taken_from_the_checked_text_not_the_file(self):
+        task = self.input / "task.txt"
+        task.write_text("first version\n")
+        _, prompt = worker.checked_input(self.input, task, self.root)
+        task.write_text("changed after the check\n")  # a later change must not move it
+        succeeded, manifest = self.research(prompt=prompt)
+        self.assertTrue(succeeded, manifest)
+        self.assertEqual(manifest["prompt_sha256"], worker.prompt_sha256("first version\n"))
 
     def result_files(self):
         return {path.name: path.read_bytes()
@@ -143,8 +190,10 @@ class ClosedGateTests(Fixture):
                 mock.patch.object(worker.os, "read",
                                   side_effect=AssertionError("os.read")):
             with self.assertRaises(worker.Blocked) as caught:
+                # The macOS gate order; the Linux one is LinuxClosedGateTests.
                 worker.require_runtime("claude-profile1", prefix, str(self.bin),
-                                       credential, (self.input, self.run_dir))
+                                       credential, (self.input, self.run_dir),
+                                       platform="darwin")
         self.assertIn("no real launch has been measured", str(caught.exception))
 
     def test_main_blocks_with_a_good_credential_and_starts_nothing(self):
@@ -172,12 +221,15 @@ class ClosedGateTests(Fixture):
         options = set(worker.re.findall(r'add_argument\("(--[a-z-]+)"', source))
         self.assertEqual(options, {
             "--profile", "--input-dir", "--prompt-file", "--run-dir", "--runtime-prefix",
-            "--credential-file", "--permission-mode", "--execution-profile",
+            "--credential-file", "--model", "--effort", "--permission-mode",
+            "--execution-profile",
             "--web-domain", "--timeout", "--relay-repo",
             "--relay-request-budget", "--relay-max-response-bytes",
             "--relay-response-byte-budget", "--relay-timeout-seconds"})
         self.assertNotIn("os.environ.get(\"OSS", source)
-        self.assertEqual(source.count("os.environ"), 3)
+        # main reads the environment once (parent = dict(os.environ)); every
+        # child environment is built from allowlists over that copy.
+        self.assertEqual(source.count("os.environ"), 1)
 
     def test_cli_error_never_prints_the_token(self):
         prefix = self.fake_prefix()
@@ -284,7 +336,7 @@ class EnvironmentTests(Fixture):
         relay = worker.relay_environment({**parent, **child})
         self.assertEqual(set(relay), {"PATH", "PYTHONDONTWRITEBYTECODE"})
         policy = worker.build_policy(self.input, self.run_dir, self.bin / "claude")
-        self.assertEqual(policy["network"]["allowedDomains"], ["api.anthropic.com"])
+        self.assertEqual(policy["network"]["allowedDomains"], MODEL_DOMAINS)
 
 
 class SupervisedCredentialTests(Fixture):
@@ -401,6 +453,42 @@ class SupervisedCredentialTests(Fixture):
         body = "os.mkfifo(os.path.join(out,'..','tmp','pipe'))\n"
         succeeded, manifest = self.research(body, credential=self.credential())
         self.assertTrue(succeeded, manifest)
+
+    def test_socket_in_an_area_leaves_the_scan_complete(self):
+        # Linux srt keeps its proxy sockets in run/tmp; they hold no file data.
+        body = ("import socket\n"
+                "s=socket.socket(socket.AF_UNIX)\n"
+                "s.bind(os.path.join(out,'..','tmp','srt-proxy.sock'))\n")
+        succeeded, manifest = self.research(body, credential=self.credential())
+        self.assertTrue(succeeded, manifest)
+        self.assertEqual(manifest["credential"]["exact_value_check"], "clean")
+
+    def test_socket_named_after_the_value_is_still_exposed(self):
+        credential = self.credential()
+        area = self.root / "area"
+        area.mkdir()
+        server = socket.socket(socket.AF_UNIX)
+        self.addCleanup(server.close)
+        # AF_UNIX paths are short: bind by a relative name inside the area.
+        cwd = os.getcwd()
+        os.chdir(area)
+        try:
+            server.bind(credential.reveal()[:20])
+        finally:
+            os.chdir(cwd)
+        scan = worker.ExposureScan(credential.reveal()[:20])
+        self.assertEqual(scan.area(area), "exposed")
+
+    def test_manifest_with_the_value_in_a_requested_field_is_not_written(self):
+        # A model value that happens to hold the credential must not reach the
+        # manifest either: the exact-value check covers every manifest field.
+        credential = self.credential()
+        succeeded, manifest = self.research(
+            credential=credential, selection=worker.Selection(credential.reveal(), "high"))
+        self.assertFalse(succeeded)
+        self.assertIsNone(manifest)
+        self.assertNotIn(credential.reveal(), json.dumps(
+            {name: data.decode(errors="replace") for name, data in self.result_files().items()}))
 
     def test_credential_of_another_profile_is_blocked_before_anything(self):
         other = worker.load_credential(

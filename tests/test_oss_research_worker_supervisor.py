@@ -5,10 +5,16 @@ claude and a synthetic relay (python -c). The fakes enforce nothing, so they
 prove the supervisor's contract, never a sandbox boundary. RelayReadyTests
 starts the real relay without sending it a request: no upstream is contacted.
 
-RealSrtSupervisorTests (only with OSS_RESEARCH_SRT_PREFIX, macOS) runs the real
+RealSrtSupervisorTests (only with OSS_RESEARCH_SRT_PREFIX, macOS or Linux) runs the real
 relay against a 127.0.0.1 fixture upstream and a non-AI probe inside the real
 srt 0.0.77. No model, no GitHub host, no credential. The launch gate stays
 closed throughout; ClosedGateTests checks it with relay arguments too.
+
+The setsid case differs by platform. On macOS the escaped descendant is
+measured to survive (the documented limit). On Linux it is expected to die
+with srt's PID namespace, measured on the Debian 13 guest (2026-09-28). The pid it reports is a
+namespace pid, so the Linux test finds it by a unique argv string in the
+host's /proc (processes_holding), with a live positive control first.
 """
 
 import importlib.machinery
@@ -41,7 +47,17 @@ def load(name, path):
 
 
 worker = load("oss_research_worker", SCRIPT)
+# The model endpoint as the platform's policy spells it (Linux adds :443).
+MODEL_DOMAINS = list(worker.ALLOWED_DOMAINS_LINUX if sys.platform == "linux"
+                     else worker.ALLOWED_DOMAINS)
+linux_tests = load("oss_research_worker_linux_tests", REPO / "tests/test_oss_research_worker_linux.py")
 PYTHON = str(Path(sys.executable).resolve())
+LINUX = sys.platform == "linux"
+SHORT_TMP = "/tmp" if LINUX else "/private/tmp"
+BASE_PREFIX = str(Path(sys.base_prefix).resolve())
+# Linux: the system python's library is under /usr/lib (SYSTEM_READ_LINUX).
+FIXTURE_READ = ([PYTHON] + ([] if BASE_PREFIX.startswith("/usr") else [BASE_PREFIX])
+                if LINUX else [BASE_PREFIX, "/opt/homebrew"])
 PREFIX = os.environ.get("OSS_RESEARCH_SRT_PREFIX")
 SOURCES = [{"role": "issues", "path": "/fixture/issues.py", "sha256": "a" * 64},
            {"role": "sibling", "path": "/fixture/sibling.py", "sha256": "b" * 64}]
@@ -73,7 +89,7 @@ def write_executable(path, body):
 
 class Fixture(unittest.TestCase):
     def setUp(self):
-        self.root = Path(tempfile.mkdtemp(prefix="osrs-", dir="/private/tmp")).resolve()
+        self.root = Path(tempfile.mkdtemp(prefix="osrs-", dir=SHORT_TMP)).resolve()
         self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
         self.input = self.root / "input"
         self.input.mkdir()
@@ -144,7 +160,7 @@ class RelayRunTests(Fixture):
         self.assertEqual(manifest["relay"],
                          {"sources": SOURCES, "relay_sha256": "0" * 64, "port": FAKE_PORT})
         self.assertEqual(policy["network"]["allowedDomains"],
-                         ["api.anthropic.com", f"127.0.0.1:{FAKE_PORT}"])
+                         [*MODEL_DOMAINS, f"127.0.0.1:{FAKE_PORT}"])
         self.assertIs(policy["network"]["allowLocalBinding"], False)
         self.assertEqual((self.run_dir / "result/relay.log").read_text(), "relay log line\n")
         self.assert_groups_gone()
@@ -153,7 +169,7 @@ class RelayRunTests(Fixture):
         succeeded, manifest, policy = self.supervise(relay=self.relay("sys.exit(3)\n"))
         self.assert_failed(succeeded, manifest, "relay-exited")
         self.assertFalse(self.started.exists())
-        self.assertEqual(policy["network"]["allowedDomains"], ["api.anthropic.com"])
+        self.assertEqual(policy["network"]["allowedDomains"], MODEL_DOMAINS)
         self.assertIsNone(manifest["relay"]["port"])
 
     def test_silent_relay_times_out_at_the_one_deadline(self):
@@ -195,7 +211,7 @@ class RelayRunTests(Fixture):
         self.assertEqual(manifest["failures"],
                          ["relay-not-ready: relay sources differ from the parent-hashed skills"])
         self.assertFalse(self.started.exists())
-        self.assertEqual(policy["network"]["allowedDomains"], ["api.anthropic.com"])
+        self.assertEqual(policy["network"]["allowedDomains"], MODEL_DOMAINS)
 
     def test_relay_that_exits_while_the_child_runs_fails_the_run(self):
         succeeded, manifest, _ = self.supervise(
@@ -391,7 +407,7 @@ class ClosedGateTests(unittest.TestCase):
     """The gate stays first: relay arguments change nothing before it."""
 
     def setUp(self):
-        self.root = Path(tempfile.mkdtemp(prefix="osrs-gate-", dir="/private/tmp")).resolve()
+        self.root = Path(tempfile.mkdtemp(prefix="osrs-gate-", dir=SHORT_TMP)).resolve()
         self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
         (self.root / "input").mkdir()
         (self.root / "input/task.txt").write_text("summarize")
@@ -430,8 +446,8 @@ class ClosedGateTests(unittest.TestCase):
         self.assertFalse(self.run_dir.exists())
 
 
-@unittest.skipUnless(PREFIX and sys.platform == "darwin",
-                     "set OSS_RESEARCH_SRT_PREFIX to the pinned srt install (macOS)")
+@unittest.skipUnless(PREFIX and sys.platform in ("darwin", "linux"),
+                     "set OSS_RESEARCH_SRT_PREFIX to the pinned srt install (macOS, Linux)")
 class RealSrtSupervisorTests(unittest.TestCase):
     """Product supervisor + real relay + real srt + non-AI probe; 127.0.0.1 only."""
 
@@ -452,7 +468,7 @@ class RealSrtSupervisorTests(unittest.TestCase):
 
     def setUp(self):
         # Unix socket paths must stay under 104 bytes, so not the scratchpad.
-        self.root = Path(tempfile.mkdtemp(prefix="osrs-", dir="/private/tmp")).resolve()
+        self.root = Path(tempfile.mkdtemp(prefix="osrs-", dir=SHORT_TMP)).resolve()
         self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
         self.input = self.root / "input"
         self.input.mkdir()
@@ -467,14 +483,14 @@ class RealSrtSupervisorTests(unittest.TestCase):
                            OSS_SUPERVISOR_UPSTREAM_PORT=str(self.upstream.server_address[1]),
                            GH_TOKEN="gho_supervisor_parent_sentinel")
         launch = launch._replace(environment=environment)
-        read = [str(Path(sys.base_prefix).resolve()), "/opt/homebrew"]
+        read = FIXTURE_READ
         # The probe needs the relay port, known only once ready checked out.
         ports = {}
 
         def policy_for(port):
             ports["relay"] = port
             policy = worker.build_policy(self.input, self.run_dir, self.root / "no-claude",
-                                         port, model=False)
+                                         port, model=False, runtime=self.runtime)
             policy["filesystem"]["allowRead"] += read
             return policy
 
@@ -505,9 +521,14 @@ class RealSrtSupervisorTests(unittest.TestCase):
         observed = json.loads((self.run_dir / "result/report.md").read_text())
         self.assertEqual(observed["get"], [200, "octo/demo"])
         self.assertEqual(observed["post"], 405)
-        self.assertTrue(observed["direct_relay"].startswith("PermissionError"), observed)
+        # macOS refuses a direct connect with EPERM. Linux gives the probe its own
+        # network namespace, so the connect is refused there; the control is the
+        # same relay answering 200 through the proxy above and the upstream
+        # seeing only that one GET below.
+        direct = ("ConnectionRefusedError", "PermissionError") if LINUX else ("PermissionError",)
+        self.assertTrue(observed["direct_relay"].startswith(direct), observed)
         self.assertEqual(observed["proxy_mock"], 403)
-        self.assertTrue(observed["direct_mock"].startswith("PermissionError"), observed)
+        self.assertTrue(observed["direct_mock"].startswith(direct), observed)
         self.assertEqual([(r["method"], r["path"].partition("?")[0]) for r in self.upstream.requests],
                          [("GET", "/repos/octo/demo")])
         for seen in self.upstream.requests:
@@ -524,6 +545,7 @@ class RealSrtSupervisorTests(unittest.TestCase):
                          ["/repos/octo/hang"])
         self.assertFalse((self.run_dir / "result/report.md").exists())
 
+    @unittest.skipIf(LINUX, "macOS measurement; Linux is the PID namespace test below")
     def test_setsid_inside_srt_is_bounded_but_not_killed(self):
         # Measures the documented limit under the real srt: the probe's forked
         # descendant calls setsid and keeps the child's stdout open.
@@ -538,6 +560,37 @@ class RealSrtSupervisorTests(unittest.TestCase):
         self.assertLess(self.elapsed, worker.EXIT_GRACE_SECONDS + worker.CLEANUP_SECONDS + 5)
         self.assertEqual(escaped["outcome"], "setsid")
         self.assertTrue(alive(pid), "srt did not stop setsid; the escaped process survives")
+
+    @unittest.skipUnless(LINUX, "Linux PID namespace (measured on the Debian guest)")
+    def test_setsid_inside_srt_dies_with_the_pid_namespace(self):
+        marker = self.run_dir / "output/escaped.json"
+        needle = str(marker).encode()
+        # Positive control: the scan sees a live process carrying a unique string.
+        control_tag = f"osrs-control-{os.getpid()}-{time.monotonic_ns()}"
+        control = subprocess.Popen([PYTHON, "-c", "import time; time.sleep(30)", control_tag])
+        self.addCleanup(control.wait)
+        self.addCleanup(control.kill)
+        self.assertEqual(linux_tests.processes_holding(control_tag.encode()), [control.pid])
+        self.assertEqual(linux_tests.processes_holding(needle), [])
+
+        def kill_leftovers():
+            for pid in linux_tests.processes_holding(needle):
+                os.kill(pid, signal.SIGKILL)
+        self.addCleanup(kill_leftovers)
+        succeeded, manifest, _ = self.supervise(
+            lambda ports: ["escape", str(ports["relay"]), str(marker)], seconds=30)
+        escaped = json.loads(marker.read_text())
+        self.assertEqual(escaped["outcome"], "setsid")
+        self.assertFalse(succeeded)
+        self.assertLess(self.elapsed, worker.EXIT_GRACE_SECONDS + worker.CLEANUP_SECONDS + 5)
+        self.assertTrue(set(manifest["failures"]) <= {"child-pipes-held-open"}, manifest)
+        # escaped["pid"] is a namespace pid: never checked with os.kill here.
+        survivors = linux_tests.processes_holding(needle)
+        until = time.monotonic() + worker.CLEANUP_SECONDS
+        while survivors and time.monotonic() < until:
+            time.sleep(0.1)
+            survivors = linux_tests.processes_holding(needle)
+        self.assertEqual(survivors, [], "a setsid descendant outlived srt's PID namespace")
 
 
 if __name__ == "__main__":

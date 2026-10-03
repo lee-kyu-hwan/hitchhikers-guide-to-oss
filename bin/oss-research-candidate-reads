@@ -1,0 +1,513 @@
+#!/usr/bin/env python3
+"""The non-AI candidate-verifier read entry: discover and locus-search through the relay, inside srt.
+
+Linux guest only, as the research user inside the unit wrapper
+(executable_oss-research-linux-run --entry candidate-reads):
+
+    executable_oss-research-candidate-reads --out-dir OUT --input-dir IN --stage discover \\
+        --repo OWNER/NAME --pattern PAT-001 [--pattern PAT-002 ...] \\
+        [--max-candidates-per-repo 5] [--max-candidates-total 5] [--max-clues-per-pattern 5] \\
+        [--request-budget 60] [--timeout 300]
+    executable_oss-research-candidate-reads --out-dir OUT --input-dir IN --stage locus-search \\
+        --repo OWNER/NAME [--clue TEXT ...] [--max-clues-per-locus 5] [--request-budget 60] \\
+        [--timeout 300]
+
+It is the PR and Issue collection entries' structure (executable_oss-research-collect,
+-collect-issues) with the candidate verifier's two read steps behind it:
+verifying-open-source-contribution-candidates' discover and locus-search, which
+read GitHub and nothing else. The same worker pieces are reused, not copied:
+the relay (relay_launch), build_policy(model=False) (only the relay's loopback
+port, once its ready line checked out), the Supervisor, the area checks and the
+bounded reads of the child's files. This file loads the PR entry only for
+load_worker and file_entry.
+
+There is no model, credential, profile, prompt or permission mode here. There
+is no upstream, base URL or proxy option: the relay talks to api.github.com only
+and holds no credential. There is no clone (the verifier's --allow-clone is never
+passed) and nothing is run from the target repository: static reads only.
+
+The child is executable_oss-research-relay-verify --require-proxy, which loads
+the reviewed verifier from the worker's skills directory and reaches the relay
+only through srt's own loopback proxy. It reads only the worker's Linux system
+set plus this entry's own set: the pinned python, the relay-collect adapter it
+loads beside itself, and the verifier skill's REVISION_PATHS files (the verifier
+hashes exactly these into its output revision). The entry reads the verifier's
+REVISION_PATHS from its source text (no code is run) and stops before the relay
+if it differs from VERIFIER_REVISION_FILES.
+
+Inputs are the host's: IN holds exactly the stage's files, each a regular file
+of at most MAX_INPUT_BYTES that group and other cannot write
+(discover: analysis.json; locus-search: discovery.json and assessment.json). Every
+request outside the fixed limits below, and any input that does not fit the
+request, is refused with exit 2 before the relay starts.
+
+Limits are fixed here: one target repository (the relay also gets the owner's
+.github repository, which the verifier's policy reads need), at most MAX_PATTERNS
+patterns, MAX_CANDIDATES candidates (per repository and in all), MAX_CLUES clues
+per pattern or locus and as options, a request budget of at most MAX_REQUEST_BUDGET
+(the relay gets the same budget).
+
+Status is the verifier's, never raised: its exit 0 is "succeeded" (exit 0), its
+exit 3 is "partial" (exit EXIT_PARTIAL: a budget stop, an unavailable anonymous
+code search or an unreadable source), anything else is "failed" (exit 4). Every
+outcome is kept.
+
+Output, in OUT/run: output/{discovery.json | locus-search.json,
+verification-manifest.json, transport.json} from the child, and in result/
+manifest.json (this run), relay.log, stderr.log and read-envelope.json, which
+binds every file's and every input's size and sha256 to the request, the child's
+exit code and the relay's ready sources. The host checks it with
+tests/fixtures/oss_research_worker/linux/verify_pickup.py --candidate-reads.
+"""
+
+from __future__ import annotations
+
+import argparse
+import ast
+import errno
+import hashlib
+import importlib.machinery
+import importlib.util
+import json
+import os
+from pathlib import Path
+import re
+import stat
+import sys
+from typing import NamedTuple
+
+STAGES = ("discover", "locus-search")
+MAX_PATTERNS = 5
+MAX_CANDIDATES = 5
+MAX_CLUES = 5
+MAX_CLUE_CHARS = 200
+MAX_REQUEST_BUDGET = 60
+MAX_TIMEOUT_SECONDS = 1800.0
+MAX_INPUT_BYTES = 4 * 1024 * 1024
+RELAY_MAX_RESPONSE_BYTES = 4 * 1024 * 1024
+RELAY_RESPONSE_BYTE_BUDGET = 64 * 1024 * 1024
+RELAY_TIMEOUT_SECONDS = 30.0
+ADAPTER_TIMEOUT_SECONDS = "30"
+ADAPTER_DEADLINE_MARGIN = 30.0
+ADAPTER = "executable_oss-research-relay-verify"
+# The files beside the adapter that it loads by path (its ADAPTER constant: the
+# relay-collect adapter, whose RelayOpener it reuses). A test keeps this equal.
+ADAPTER_DEPENDENCIES = ("executable_oss-research-relay-collect",)
+VERIFIER_SKILL = "verifying-open-source-contribution-candidates"
+VERIFIER_SCRIPT = "scripts/verify_candidates.py"
+# The verifier's own REVISION_PATHS (verify_candidates.py): the files it reads when it
+# writes its output revision. A test keeps the two equal; main checks the source text.
+VERIFIER_REVISION_FILES = ("SKILL.md", "agents/openai.yaml", "references/verification-contract.md",
+                           "references/github-verification-contract.md",
+                           "scripts/verify_candidates.py", "tests/test_verify_candidates.py",
+                           "tests/test_skill_contract.py")
+PATTERN_ID = re.compile(r"\APAT-\d+\Z")
+INPUT_FILES = {"discover": ("analysis.json",), "locus-search": ("discovery.json", "assessment.json")}
+OUTPUT_FILES = {"discover": ("discovery.json", "verification-manifest.json", "transport.json"),
+                "locus-search": ("locus-search.json", "verification-manifest.json", "transport.json")}
+ENVELOPE_SCHEMA = "oss-research-candidate-reads-envelope/1"
+UPSTREAM = "github-rest-via-relay"
+ENTRY = "dot_local/bin/executable_oss-research-candidate-reads"
+MODE = "candidate-reads"
+
+EXIT_OK = 0
+EXIT_BAD_INPUT = 2
+EXIT_BLOCKED = 3
+EXIT_FAILED = 4
+EXIT_PARTIAL = 5
+# The verifier's exit codes for these two steps (verify_candidates.py).
+VERIFIER_COMPLETE = 0
+VERIFIER_PARTIAL = 3
+
+
+class Reads(NamedTuple):
+    stage: str
+    repository: str
+    patterns: tuple[str, ...]
+    clues: tuple[str, ...]
+    max_candidates_per_repo: int | None
+    max_candidates_total: int | None
+    max_clues_per_pattern: int | None
+    max_clues_per_locus: int | None
+    request_budget: int
+
+    @property
+    def repositories(self) -> tuple[str, ...]:
+        """The relay's allowlist: the target and its owner's .github repository."""
+        owner = self.repository.split("/", 1)[0]
+        organisation = f"{owner}/.github"
+        return (self.repository,) if self.repository.lower() == organisation.lower() \
+            else (self.repository, organisation)
+
+    def as_request(self) -> dict:
+        return {"stage": self.stage, "repository": self.repository,
+                "relay_repositories": list(self.repositories), "patterns": list(self.patterns),
+                "clues": list(self.clues), "max_candidates_per_repo": self.max_candidates_per_repo,
+                "max_candidates_total": self.max_candidates_total,
+                "max_clues_per_pattern": self.max_clues_per_pattern,
+                "max_clues_per_locus": self.max_clues_per_locus, "request_budget": self.request_budget}
+
+
+def load_collect_entry(here: Path = Path(__file__)):
+    """The PR collection entry beside this file, for load_worker and file_entry."""
+    path = Path(os.path.realpath(here)).with_name("executable_oss-research-collect")
+    loader = importlib.machinery.SourceFileLoader("oss_research_collect_entry", str(path))
+    module = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
+    loader.exec_module(module)
+    return module
+
+
+def checked_reads(worker, stage: str, repository: str, patterns: list[str], clues: list[str],
+                  max_candidates_per_repo, max_candidates_total, max_clues_per_pattern,
+                  max_clues_per_locus, request_budget) -> Reads:
+    """Raise ValueError unless the request is inside this entry's fixed limits."""
+    if stage not in STAGES:
+        raise ValueError("stage must be one of " + ", ".join(STAGES))
+    if type(repository) is not str or worker.REPOSITORY.match(repository) is None:
+        raise ValueError("repository must be one OWNER/NAME")
+    reads = Reads(stage, repository, tuple(patterns), tuple(clues), max_candidates_per_repo,
+                  max_candidates_total, max_clues_per_pattern, max_clues_per_locus, request_budget)
+    worker.checked_relay_request(list(reads.repositories), request_budget, RELAY_MAX_RESPONSE_BYTES,
+                                 RELAY_RESPONSE_BYTE_BUDGET, RELAY_TIMEOUT_SECONDS)
+
+    def bounded(label, value, limit):
+        if type(value) is not int or not 1 <= value <= limit:
+            raise ValueError(f"{label} must be an integer from 1 to {limit}")
+
+    bounded("request budget", request_budget, MAX_REQUEST_BUDGET)
+    if stage == "discover":
+        if clues or max_clues_per_locus is not None:
+            raise ValueError("clues and max clues per locus belong to locus-search")
+        if not 1 <= len(patterns) <= MAX_PATTERNS or len(set(patterns)) != len(patterns) \
+                or any(type(p) is not str or PATTERN_ID.match(p) is None for p in patterns):
+            raise ValueError(f"discover needs 1 to {MAX_PATTERNS} unique PAT-<n> patterns")
+        bounded("max candidates per repo", max_candidates_per_repo, MAX_CANDIDATES)
+        bounded("max candidates total", max_candidates_total, MAX_CANDIDATES)
+        bounded("max clues per pattern", max_clues_per_pattern, MAX_CLUES)
+    else:
+        if patterns or any(value is not None for value in (max_candidates_per_repo, max_candidates_total,
+                                                           max_clues_per_pattern)):
+            raise ValueError("patterns and candidate or pattern limits belong to discover")
+        bounded("max clues per locus", max_clues_per_locus, MAX_CLUES)
+        if len(clues) > MAX_CLUES or len(set(clues)) != len(clues):
+            raise ValueError(f"at most {MAX_CLUES} unique clues")
+        for clue in clues:
+            if type(clue) is not str or not 1 <= len(clue) <= MAX_CLUE_CHARS or clue != clue.strip() \
+                    or '"' in clue or "\\" in clue \
+                    or any(ord(c) < 32 or ord(c) == 127 for c in clue):
+                raise ValueError(f"a clue is 1 to {MAX_CLUE_CHARS} printable characters without a "
+                                 "quote, a backslash, a control character or edge spaces")
+    return reads
+
+
+def read_input(path: Path) -> tuple[bytes, dict]:
+    """The bytes and (size, sha256) of one input: a plain file, not writable by group or other.
+
+    The host made these files; a link, FIFO, device, oversize or writable file is refused
+    before it is read (no follow, no blocking open, fstat, then a bounded read)."""
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError as error:
+        raise ValueError(f"input {path.name} is not openable as a plain file "
+                         f"({errno.errorcode.get(error.errno, error.errno)})") from None
+    try:
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode):
+            raise ValueError(f"input {path.name} is not a regular file")
+        if info.st_mode & 0o022:
+            raise ValueError(f"input {path.name} is writable by group or other")
+        if not 0 < info.st_size <= MAX_INPUT_BYTES:
+            raise ValueError(f"input {path.name} must be 1 to {MAX_INPUT_BYTES} bytes")
+        data = b""
+        while len(data) <= MAX_INPUT_BYTES:
+            chunk = os.read(descriptor, 1 << 16)
+            if not chunk:
+                break
+            data += chunk
+        if len(data) > MAX_INPUT_BYTES:
+            raise ValueError(f"input {path.name} must be 1 to {MAX_INPUT_BYTES} bytes")
+        return data, {"bytes": len(data), "sha256": hashlib.sha256(data).hexdigest()}
+    finally:
+        os.close(descriptor)
+
+
+def _unique(pairs):
+    document = dict(pairs)
+    if len(document) != len(pairs):
+        raise ValueError("duplicate key")
+    return document
+
+
+def checked_inputs(reads: Reads, input_dir: Path) -> dict[str, dict]:
+    """Name -> {bytes, sha256} of the stage's input files, checked against the request.
+
+    Raise ValueError otherwise: the directory holds exactly the stage's files, each a
+    JSON object; discover's patterns are in the analysis and not superseded; locus-search's
+    discovery is for exactly this repository and the assessment is bound to its sha256."""
+    if input_dir.is_symlink() or not input_dir.is_dir():
+        raise ValueError("--input-dir must be an existing directory")
+    if input_dir.stat().st_mode & 0o022:
+        raise ValueError("--input-dir is writable by group or other")
+    names = INPUT_FILES[reads.stage]
+    if sorted(p.name for p in input_dir.iterdir()) != sorted(names):
+        raise ValueError("--input-dir must hold exactly " + ", ".join(names))
+    documents, described = {}, {}
+    for name in names:
+        data, described[name] = read_input(input_dir / name)
+        try:
+            document = json.loads(data.decode("utf-8"), object_pairs_hook=_unique,
+                                  parse_constant=lambda constant: (_ for _ in ()).throw(ValueError(constant)))
+        except (ValueError, UnicodeError):
+            raise ValueError(f"input {name} is not one JSON object") from None
+        if not isinstance(document, dict):
+            raise ValueError(f"input {name} is not one JSON object")
+        documents[name] = document
+    if reads.stage == "discover":
+        patterns = documents["analysis.json"].get("patterns")
+        found = {p.get("pattern_id"): p for p in patterns if isinstance(p, dict)} \
+            if isinstance(patterns, list) else {}
+        for pattern in reads.patterns:
+            if pattern not in found:
+                raise ValueError(f"pattern {pattern} is not in the analysis")
+            if found[pattern].get("superseded_by") is not None:
+                raise ValueError(f"pattern {pattern} is superseded")
+    else:
+        discovery, assessment = documents["discovery.json"], documents["assessment.json"]
+        inputs, records = discovery.get("inputs"), discovery.get("records")
+        if not (isinstance(inputs, dict) and inputs.get("repositories") == [reads.repository]
+                and isinstance(records, list)
+                and all(isinstance(r, dict) and r.get("repository") == reads.repository for r in records)):
+            raise ValueError("the discovery is not for exactly the requested repository")
+        if assessment.get("discovery_sha256") != described["discovery.json"]["sha256"]:
+            raise ValueError("the assessment is not bound to this discovery")
+    return described
+
+
+def verifier_file(worker) -> Path:
+    """The reviewed verifier the child loads by path (from the worker's skills directory)."""
+    _, skills = worker.trusted_relay(Path(worker.__file__))
+    return (skills / VERIFIER_SKILL / VERIFIER_SCRIPT).resolve(strict=True)
+
+
+def adapter_file(worker) -> Path:
+    return Path(os.path.realpath(worker.__file__)).with_name(ADAPTER)
+
+
+def declared_revision_files(verifier: Path) -> tuple[str, ...]:
+    """The verifier's REVISION_PATHS read from its source text. No verifier code is run."""
+    tree = ast.parse(verifier.read_text(encoding="utf-8"))
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "REVISION_PATHS"
+                                                for t in node.targets):
+            return tuple(ast.literal_eval(node.value))
+    raise ValueError("the verifier declares no REVISION_PATHS")
+
+
+def candidate_read(worker, python: str) -> list[str]:
+    skill = verifier_file(worker).parents[1]
+    adapter = adapter_file(worker)
+    return [python, *[str(adapter.with_name(name)) for name in ADAPTER_DEPENDENCIES],
+            *[str(skill / relative) for relative in VERIFIER_REVISION_FILES]]
+
+
+def adapter_arguments(worker, reads: Reads, port: int, run_dir: Path, input_dir: Path,
+                      seconds: float) -> list[str]:
+    _, skills = worker.trusted_relay(Path(worker.__file__))
+    output = run_dir / "output"
+    document = OUTPUT_FILES[reads.stage][0]
+    argv = [reads.stage, "--relay-url", f"http://127.0.0.1:{port}", "--skills-dir", str(skills),
+            "--transport-record", str(output / "transport.json"),
+            "--timeout-seconds", ADAPTER_TIMEOUT_SECONDS,
+            "--max-response-bytes", str(RELAY_MAX_RESPONSE_BYTES),
+            "--deadline-seconds", f"{max(seconds - ADAPTER_DEADLINE_MARGIN, seconds / 2):g}",
+            "--output", str(output / document),
+            "--manifest", str(output / "verification-manifest.json"),
+            "--request-budget", str(reads.request_budget), "--require-proxy"]
+    if reads.stage == "discover":
+        argv += ["--analysis", str(input_dir / "analysis.json"), "--repo", reads.repository,
+                 "--max-candidates-per-repo", str(reads.max_candidates_per_repo),
+                 "--max-candidates-total", str(reads.max_candidates_total),
+                 "--max-clues-per-pattern", str(reads.max_clues_per_pattern)]
+        for pattern in reads.patterns:
+            argv += ["--pattern", pattern]
+    else:
+        argv += ["--discovery", str(input_dir / "discovery.json"),
+                 "--assessment", str(input_dir / "assessment.json"),
+                 "--max-clues-per-locus", str(reads.max_clues_per_locus)]
+        for clue in reads.clues:
+            argv += ["--clue", clue]
+    return argv
+
+
+def run_status(exit_code, problems: list[str]) -> str:
+    """succeeded, partial or failed: the verifier's own exit, never raised."""
+    if problems:
+        return "failed"
+    return "succeeded" if exit_code == VERIFIER_COMPLETE else "partial"
+
+
+def recorder(worker, collect_entry, reads: Reads, inputs: dict[str, dict], upstream: str,
+             unit: str | None):
+    """The record function run_supervised calls instead of the model collect()."""
+
+    def record(run_dir: Path, exit_code, stdout: str, stderr: str, failures: list[str],
+               relay: dict | None) -> bool:
+        moved = worker.parent_path_problems(run_dir)
+        if moved:
+            print("OSS candidate reads not recorded: " + "; ".join(moved), file=sys.stderr)
+            return False
+        result = run_dir / "result"
+        relay = dict(relay or {})
+        (result / "relay.log").write_text(relay.pop("stderr", ""), encoding="utf-8")
+        (result / "stderr.log").write_text(stderr, encoding="utf-8")
+        problems = list(failures)
+        if exit_code is None:
+            problems.append("no exit code: the supervisor stopped the child")
+        elif exit_code not in (VERIFIER_COMPLETE, VERIFIER_PARTIAL):
+            problems.append(f"verifier exit code {exit_code}")
+        files = {}
+        for name in OUTPUT_FILES[reads.stage]:
+            entry, why = collect_entry.file_entry(run_dir / "output" / name)
+            if entry is None:
+                problems.append(f"output {name}: {why}")
+            else:
+                files[name] = entry
+        problems += worker.area_problems(run_dir)
+        status = run_status(exit_code, problems)
+        manifest = {"kind": "candidate-reads", "stage": reads.stage, "status": status,
+                    "exit_code": exit_code, "failures": list(failures), "problems": problems,
+                    "policy_sha256": hashlib.sha256(
+                        (run_dir / "policy/srt-settings.json").read_bytes()).hexdigest(),
+                    "request": reads.as_request(), "inputs": inputs, "relay": relay}
+        (result / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+        for name in ("relay.log", "manifest.json"):
+            files["run-manifest.json" if name == "manifest.json" else name] = \
+                collect_entry.file_entry(result / name)[0]
+        envelope = {"schema": ENVELOPE_SCHEMA, "entry": ENTRY, "upstream": upstream, "unit": unit,
+                    "stage": reads.stage, "request": reads.as_request(), "inputs": inputs,
+                    "adapter_exit": exit_code,
+                    "relay": {key: relay.get(key) for key in ("sources", "relay_sha256", "port")},
+                    "files": files}
+        (result / "read-envelope.json").write_text(json.dumps(envelope, indent=1), encoding="utf-8")
+        return status != "failed"
+
+    return record
+
+
+def run_reads(worker, collect_entry, runtime: list[str], out: Path, input_dir: Path, reads: Reads,
+              inputs: dict[str, dict], seconds: float, launch, upstream: str = UPSTREAM,
+              drop_read: tuple[str, ...] = ()) -> bool:
+    """One supervised candidate-reads step: input_dir read-only, OUT/run the run directory.
+
+    launch is the worker's relay_launch for this request. Tests hand the same launch with
+    local fixture infrastructure beside it (never through a command-line option); drop_read
+    is for the read-set counterexamples only.
+    """
+    input_dir = input_dir.resolve(strict=True)
+    run_dir = worker.checked_run_dir(out / "run", input_dir)
+    python = os.path.realpath(sys.executable)
+    adapter = adapter_file(worker)
+    ports = {}
+
+    def policy_for(port):
+        ports["relay"] = port
+        policy = worker.build_policy(input_dir, run_dir, adapter, port, model=False, runtime=runtime)
+        policy["filesystem"]["allowRead"] += candidate_read(worker, python)
+        policy["filesystem"]["allowRead"] = [path for path in policy["filesystem"]["allowRead"]
+                                             if path not in drop_read]
+        return policy
+
+    def command_for(policy_file):
+        if ports.get("relay") is None:
+            # The relay failed (the supervisor recorded why); no child is started.
+            return ["/nonexistent/no-relay-port"]
+        return worker.sandboxed(runtime, policy_file, [python, "-B", str(adapter),
+                                                       *adapter_arguments(worker, reads, ports["relay"],
+                                                                          run_dir, input_dir, seconds)])
+
+    environment = worker.build_environment({name: os.environ[name] for name in ("PATH", "LANG")
+                                            if name in os.environ}, run_dir)
+    return worker.run_supervised(
+        input_dir, run_dir, worker.PROFILES[0], seconds, launch, policy_for, command_for,
+        environment, record=recorder(worker, collect_entry, reads, inputs, upstream,
+                                     os.environ.get(worker.UNIT_ENV_MARKER)))
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--out-dir", required=True, type=Path)
+    parser.add_argument("--input-dir", required=True, type=Path)
+    parser.add_argument("--stage", required=True)
+    parser.add_argument("--repo", required=True)
+    parser.add_argument("--pattern", action="append", default=[])
+    parser.add_argument("--clue", action="append", default=[])
+    parser.add_argument("--max-candidates-per-repo", type=int)
+    parser.add_argument("--max-candidates-total", type=int)
+    parser.add_argument("--max-clues-per-pattern", type=int)
+    parser.add_argument("--max-clues-per-locus", type=int)
+    parser.add_argument("--request-budget", type=int, default=MAX_REQUEST_BUDGET)
+    parser.add_argument("--timeout", type=float, default=300.0)
+    options = parser.parse_args(argv)
+    collect_entry = load_collect_entry()
+    worker = collect_entry.load_worker()
+    discover = options.stage == "discover"
+    # Each stage has its own limits; an omitted one takes its fixed maximum, the other stage's stay None.
+    fixed = (MAX_CANDIDATES, MAX_CANDIDATES, MAX_CLUES, None) if discover else (None, None, None, MAX_CLUES)
+    given = (options.max_candidates_per_repo, options.max_candidates_total,
+             options.max_clues_per_pattern, options.max_clues_per_locus)
+    limits = [default if value is None and default is not None else value
+              for value, default in zip(given, fixed)]
+    try:
+        reads = checked_reads(worker, options.stage, options.repo, options.pattern, options.clue,
+                              *limits, options.request_budget)
+        if not 0 < options.timeout <= MAX_TIMEOUT_SECONDS:
+            raise ValueError(f"timeout must be above 0 and at most {MAX_TIMEOUT_SECONDS:g}")
+        out = options.out_dir
+        if out.is_symlink() or not out.is_dir() or any(out.iterdir()):
+            raise ValueError("--out-dir must be an existing empty directory")
+        inputs = checked_inputs(reads, options.input_dir)
+    except ValueError as error:
+        print(f"OSS candidate reads did not start: {error}", file=sys.stderr)
+        return EXIT_BAD_INPUT
+    try:
+        if sys.platform != "linux":
+            raise worker.Blocked("the candidate reads entry runs on the Linux guest only")
+        if not worker.parent_eof_guard(dict(os.environ)):
+            raise worker.Blocked("the candidate reads entry runs only inside the unit wrapper")
+        runtime = worker.verify_runtime(Path(os.environ.get("OSS_RESEARCH_SRT_PREFIX", "")),
+                                        os.environ.get("PATH", ""))
+        problems = worker.platform_problems(Path(runtime[1]).parents[4], sys.platform)
+        if problems:
+            raise worker.Blocked("this host cannot run srt isolated: " + "; ".join(problems))
+        if adapter_file(worker).is_symlink() or not adapter_file(worker).is_file():
+            raise worker.Blocked(f"the verifier adapter is not installed: {adapter_file(worker)}")
+        try:
+            declared = declared_revision_files(verifier_file(worker))
+        except (OSError, ValueError, SyntaxError) as error:
+            raise worker.Blocked(f"the verifier's revision files cannot be read: {error}") from None
+        if tuple(sorted(declared)) != tuple(sorted(VERIFIER_REVISION_FILES)):
+            raise worker.Blocked("the verifier's REVISION_PATHS differ from this entry's read set; "
+                                 "the entry must be reviewed against the new verifier first")
+        request = worker.checked_relay_request(list(reads.repositories), reads.request_budget,
+                                               RELAY_MAX_RESPONSE_BYTES, RELAY_RESPONSE_BYTE_BUDGET,
+                                               RELAY_TIMEOUT_SECONDS)
+        launch = worker.relay_launch(request, dict(os.environ))
+        kept = run_reads(worker, collect_entry, runtime, out.resolve(), options.input_dir, reads, inputs,
+                         options.timeout, launch)
+    except worker.Blocked as error:
+        print(f"OSS candidate reads blocked: {error}", file=sys.stderr)
+        return EXIT_BLOCKED
+    try:
+        manifest = json.loads((out / "run/result/manifest.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        manifest = {}
+    status = manifest.get("status") if kept else "failed"
+    print(json.dumps({"mode": MODE, "entry": ENTRY, "stage": reads.stage, "status": status,
+                      "manifest": {key: manifest.get(key) for key in ("status", "exit_code",
+                                                                      "failures", "problems")}}))
+    return {"succeeded": EXIT_OK, "partial": EXIT_PARTIAL}.get(status, EXIT_FAILED)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

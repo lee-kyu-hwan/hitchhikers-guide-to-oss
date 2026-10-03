@@ -1,0 +1,770 @@
+#!/usr/bin/env python3
+"""Run the OSS research worker, or its non-AI verification entry, in one systemd unit.
+
+Linux guest only, as root, started by the trusted guest administrator:
+
+    sudo env -i PATH=/usr/bin:/bin /usr/bin/python3 -I -B \\
+      /opt/oss-research/src-<commit>/dot_local/bin/executable_oss-research-linux-run \\
+      --entry worker|verify --timeout SECONDS [--egress none|pin] -- ARGS...
+
+With --egress pin (and OSS_RESEARCH_EGRESS_RESOLVER set by the administrator),
+B's egress-pin tool from the same tree opens the pinned names on 443 before
+the unit (apply, then verify: same run, same manifest, lease longer than the
+unit) and clears them after it, whatever happened. If this wrapper is killed
+with SIGKILL, the unit still ends (guard) but the pin stays until its kernel
+lease expires; clear then fails closed and a new run waits for the expiry.
+
+Before it starts anything it also compares the guest's system clock with the RTC
+(clock guard, below) and, if they differ, sets the system clock from the RTC.
+
+Before any other code of the tree is imported, this file checks with the
+standard library alone that it, the worker beside it, the entry, the tools and
+the whole source tree with every directory above them are root-owned, not
+writable by group or others, and hold no special file or link leading out of
+the tree. Only then is the worker imported (for its Supervisor and allowlists).
+
+The unit runs as the unprivileged research user with a fixed argv, a fixed
+property set and an allowlisted environment. Its cgroup is ended as a whole
+(KillMode=control-group) when its main process exits, when RuntimeMaxSec
+passes, when this wrapper times out or is stopped by SIGTERM/SIGINT, and,
+through the worker's parent_eof_guard, when this wrapper dies (its pipe on the
+unit's stdin reads EOF). Afterwards the unit must be gone and its cgroup
+directory removed.
+
+Only five programs can run, all from the checked tree: the worker itself
+(whose main stays behind its closed gate), the non-AI collection entry
+dot_local/bin/executable_oss-research-collect (no model path), the non-AI
+Issue collection entry dot_local/bin/executable_oss-research-collect-issues
+(no model path), the non-AI candidate-verifier read entry
+dot_local/bin/executable_oss-research-candidate-reads (no model path, no clone)
+and the non-AI verification entry
+tests/fixtures/oss_research_worker/linux/unit_inner.py. Nothing here adds a
+sudoers rule or runs anything else as root.
+"""
+
+from __future__ import annotations
+
+import argparse
+import errno
+import fcntl
+from datetime import datetime, timezone
+import importlib.machinery
+import importlib.util
+import ipaddress
+import json
+import math
+import os
+from pathlib import Path
+import pwd
+import re
+import secrets
+import signal
+import stat
+import subprocess
+import sys
+import time
+
+USER = "ossresearch"
+# Trust anchors. Tests point these at a scratch tree; the guest keeps them.
+TRUSTED_OWNER = 0
+FILESYSTEM_ROOT = Path("/")
+TRUSTED_PARENT = Path("/opt")
+SYSTEM_PATH = ("/usr/bin", "/bin")
+SYSTEMD_RUN = Path("/usr/bin/systemd-run")
+SYSTEMCTL = Path("/usr/bin/systemctl")
+CGROUP_ROOT = Path("/sys/fs/cgroup/system.slice")
+# Clock guard. The guest (Lima/VZ) loses system time while the host Mac sleeps: its
+# system clock stops, the RTC (the host's time) does not. The guest cannot reach NTP
+# (research and resolver uids have no egress), so before each run the wrapper compares
+# the two and, if they differ, sets the system clock from the RTC. No network is used.
+# Measured 2026-10-02: the system clock was behind the RTC by 7 h 1 min and by 19 min 46 s.
+RTC_SINCE_EPOCH = Path("/sys/class/rtc/rtc0/since_epoch")  # whole seconds, UTC
+CLOCK_SET_PROGRAM = Path("/usr/bin/date")  # a trusted file (bootstrap); never found on PATH
+# 5 s: the RTC counts whole seconds and the two reads are not atomic, so an honest
+# offset is up to about 1.5 s; the smallest time the guard must care about (a pin
+# lease of 60 s, a request deadline of 30 s) is an order of magnitude longer.
+CLOCK_TOLERANCE_SECONDS = 5.0
+# Beyond a week the RTC itself is the more likely thing to be wrong (an RTC reading
+# 1970 would otherwise be copied into the system clock): block instead of resetting.
+CLOCK_MAX_RESYNC_SECONDS = 7 * 24 * 3600
+CLOCK_SET_SECONDS = 10
+WORKER = "executable_oss-research-worker"
+# worker: the research worker (its main stays behind its model gates).
+# collect: the non-AI collection entry (relay + collector in srt, model=False;
+# no model, credential or prompt, so it opens no model path).
+# collect-issues: the non-AI Issue collection entry (the same relay and srt
+# child as collect, with the Issue collector; model=False).
+# candidate-reads: the non-AI candidate-verifier read entry (the same relay and srt
+# child shape, with the verifier's discover and locus-search; model=False; no clone).
+# verify: the non-AI verification entry of the tests.
+ENTRIES = {"worker": "dot_local/bin/executable_oss-research-worker",
+           "collect": "dot_local/bin/executable_oss-research-collect",
+           "collect-issues": "dot_local/bin/executable_oss-research-collect-issues",
+           "candidate-reads": "dot_local/bin/executable_oss-research-candidate-reads",
+           "verify": "tests/fixtures/oss_research_worker/linux/unit_inner.py"}
+# The unit's properties are fixed; RuntimeMaxSec follows --timeout. MemoryMax
+# leaves the 2 GiB guest room for its own services.
+PROPERTIES = ("KillMode=control-group", "TasksMax=512", "MemoryMax=1536M",
+              "NoNewPrivileges=yes", "StandardInput=null")
+UNIT_GRACE_SECONDS = 10
+MAX_TIMEOUT_SECONDS = 7200
+MAX_ARGUMENTS = 64
+MAX_ARGUMENT_BYTES = 4096
+SYSTEMCTL_SECONDS = 30
+CLEANUP_SECONDS = 10.0
+UNIT_NAME = re.compile(r"\Aoss-research-[0-9a-f]{16}\Z")
+MANIFEST_SHA256 = re.compile(r"\Asha256:[0-9a-f]{64}\Z")  # egress-pin's manifest_sha256
+# Egress (docs/research/2026-09-28-78-network-boundary-plan.md §9): with
+# --egress pin, B's root tool from the same checked tree opens exactly the
+# pinned names on 443 for the run and is always cleared afterwards. The
+# resolver is decided by the administrator (no default yet); none means the
+# research user keeps no egress at all (the guest's nft default).
+EGRESS_PIN = "dot_local/bin/executable_oss-research-egress-pin"
+EGRESS_MODES = ("none", "pin")
+EGRESS_RESOLVER_VARIABLE = "OSS_RESEARCH_EGRESS_RESOLVER"
+EGRESS_SECONDS = 60
+EGRESS_MIN_TTL, EGRESS_MAX_TTL, EGRESS_TTL_MARGIN = 60, 3600, 30
+# B's live state (33571da): the manifest on tmpfs and the nft allow set. Read
+# only, by root, to see that no pin is open before a --egress none run.
+EGRESS_MANIFEST = Path("/run/oss-research-egress/manifest.json")
+NFT = Path("/usr/sbin/nft")
+NFT_SET = ("inet", "oss_research", "egress4")
+# One run at a time on the VM, none and pin alike, for the unit's whole life.
+RUN_LOCK = Path("/run/oss-research-unit/lock")
+# Handed to the unit for its record only. They prove nothing inside the unit:
+# the wrapper's own record (root) is the evidence, and no gate reads these.
+EGRESS_EVIDENCE = {"run_id": "OSS_RESEARCH_EGRESS_RUN_ID",
+                   "manifest_sha256": "OSS_RESEARCH_EGRESS_MANIFEST_SHA256",
+                   "expires_at": "OSS_RESEARCH_EGRESS_EXPIRES_AT"}
+# What the inner receives besides the worker's own allowlist: the pinned srt
+# prefix for the verification entry (its tests read it from the environment).
+EXTRA_VARIABLES = ("OSS_RESEARCH_SRT_PREFIX",)
+
+EXIT_BAD_INPUT = 2
+EXIT_BLOCKED = 3
+EXIT_FAILED = 4
+
+
+class Interrupted(Exception):
+    def __init__(self, signum: int):
+        super().__init__(signal.Signals(signum).name)
+        self.signum = signum
+
+
+# --- Bootstrap: standard library only, before the tree's code is imported. ---
+
+def closed(info: os.stat_result) -> bool:
+    return info.st_uid == TRUSTED_OWNER and not info.st_mode & 0o022
+
+
+def inside(path: Path, root: Path) -> bool:
+    return path == root or root in path.parents
+
+
+def directory_chain(label: str, directory: Path) -> list[str]:
+    """directory and each one above it up to FILESYSTEM_ROOT: owned and closed."""
+    root = Path(os.path.realpath(FILESYSTEM_ROOT))
+    if not inside(directory, root):
+        return [f"{label}: {directory} is outside {root}"]
+    for current in [directory, *directory.parents]:
+        try:
+            info = os.stat(current)
+        except OSError as error:
+            return [f"{label}: {current} is unusable: {error.strerror}"]
+        if not stat.S_ISDIR(info.st_mode) or not closed(info):
+            return [f"{label}: directory {current} is not owned by uid {TRUSTED_OWNER} "
+                    "or is writable by group or others"]
+        if current == root:
+            break
+    return []
+
+
+def trusted_file(label: str, path: Path) -> list[str]:
+    """A regular file, not a link, owned and closed, never set-id, and both
+    spellings of its directory chain owned and closed."""
+    try:
+        info = os.lstat(path)
+    except OSError as error:
+        return [f"{label} is unusable: {error.strerror}"]
+    if stat.S_ISLNK(info.st_mode):
+        return [f"{label} must not be a symlink: {path}"]
+    if not stat.S_ISREG(info.st_mode) or not closed(info) \
+            or info.st_mode & (stat.S_ISUID | stat.S_ISGID):
+        return [f"{label} is not a closed regular file owned by uid {TRUSTED_OWNER}: {path}"]
+    problems = []
+    for directory in {Path(os.path.abspath(path)).parent, Path(os.path.realpath(path)).parent}:
+        problems += directory_chain(label, directory)
+    return problems
+
+
+def trusted_tree(source: Path) -> list[str]:
+    """The source tree under TRUSTED_PARENT, its chain closed, every entry owned
+    and closed, no special file, no link leading out of it."""
+    parent = Path(os.path.realpath(TRUSTED_PARENT))
+    if source.is_symlink() or parent not in source.parents:
+        return [f"source tree must be a directory under {TRUSTED_PARENT}: {source}"]
+    problems = directory_chain("source tree", source)
+    if problems:
+        return problems
+    errors: list[OSError] = []
+    for current, directories, files in os.walk(source, onerror=errors.append):
+        for name in directories + files:
+            path = Path(current) / name
+            try:
+                info = os.lstat(path)
+            except OSError as error:
+                return [f"source tree entry is unusable: {path}: {error.strerror}"]
+            if info.st_uid != TRUSTED_OWNER:
+                return [f"source tree entry is not owned by uid {TRUSTED_OWNER}: {path}"]
+            if stat.S_ISLNK(info.st_mode):
+                if not inside(Path(os.path.realpath(path)), source):
+                    return [f"source tree link leads outside it: {path}"]
+            elif not (stat.S_ISDIR(info.st_mode) or stat.S_ISREG(info.st_mode)):
+                return [f"special file in the source tree: {path}"]
+            elif info.st_mode & 0o022:
+                return [f"source tree entry is writable by group or others: {path}"]
+    if errors:
+        return [f"source tree cannot be fully listed: {errors[0].strerror}"]
+    return []
+
+
+def bootstrap(script: Path, entry: str, python: Path,
+              egress: str = "none") -> tuple[Path, list[str]]:
+    """(source tree, problems): everything the import and the unit rely on."""
+    if script.is_symlink() or not script.name.startswith("executable_"):
+        return Path(), ["the unit wrapper runs only as the file of a reviewed source tree"]
+    script = Path(os.path.realpath(script))
+    source = script.parents[2]
+    problems = trusted_tree(source)
+    for label, path in (("unit wrapper", script), ("worker", script.with_name(WORKER)),
+                        ("entry", source / ENTRIES[entry]), ("python", python),
+                        ("systemd-run", SYSTEMD_RUN), ("systemctl", SYSTEMCTL),
+                        ("nft", NFT), ("clock-set program", CLOCK_SET_PROGRAM)):
+        problems += trusted_file(label, path)
+    if egress == "pin":
+        problems += trusted_file("egress-pin", source / EGRESS_PIN)
+    return source, problems
+
+
+def read_rtc() -> int:
+    """The RTC in whole seconds since the epoch (UTC), from the kernel's file.
+
+    Raises OSError or ValueError when it cannot be read or is not a plain positive
+    integer. The final path component is opened without following a link."""
+    descriptor = os.open(RTC_SINCE_EPOCH, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        data = os.read(descriptor, 64)
+    finally:
+        os.close(descriptor)
+    text = data.decode("ascii", errors="strict")
+    if re.fullmatch(r"[0-9]{1,12}\n?", text) is None or int(text) <= 0:
+        raise ValueError("the RTC reading is not a positive integer")
+    return int(text)
+
+
+def system_seconds() -> float:
+    return time.time()
+
+
+def set_system_clock(epoch: int) -> None:
+    """Set the system clock to epoch (UTC seconds) with the fixed program, no network.
+
+    The argv, the environment and the program are fixed here: nothing the caller or
+    the environment says reaches them. Raises OSError when the program fails."""
+    if type(epoch) is not int or epoch <= 0:
+        raise ValueError("the epoch must be a positive integer")
+    result = subprocess.run([str(CLOCK_SET_PROGRAM), "-u", "-s", f"@{epoch}"], capture_output=True,
+                            text=True, timeout=CLOCK_SET_SECONDS, stdin=subprocess.DEVNULL,
+                            env={"LC_ALL": "C", "PATH": ":".join(SYSTEM_PATH)}, check=False)
+    if result.returncode != 0:
+        raise OSError(f"{CLOCK_SET_PROGRAM} exited with {result.returncode}")
+
+
+def clock_guard(read_rtc=None, now=None, set_clock=None) -> dict:
+    """Compare the system clock with the RTC; set it from the RTC when they differ.
+
+    Returns the evidence: checked_at (the RTC's time), tolerance_seconds,
+    offset_before (system minus RTC, seconds), action (none, resynced or blocked),
+    offset_after and reason. action blocked means nothing may be started: the RTC
+    cannot be read (rtc-unreadable), the offset is too large to trust
+    (offset-too-large), the reset failed (resync-failed) or the clocks still differ
+    after it (still-off-after-resync). There is no fallback that goes on anyway.
+    """
+    read_rtc = globals()["read_rtc"] if read_rtc is None else read_rtc
+    now = system_seconds if now is None else now
+    set_clock = set_system_clock if set_clock is None else set_clock
+    record = {"checked_at": None, "tolerance_seconds": CLOCK_TOLERANCE_SECONDS, "offset_before": None,
+              "action": "blocked", "offset_after": None, "reason": None}
+
+    def blocked(reason: str) -> dict:
+        record["reason"] = reason
+        return record
+
+    try:
+        rtc = read_rtc()
+    except (OSError, ValueError):
+        return blocked("rtc-unreadable")
+    record["checked_at"] = datetime.fromtimestamp(rtc, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    offset = now() - rtc
+    record["offset_before"] = record["offset_after"] = round(offset, 3)
+    if abs(offset) <= CLOCK_TOLERANCE_SECONDS:
+        record["action"] = "none"
+        return record
+    record["offset_after"] = None
+    if abs(offset) > CLOCK_MAX_RESYNC_SECONDS:
+        return blocked("offset-too-large")
+    try:
+        set_clock(rtc)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return blocked("resync-failed")
+    try:
+        rtc_again = read_rtc()
+    except (OSError, ValueError):
+        return blocked("rtc-unreadable")
+    record["offset_after"] = round(now() - rtc_again, 3)
+    if abs(record["offset_after"]) > CLOCK_TOLERANCE_SECONDS:
+        return blocked("still-off-after-resync")
+    record["action"] = "resynced"
+    return record
+
+
+def clock_after_run(read_rtc=None, now=None) -> dict:
+    """The offset once the run is over. Only read, never set, and it never changes
+    the run's result: a host that slept during the run is marked, not judged."""
+    read_rtc = globals()["read_rtc"] if read_rtc is None else read_rtc
+    now = system_seconds if now is None else now
+    try:
+        offset = round(now() - read_rtc(), 3)
+    except (OSError, ValueError):
+        return {"offset": None, "within_tolerance": None, "error": "rtc-unreadable"}
+    return {"offset": offset, "within_tolerance": abs(offset) <= CLOCK_TOLERANCE_SECONDS, "error": None}
+
+
+def checked_path(value: str | None) -> str:
+    """The unit's PATH: system directories, plus closed directories under
+    TRUSTED_PARENT (the pinned node, for example). Anything else is refused.
+
+    Both spellings count: the chain above the entry as written (a link placed
+    in a writable directory could be swapped) and above what it resolves to.
+    The returned PATH holds the resolved directories, not the aliases.
+    """
+    if not value:
+        return ":".join(SYSTEM_PATH)
+    parent = Path(os.path.realpath(TRUSTED_PARENT))
+    kept = []
+    for entry in value.split(":"):
+        if entry in SYSTEM_PATH:
+            kept.append(entry)
+            continue
+        path = Path(entry)
+        if not path.is_absolute() or os.path.normpath(entry) != entry:
+            raise ValueError(f"PATH entry is not a plain absolute path: {entry!r}")
+        resolved = Path(os.path.realpath(path))
+        if parent not in resolved.parents or directory_chain("PATH entry", resolved) \
+                or directory_chain("PATH entry", path):
+            raise ValueError(f"PATH entry is not a closed directory under {TRUSTED_PARENT}: {entry}")
+        kept.append(str(resolved))
+    return ":".join(kept)
+
+
+def load_worker(script: Path):
+    """The worker beside this file. Called only after bootstrap passed."""
+    path = Path(os.path.realpath(script)).with_name(WORKER)
+    loader = importlib.machinery.SourceFileLoader("oss_research_worker", str(path))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+# --- Run lock and the idle egress check. ---
+
+def acquire_run_lock() -> int:
+    """An exclusive, non-blocking lock held until this process ends (flock, so a
+    SIGKILL releases it). Raises ValueError when another run holds it."""
+    directory = RUN_LOCK.parent
+    try:
+        os.mkdir(directory, 0o700)
+    except FileExistsError:
+        pass
+    info = os.lstat(directory)
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != TRUSTED_OWNER or info.st_mode & 0o077:
+        raise ValueError(f"run lock directory {directory} is not a private directory of uid "
+                         f"{TRUSTED_OWNER}")
+    descriptor = os.open(RUN_LOCK, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as error:
+        os.close(descriptor)
+        if error.errno in (errno.EWOULDBLOCK, errno.EAGAIN):
+            raise ValueError("another OSS research run holds the run lock")
+        raise
+    return descriptor
+
+
+def egress_idle() -> list[str]:
+    """No pin may be open for a --egress none run: B's manifest absent and the
+    live allow set readable and empty. Anything else, unclear included, refuses.
+    An existing pin is never cleared here: it may belong to another run."""
+    problems = []
+    if os.path.lexists(EGRESS_MANIFEST):
+        problems.append(f"egress pin present ({EGRESS_MANIFEST}); wait for its run or its lease")
+    try:
+        completed = subprocess.run([str(NFT), "-j", "list", "set", *NFT_SET],
+                                   stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                                   timeout=EGRESS_SECONDS, env={"PATH": "/usr/bin:/bin"})
+        data = json.loads(completed.stdout) if completed.returncode == 0 else None
+    except (OSError, subprocess.SubprocessError, ValueError) as error:
+        return problems + [f"egress set unreadable: {type(error).__name__}"]
+    if not isinstance(data, dict):
+        return problems + [f"egress set unreadable: nft exit {completed.returncode}"]
+    sets = [item["set"] for item in data.get("nftables", [])
+            if isinstance(item, dict) and isinstance(item.get("set"), dict)]
+    if len(sets) != 1:
+        return problems + ["egress set unreadable: not exactly one set"]
+    if sets[0].get("elem"):
+        problems.append(f"egress set not empty: {len(sets[0]['elem'])} element(s)")
+    return problems
+
+
+# --- Egress pin (B's tool, called as-is). ---
+
+def pin_ttl(seconds: float) -> int:
+    """The pin's lifetime: the unit's own bound plus a margin, never clamped."""
+    ttl = max(EGRESS_MIN_TTL, math.ceil(seconds) + UNIT_GRACE_SECONDS + EGRESS_TTL_MARGIN)
+    if ttl > EGRESS_MAX_TTL:
+        raise ValueError(f"egress pin ttl {ttl} s is above {EGRESS_MAX_TTL} s; use a shorter timeout")
+    return ttl
+
+
+def checked_resolver(value: str | None) -> str:
+    if not value:
+        raise ValueError(f"--egress pin needs {EGRESS_RESOLVER_VARIABLE} (an IPv4 literal)")
+    try:
+        return str(ipaddress.IPv4Address(value))
+    except ValueError:
+        raise ValueError(f"{EGRESS_RESOLVER_VARIABLE} is not an IPv4 literal: {value!r}")
+
+
+def egress_tool(tool: Path, python: Path, *arguments: str) -> tuple[int, dict]:
+    """(exit, last stdout JSON object); a crash or garbage is exit -1."""
+    try:
+        completed = subprocess.run([str(python), "-I", "-B", str(tool), *arguments],
+                                   stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                                   timeout=EGRESS_SECONDS, env={"PATH": "/usr/bin:/bin"})
+    except (OSError, subprocess.SubprocessError) as error:
+        return -1, {"error": type(error).__name__}
+    try:
+        document = json.loads(completed.stdout.strip().splitlines()[-1])
+    except (IndexError, ValueError):
+        document = None
+    if not isinstance(document, dict):
+        return -1 if completed.returncode == 0 else completed.returncode, {"error": "no JSON"}
+    return completed.returncode, document
+
+
+def parse_expiry(value: object) -> float | None:
+    try:
+        return datetime.strptime(str(value), "%Y-%m-%dT%H:%M:%SZ").replace(
+            tzinfo=timezone.utc).timestamp()
+    except ValueError:
+        return None
+
+
+def open_egress(tool: Path, python: Path, run_id: str, seconds: float, resolver: str,
+                now=time.time) -> tuple[dict | None, list[str], dict]:
+    """apply then verify; (evidence, problems, record). Evidence only when both
+    agree on the run and the manifest, and the pin outlives the unit."""
+    record: dict = {}
+    code, applied = egress_tool(tool, python, "apply", "--run-id", run_id,
+                                "--ttl", str(pin_ttl(seconds)), "--resolver", resolver)
+    record["apply"] = {"exit": code, **{key: applied.get(key) for key in
+                                         ("status", "run_id", "expires_at", "manifest_sha256",
+                                          "nft_elements", "error")}}
+    if code != 0 or applied.get("status") != "pinned" or applied.get("run_id") != run_id:
+        return None, [f"egress-apply-failed: exit {code}"], record
+    code, verified = egress_tool(tool, python, "verify", "--run-id", run_id)
+    record["verify"] = {"exit": code, **{key: verified.get(key) for key in
+                                          ("ok", "problems", "run_id", "expires_at",
+                                           "manifest_sha256")}}
+    if code != 0 or verified.get("ok") is not True or verified.get("run_id") != run_id \
+            or MANIFEST_SHA256.match(str(applied.get("manifest_sha256"))) is None \
+            or verified.get("manifest_sha256") != applied.get("manifest_sha256") \
+            or verified.get("expires_at") != applied.get("expires_at"):
+        return None, [f"egress-verify-failed: exit {code}"], record
+    expires = parse_expiry(verified["expires_at"])
+    if expires is None or expires - now() < seconds + UNIT_GRACE_SECONDS:
+        return None, ["egress-expires-too-soon"], record
+    return ({"run_id": run_id, "manifest_sha256": verified["manifest_sha256"],
+             "expires_at": verified["expires_at"]}, [], record)
+
+
+def close_egress(tool: Path, python: Path, run_id: str, record: dict) -> list[str]:
+    """clear, always. Exit 4 means the kernel lease stays until it expires."""
+    code, cleared = egress_tool(tool, python, "clear", "--run-id", run_id)
+    record["clear"] = {"exit": code, **{key: cleared.get(key) for key in
+                                         ("status", "closed", "error")}}
+    if code == 4:
+        until = record.get("apply", {}).get("expires_at")
+        return [f"egress-clear-failed: kernel lease until {until}"]
+    if code != 0:
+        return [f"egress-clear-failed: exit {code}"]
+    return []
+
+
+# --- The unit. ---
+
+def checked_arguments(arguments: list[str]) -> list[str]:
+    if len(arguments) > MAX_ARGUMENTS:
+        raise ValueError(f"at most {MAX_ARGUMENTS} arguments")
+    for argument in arguments:
+        if "\0" in argument or "\n" in argument or len(argument.encode()) > MAX_ARGUMENT_BYTES:
+            raise ValueError("an argument holds NUL or a newline, or is too long")
+    return arguments
+
+
+def checked_timeout(value: str) -> float:
+    seconds = float(value)
+    if not math.isfinite(seconds) or not 0 < seconds <= MAX_TIMEOUT_SECONDS:
+        raise argparse.ArgumentTypeError(f"timeout must be above 0 and at most {MAX_TIMEOUT_SECONDS}")
+    return seconds
+
+
+def unit_environment(worker, parent: dict[str, str]) -> dict[str, str]:
+    names = (*worker.INHERITED_VARIABLES, *EXTRA_VARIABLES)
+    environment = {name: parent[name] for name in names if name in parent}
+    for name, value in environment.items():
+        if "\n" in value or "\0" in value:
+            raise ValueError(f"environment value of {name} holds a newline or NUL")
+    environment["PATH"] = checked_path(parent.get("PATH"))
+    return environment
+
+
+def unit_argv(unit: str, seconds: float, source: Path, program: list[str],
+              environment: dict[str, str], marker: str,
+              evidence: dict[str, str] | None = None) -> list[str]:
+    """The one systemd-run command; only the unit name, timeout, environment
+    values and the program's own arguments (after "--") vary."""
+    if UNIT_NAME.match(unit) is None:
+        raise ValueError("unit name is not oss-research-<16 hex>")
+    argv = [str(SYSTEMD_RUN), "--quiet", "--wait", "--pipe", "--collect", f"--unit={unit}",
+            f"--uid={USER}", f"--gid={USER}", f"--working-directory={source}",
+            "-p", f"RuntimeMaxSec={math.ceil(seconds) + UNIT_GRACE_SECONDS}"]
+    for item in PROPERTIES:
+        argv += ["-p", item]
+    for name, value in sorted(environment.items()):
+        argv.append(f"--setenv={name}={value}")
+    argv.append(f"--setenv={marker}={unit}")
+    for key, name in EGRESS_EVIDENCE.items():
+        if evidence is not None:
+            argv.append(f"--setenv={name}={evidence[key]}")
+    return [*argv, "--", *program]
+
+
+def research_user_problems() -> list[str]:
+    try:
+        user = pwd.getpwnam(USER)
+    except KeyError:
+        return [f"no {USER} user"]
+    if user.pw_uid == 0 or user.pw_gid == 0:
+        return [f"{USER} must not be root"]
+    return []
+
+
+def systemctl(*arguments: str) -> subprocess.CompletedProcess:
+    return subprocess.run([str(SYSTEMCTL), *arguments], stdin=subprocess.DEVNULL,
+                          capture_output=True, text=True, timeout=SYSTEMCTL_SECONDS,
+                          env={"PATH": "/usr/bin:/bin"})
+
+
+def unit_state(unit: str) -> str:
+    return systemctl("show", "-p", "LoadState", "--value", unit).stdout.strip()
+
+
+def end_unit(unit: str) -> list[str]:
+    """SIGKILL the unit's cgroup and stop it. A systemctl that fails or hangs is
+    recorded; the caller checks what is left either way."""
+    problems = []
+    for command in (["kill", "--signal=SIGKILL", unit], ["stop", unit]):
+        try:
+            systemctl(*command)
+        except (OSError, subprocess.SubprocessError) as error:
+            problems.append(f"unit-stop-failed: {command[0]}: {type(error).__name__}")
+    return problems
+
+
+def unit_gone(unit: str, cgroup_root: Path | None = None) -> list[str]:
+    """After the run: the unit unloaded and its cgroup removed, within CLEANUP_SECONDS."""
+    cgroup = (CGROUP_ROOT if cgroup_root is None else cgroup_root) / f"{unit}.service"
+    until = time.monotonic() + CLEANUP_SECONDS
+    while True:
+        try:
+            state = unit_state(unit)
+        except (OSError, subprocess.SubprocessError) as error:
+            state = f"unknown ({type(error).__name__})"
+        if state == "not-found" and not cgroup.exists():
+            return []
+        if time.monotonic() >= until:
+            problems = []
+            if state != "not-found":
+                problems.append(f"unit-survived: {state or 'unknown'}")
+            if cgroup.exists():
+                problems.append("cgroup-remains")
+            return problems
+        time.sleep(0.1)
+
+
+def run_unit(worker, argv: list[str], unit: str, seconds: float, source: Path) -> dict:
+    """Start systemd-run under one Supervisor deadline and always end the unit."""
+    supervisor = worker.Supervisor(seconds + UNIT_GRACE_SECONDS / 2)
+    record = {"unit": unit, "exit_code": None, "failures": []}
+    process = None
+
+    def interrupt(signum, _frame):
+        raise Interrupted(signum)
+
+    previous = {signum: signal.signal(signum, interrupt)
+                for signum in (signal.SIGTERM, signal.SIGINT)}
+    try:
+        try:
+            process = supervisor.start(argv, {"PATH": "/usr/bin:/bin"}, source,
+                                       stdin=subprocess.PIPE)
+            record["exit_code"] = supervisor.run(process)
+        except Interrupted as error:
+            supervisor.fail(f"unit-signal: {error}")
+        except OSError as error:
+            supervisor.fail(f"unit-not-started: {type(error).__name__}")
+        finally:
+            for signum in previous:
+                signal.signal(signum, signal.SIG_IGN)
+            if process is not None and process.stdin is not None:
+                process.stdin.close()  # the guard inside ends the unit's main process
+            supervisor.cleanup()
+            supervisor.failures += end_unit(unit)
+            supervisor.failures += unit_gone(unit)
+    finally:
+        for signum, handler in previous.items():
+            signal.signal(signum, handler)
+    record["failures"] = list(supervisor.failures)
+    if record["failures"]:
+        record["exit_code"] = None
+    record["stdout"] = worker.text(supervisor.data["stdout"][-65_536:])
+    record["stderr"] = worker.text(supervisor.data["stderr"][-16_384:])
+    return record
+
+
+def launch(worker, entry: str, seconds: float, egress: str, source: Path, python: Path,
+           environment: dict[str, str], arguments: list[str], resolver: str | None) -> dict:
+    """One run: open the egress pin (if asked), the unit, and always clear."""
+    unit = f"oss-research-{secrets.token_hex(8)}"
+    record: dict = {"unit": unit, "entry": entry, "egress": egress, "exit_code": None,
+                    "failures": []}
+    tool = source / EGRESS_PIN
+    evidence = None
+
+    def interrupt(signum, _frame):
+        raise Interrupted(signum)
+
+    previous = {signum: signal.signal(signum, interrupt)
+                for signum in (signal.SIGTERM, signal.SIGINT)}
+    try:
+        try:
+            if egress == "none":
+                problems = egress_idle()
+                if problems:
+                    record["failures"] += ["egress-not-idle: " + item for item in problems]
+                    return record
+            if egress == "pin":
+                evidence, problems, record["egress_pin"] = open_egress(
+                    tool, python, unit, seconds, resolver)
+                if problems:
+                    record["failures"] += problems
+                    return record
+            argv = unit_argv(unit, seconds, source,
+                             [str(python), "-I", "-B", str(source / ENTRIES[entry]), *arguments],
+                             environment, worker.UNIT_ENV_MARKER, evidence)
+            record.update(run_unit(worker, argv, unit, seconds, source))
+        except Interrupted as error:
+            record["failures"].append(f"unit-signal: {error}")
+            record["exit_code"] = None
+        finally:
+            for signum in previous:
+                signal.signal(signum, signal.SIG_IGN)
+            if egress == "pin":
+                record["failures"] += close_egress(tool, python, unit,
+                                                   record.setdefault("egress_pin", {}))
+    finally:
+        for signum, handler in previous.items():
+            signal.signal(signum, handler)
+    if record["failures"]:
+        record["exit_code"] = None
+    record["egress_evidence"] = evidence
+    return record
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--entry", required=True, choices=sorted(ENTRIES))
+    parser.add_argument("--timeout", required=True, type=checked_timeout)
+    parser.add_argument("--egress", choices=EGRESS_MODES, default="none",
+                        help="none: the research user keeps no egress; pin: open the "
+                             "pinned names on 443 for this run only")
+    parser.add_argument("arguments", nargs=argparse.REMAINDER)
+    options = parser.parse_args()
+    arguments = options.arguments[1:] if options.arguments[:1] == ["--"] else options.arguments
+    resolver = None
+    try:
+        arguments = checked_arguments(arguments)
+        if options.egress == "pin":
+            pin_ttl(options.timeout)
+            resolver = checked_resolver(os.environ.get(EGRESS_RESOLVER_VARIABLE))
+    except ValueError as error:
+        print(f"OSS research unit wrapper did not start: {error}", file=sys.stderr)
+        return EXIT_BAD_INPUT
+    problems = []
+    if sys.platform != "linux":
+        problems.append("the unit wrapper runs on Linux only")
+    if os.geteuid() != TRUSTED_OWNER:
+        problems.append("the unit wrapper runs as root (the guest administrator)")
+    python = Path(os.path.realpath(sys.executable))
+    if not problems:
+        source, problems = bootstrap(Path(__file__), options.entry, python, options.egress)
+        problems += research_user_problems()
+    if problems:
+        print("OSS research unit wrapper blocked: " + "; ".join(problems), file=sys.stderr)
+        return EXIT_BLOCKED
+    worker = load_worker(Path(__file__))
+    try:
+        environment = unit_environment(worker, dict(os.environ))
+    except ValueError as error:
+        print(f"OSS research unit wrapper did not start: {error}", file=sys.stderr)
+        return EXIT_BAD_INPUT
+    try:
+        acquire_run_lock()  # held until this process exits
+    except (OSError, ValueError) as error:
+        print(f"OSS research unit wrapper blocked: {error}", file=sys.stderr)
+        return EXIT_BLOCKED
+    # The clock guard comes before anything else is started: no unit, pin, relay or
+    # credential exists yet. It holds the run lock, so no other run sees the step.
+    clock = clock_guard()
+    if clock["action"] == "blocked":
+        print(json.dumps({"unit": None, "entry": options.entry, "egress": options.egress,
+                          "exit_code": None, "failures": ["clock-guard: " + clock["reason"]],
+                          "clock": clock, "egress_evidence": None}))
+        print("OSS research unit wrapper blocked: the guest clock cannot be trusted "
+              f"({clock['reason']}); nothing was started", file=sys.stderr)
+        return EXIT_BLOCKED
+    record = launch(worker, options.entry, options.timeout, options.egress, source, python,
+                    environment, arguments, resolver)
+    clock["after_run"] = clock_after_run()
+    record["clock"] = clock
+    print(json.dumps(record))
+    if any(item.startswith(("egress-apply", "egress-verify", "egress-not-idle"))
+           or item == "egress-expires-too-soon" for item in record["failures"]):
+        return EXIT_BLOCKED
+    return 0 if record["exit_code"] == 0 and not record["failures"] else EXIT_FAILED
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

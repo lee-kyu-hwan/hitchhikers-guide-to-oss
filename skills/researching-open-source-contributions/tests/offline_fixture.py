@@ -512,8 +512,11 @@ class VerifierWorld:
         return workflow.run_main(vc.main, argv, sleeper=collector_tests.FakeSleep(), clock=lambda: EPOCH, opener=self.opener)
 
 
-def synthetic_assessment(discovery_record, pr_urls, status="unverified", status_reason="insufficient-evidence"):
-    return {
+def synthetic_assessment(discovery_record, pr_urls, status="unverified", status_reason="insufficient-evidence",
+                         static_reproduction=False):
+    """``static_reproduction`` adds the evidence a ``reproduced`` status needs; it is still synthetic."""
+    hits = [hit["html_url"] for hit in discovery_record["code_search"]["hits"]]
+    assessment = {
         "pattern_id": discovery_record["pattern_id"], "repository": discovery_record["repository"], "locus": LOCUS,
         "status": status, "status_reason": status_reason, "sensitivity": "normal",
         "summary": SYNTHETIC + ": test-written assessment, not a verified contribution candidate.",
@@ -522,13 +525,20 @@ def synthetic_assessment(discovery_record, pr_urls, status="unverified", status_
                              for key in vc.READINESS_KEYS},
         "duplicate_verdict": {"matched_items": [], "judgment": SYNTHETIC + ": no duplicate judgment was made."},
         "ai_policy_status": "unknown", "disclosure_required": None, "private_evidence_reference": None,
-        "evidence_links": [hit["html_url"] for hit in discovery_record["code_search"]["hits"]] + list(pr_urls),
+        "evidence_links": hits + list(pr_urls),
         "execution_evidence": None, "reproduction": {"method": "none", "evidence_links": [], "public_steps": None},
         "policy_checks": {key: {"found": None, "source": None, "sha256": None, "assessment": SYNTHETIC + ": not reviewed",
                                 "evidence_links": []} for key in vc.POLICY_CHECK_KEYS},
         "blocking_gaps": ["synthetic-fixture-not-a-real-candidate", "model-pattern-extraction-not-run"],
         "superseded_by": None,
     }
+    if static_reproduction:
+        # The fake code-search hit stands in for reading the locus; nothing was reproduced for real.
+        assessment["reproduction"] = {"method": "static", "evidence_links": hits,
+                                      "public_steps": [SYNTHETIC + ": read the fixture locus."]}
+        assessment["readiness_checks"]["reproduction_evidence"] = {
+            "result": "confirmed", "evidence_links": hits, "note": SYNTHETIC + ": fixture code-search hit"}
+    return assessment
 
 
 def write_json(path, value):

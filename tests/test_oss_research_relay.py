@@ -265,6 +265,29 @@ class AllowedReadTests(RelayHarness):
         self.assertNotIn("cookie", seen["headers"])
         self.assertNotIn("parentsecret", json.dumps(seen["headers"]))
 
+    def test_versions_is_one_exact_anonymous_read(self):
+        # The collector's API-version preflight: exact path, no query, same budget and scope check.
+        self.route("/versions", ["2022-11-28", "2026-03-10"])
+        status, document = self.request("GET", "/v1/rest/versions")
+        self.assertEqual(status, 200, document)
+        self.assertEqual(document["payload"], ["2022-11-28", "2026-03-10"])
+        self.assertEqual(document["budget"]["consumed"], 1)
+        [seen] = self.upstream.requests
+        self.assertEqual((seen["method"], seen["path"]), ("GET", "/versions?per_page=100"))
+        self.assertNotIn("authorization", seen["headers"])
+        for target in ("/v1/rest/versions?page=1", "/v1/rest/versions?per_page=100"):
+            with self.subTest(target=target):
+                status, document = self.request("GET", target)
+                self.assertEqual((status, document["error"]), (400, "query_not_allowed"), document)
+        status, document = self.request("POST", "/v1/rest/versions", body=b"{}")
+        self.assertEqual(status, 405, document)
+        self.assertEqual(len(self.upstream.requests), 1)
+
+    def test_versions_scope_check_refuses_a_non_version_payload(self):
+        self.route("/versions", {"message": "not a list"})
+        status, document = self.request("GET", "/v1/rest/versions")
+        self.assertEqual((status, document["error"]), (502, "upstream_out_of_scope"), document)
+
     def test_rest_repository_item_commit_contents_and_search(self):
         self.route("/repos/octo/demo", {"full_name": "octo/demo"})
         self.route("/repos/octo/demo/pulls/3", {"url": API + "/repos/octo/demo/pulls/3"})
@@ -339,15 +362,22 @@ class WriteAndMethodRefusalTests(RelayHarness):
 class PathAndSsrfRefusalTests(RelayHarness):
     def test_endpoints_outside_the_allowlist_are_refused(self):
         for target in (
-            "/v1/rest/user", "/v1/rest/versions", "/v1/rest/repos/octo/demo/git/refs",
+            "/v1/rest/user", "/v1/rest/versions/extra", "/v1/rest/meta", "/v1/rest/repos/octo/demo/git/refs",
             "/v1/rest/repos/octo/demo/hooks", "/v1/rest/repos/octo/demo/actions/secrets",
-            "/v1/rest/repos/octo/demo/collaborators", "/v1/rest/search/code?q=repo:octo/demo",
+            "/v1/rest/repos/octo/demo/collaborators",
             "/v1/rest/repos/octo/demo/git/upload-pack", "/v1/rest/repos/octo/demo/tarball/main",
-            "/v1/rest/repos/octo/demo/commits/main", "/v1/rest/graphql",
+            "/v1/rest/graphql",
         ):
             with self.subTest(target=target):
                 status, document = self.request("GET", target)
                 self.assert_refused(status, document, 403, "endpoint_not_allowed")
+        # Added for the candidate verifier, still refused here: code search takes only its exact
+        # quoted form, and a branch commit only the default branch this relay observed.
+        for target, code in (("/v1/rest/search/code?q=repo:octo/demo", "search_grammar_not_allowed"),
+                             ("/v1/rest/repos/octo/demo/commits/main", "ref_not_observed")):
+            with self.subTest(target=target):
+                status, document = self.request("GET", target)
+                self.assert_refused(status, document, 403, code)
 
     def test_repositories_outside_the_allowlist_are_refused(self):
         for target in ("/v1/rest/repos/other/demo", "/v1/rest/repos/octo/demo2/issues/1",
@@ -600,6 +630,105 @@ class UpstreamFailureTests(RelayHarness):
             thread.join(10)
         self.assertLess(time.monotonic() - started, 2.5)
         self.assertEqual(sorted(results), [504, 504, 504])
+
+
+class RateLimitStatusTests(RelayHarness):
+    """A received rate-limit answer whose retry wait passes the deadline keeps its status.
+
+    The relay still does not wait and does not ask again: one upstream request,
+    one budget unit, answered at once as upstream_failed with the status it got."""
+
+    budget = 20
+    timeout_seconds = 5.0
+    RATE = {"x-ratelimit-limit": "60", "x-ratelimit-remaining": "0", "x-ratelimit-used": "60",
+            "x-ratelimit-resource": "graphql"}
+
+    def far_reset(self):
+        return str(int(time.time()) + 3000)
+
+    def assert_kept(self, status, document, upstream_status, headers, message):
+        self.assertEqual(status, 502, document)
+        self.assertEqual((document["error"], document["upstream_status"]), ("upstream_failed", upstream_status))
+        self.assertGreaterEqual(document["upstream_retry_wait_seconds"], self.timeout_seconds - 1)
+        self.assertEqual(document["upstream_rate_limit"], headers)
+        # The upstream's own message, as for any other upstream failure; the relay's
+        # reason is a separate field.
+        self.assertEqual(document["message"], message)
+        self.assertEqual(document["relay_reason"], "the retry wait passes the relay request deadline")
+        self.assertEqual(len(self.upstream.requests), 1)
+        self.assertEqual(document["budget"]["consumed"], 1)
+
+    def test_rest_403_rate_limit_with_a_far_reset_keeps_403(self):
+        reset = self.far_reset()
+        self.route("/repos/octo/demo", {"message": "API rate limit exceeded"}, status=403,
+                   headers=dict(self.RATE, **{"x-ratelimit-reset": reset}))
+        status, document = self.request("GET", "/v1/rest/repos/octo/demo")
+        self.assert_kept(status, document, 403, dict(self.RATE, **{"x-ratelimit-reset": reset}),
+                         "API rate limit exceeded")
+
+    def test_graphql_429_with_a_long_retry_after_keeps_429(self):
+        self.route("/graphql", {"message": "Too Many Requests"}, status=429, headers={"Retry-After": "60"})
+        status, document = self.graphql({"operation": "IssueEvidence",
+                                         "variables": {"owner": "octo", "name": "demo", "number": 1}})
+        self.assert_kept(status, document, 429, {"retry-after": "60"}, "Too Many Requests")
+
+    def test_graphql_403_rate_message_without_headers_keeps_403(self):
+        self.route("/graphql", {"message": "You have exceeded a secondary rate limit"}, status=403)
+        status, document = self.graphql({"operation": "IssueEvidence",
+                                         "variables": {"owner": "octo", "name": "demo", "number": 1}})
+        self.assert_kept(status, document, 403, {}, "You have exceeded a secondary rate limit")
+
+    def test_unsafe_or_malformed_rate_headers_are_not_forwarded(self):
+        self.route("/repos/octo/demo", {"message": "API rate limit exceeded"}, status=403,
+                   headers={"Retry-After": "60", "x-ratelimit-reset": "soon; x=1", "Set-Cookie": "a=b",
+                            "x-github-request-id": "ABC"})
+        status, document = self.request("GET", "/v1/rest/repos/octo/demo")
+        self.assert_kept(status, document, 403, {"retry-after": "60"}, "API rate limit exceeded")
+
+    def test_a_graphql_403_without_quota_is_returned_at_once_with_its_headers(self):
+        quota = {"x-ratelimit-resource": "graphql", "x-ratelimit-limit": "0", "x-ratelimit-remaining": "0",
+                 "x-ratelimit-used": "0", "x-ratelimit-reset": self.far_reset()}
+        self.route("/graphql", {"message": "API rate limit exceeded"}, status=403, headers=quota)
+        status, document = self.graphql({"operation": "IssueEvidence",
+                                         "variables": {"owner": "octo", "name": "demo", "number": 1}})
+        self.assertEqual((status, document["error"], document["upstream_status"]), (502, "upstream_failed", 403))
+        self.assertEqual(document["upstream_rate_limit"], quota)
+        self.assertNotIn("upstream_retry_wait_seconds", document)  # no wait was planned
+        self.assertEqual((len(self.upstream.requests), document["budget"]["consumed"]), (1, 1))
+
+    def test_a_short_wait_is_still_retried_inside_the_deadline(self):
+        # Unchanged: a wait that fits is waited (sleep is patched here) and retried.
+        self.route("/repos/octo/demo", {"message": "API rate limit exceeded"}, status=403,
+                   headers={"Retry-After": "1"})
+        status, document = self.request("GET", "/v1/rest/repos/octo/demo")
+        self.assertEqual((status, document["error"], document["upstream_status"]), (502, "upstream_failed", 403))
+        self.assertNotIn("upstream_retry_wait_seconds", document)
+        self.assertEqual(len(self.upstream.requests), 4)
+
+    def test_a_transport_failure_before_a_long_wait_stays_a_timeout(self):
+        # No answer was received on the last attempt, so there is no status to keep: still 504.
+        relay, opener = self.server.relay, self.server.relay._opener
+        self.route("/repos/octo/demo", {"message": "API rate limit exceeded"}, status=403,
+                   headers={"Retry-After": "60"})
+        self.request("GET", "/v1/rest/repos/octo/demo")  # leaves a 403 as the last answer
+        self.assertEqual(opener.last_response, (403, {"retry-after": "60"}))
+        with mock.patch.object(self.opener, "open", side_effect=OSError("connection reset")):
+            with self.assertRaises(OSError):
+                opener.open(urllib.request.Request(API + "/repos/octo/demo"), timeout=1)
+        self.assertIsNone(opener.last_response)
+        opener.deadline = time.monotonic() + 0.5
+        try:
+            with self.assertRaises(relay_module.DeadlineExceeded) as caught:
+                relay._sleep_within_deadline(2.0)
+        finally:
+            opener.deadline = None
+        self.assertNotIsInstance(caught.exception, relay_module.RetryWaitPassesDeadline)
+
+    def test_a_slow_upstream_is_still_a_timeout(self):
+        self.route("/repos/octo/demo", {"full_name": "octo/demo"}, delay=8)
+        status, document = self.request("GET", "/v1/rest/repos/octo/demo")
+        self.assertEqual((status, document["error"]), (504, "upstream_timeout"), document)
+        self.assertNotIn("upstream_status", document)
 
 
 class RetryBudgetTests(RelayHarness):

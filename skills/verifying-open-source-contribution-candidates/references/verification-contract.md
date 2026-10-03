@@ -7,6 +7,7 @@ A request-failed policy observation cannot support issue-ready or pr-ready.
 A policy result recorded as unreviewed cannot support a ready status.
 A ready absence claim must match the observed absence, and an AI or CLA/DCO absence needs hand-reviewed evidence for every found file.
 A ready status requires a locus and a completed search repeated at that locus.
+A reproduced status requires a static or executed reproduction, a reproduction evidence link, and a confirmed reproduction_evidence check.
 A failed recheck makes an actionable candidate unverified with status_reason insufficient-evidence.
 record and render preserve partial, failed, and unknown run states instead of defaulting them to complete.
 
@@ -83,6 +84,14 @@ FAILED_SCOPE_REASONS:
 | `private-report-ready` | `security-sensitive` |
 
 Any combination outside this table is an input-contract violation. Actionable statuses are `reproduced`, `issue-ready`, `pr-ready`, and `private-report-ready`; they are a set, not a ranking.
+
+`reproduced` is actionable, so it must carry the reproduction it claims. All three hold, or the input is a contract violation:
+
+- `reproduction.method` is `static` or `executed`, never `none`.
+- `reproduction.evidence_links` has at least one non-blank link.
+- `readiness_checks.reproduction_evidence.result` is `confirmed`.
+
+`record` rejects an assessment that misses any of them, like any other gate failure. `validate` rejects a candidates file whose current `reproduced` record misses one, and so do `render`, `recheck`, and `record --candidates`, which read the file through the same check. Such a file cannot be extended; fix the assessment and record it to a new output. The other eleven readiness checks stay optional for `reproduced`: only the public ready states need all twelve. No other status gains a reproduction requirement.
 
 ## Readiness checks
 

@@ -32,10 +32,27 @@ LOADER = importlib.machinery.SourceFileLoader("oss_research_worker_skills", str(
 SPEC = importlib.util.spec_from_loader(LOADER.name, LOADER)
 worker = importlib.util.module_from_spec(SPEC)
 LOADER.exec_module(worker)
+# The model endpoint as the platform's policy spells it (Linux adds :443).
+MODEL_DOMAINS = list(worker.ALLOWED_DOMAINS_LINUX if sys.platform == "linux"
+                     else worker.ALLOWED_DOMAINS)
 
 PREFIX = os.environ.get("OSS_RESEARCH_SRT_PREFIX")
 PYTHON = str(Path(sys.executable).resolve())
-FIXTURE_READ = [str(Path(sys.base_prefix).resolve()), "/opt/homebrew"]
+LINUX = sys.platform == "linux"
+SHORT_TMP = "/tmp" if LINUX else "/private/tmp"
+BASE_PREFIX = str(Path(sys.base_prefix).resolve())
+# Linux: the system python's library is under /usr/lib (SYSTEM_READ_LINUX).
+FIXTURE_READ = ([PYTHON] + ([] if BASE_PREFIX.startswith("/usr") else [BASE_PREFIX])
+                if LINUX else [BASE_PREFIX, "/opt/homebrew"])
+# Linux denials (measured on the Debian guest): read-only mounts, pinned directories (EBUSY)
+# and EPERM. EACCES is not counted; file modes give it outside srt too.
+DENIED = ({"Operation not permitted", "Read-only file system", "Device or resource busy",
+           "Invalid cross-device link",  # rename across srt's bind mounts (measured)
+           # A denied path that does not exist yet: srt puts an empty read-only
+           # stub there while the sandbox runs (README), so an O_EXCL create sees
+           # it. staged_problems then checks nothing was left behind.
+           "File exists"}
+          if LINUX else {"Operation not permitted"})
 SENTINEL = "sentinel-must-not-reach-staged-child"
 RUNTIME = ["/opt/node", "/opt/cli.js"]
 
@@ -69,7 +86,7 @@ def option(argv, name):
 
 class Fixture(unittest.TestCase):
     def setUp(self):
-        self.root = Path(tempfile.mkdtemp(prefix="osrs-", dir="/private/tmp")).resolve()
+        self.root = Path(tempfile.mkdtemp(prefix="osrs-", dir=SHORT_TMP)).resolve()
         self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
         self.input = self.root / "input"
         self.input.mkdir()
@@ -106,6 +123,7 @@ class ProfileTests(Fixture):
             "--print", "--output-format", "json", "--no-session-persistence",
             "--safe-mode", "--restricted", "--strict-mcp-config", "--no-chrome",
             "--disable-slash-commands", "--setting-sources", "",
+            "--settings", '{"switchModelsOnFlag": false}',
             "--permission-mode", "dontAsk", "--permission-prompts", "none",
             "--tools", "Read,Glob,Grep", "--allowedTools", "Read,Glob,Grep",
             "--disallowedTools",
@@ -139,6 +157,8 @@ class ProfileTests(Fixture):
             claude_args = argv[5:]
             self.assertEqual(option(claude_args, "--settings"),
                              str(self.run_dir / "home/.claude/settings.json"))
+            # One --settings for Claude: the staged file carries switchModelsOnFlag.
+            self.assertEqual(claude_args.count("--settings"), 1)
             for kept in ("--restricted", "--strict-mcp-config", "--no-chrome",
                          "--no-session-persistence", "--print"):
                 self.assertIn(kept, argv)
@@ -154,7 +174,7 @@ class ProfileTests(Fixture):
                          "Read Skill(deep-research) Workflow(deep-research) WebSearch")
         policy = worker.build_policy(self.input, self.run_dir, self.root / "claude",
                                      staged=self.staged())
-        self.assertEqual(policy["network"]["allowedDomains"], ["api.anthropic.com"])
+        self.assertEqual(policy["network"]["allowedDomains"], MODEL_DOMAINS)
 
     def test_corpus_extract_argv(self):
         argv = worker.build_staged_command(RUNTIME, self.policy_file, "/opt/claude",
@@ -220,7 +240,7 @@ class WebDomainTests(Fixture):
         policy = worker.build_policy(self.input, self.run_dir, self.root / "claude", 4100,
                                      staged=self.staged(domains=("docs.python.org",)))
         self.assertEqual(policy["network"]["allowedDomains"],
-                         ["api.anthropic.com", "docs.python.org", "127.0.0.1:4100"])
+                         [*MODEL_DOMAINS, "docs.python.org", "127.0.0.1:4100"])
 
 
 class StagingTests(Fixture):
@@ -261,7 +281,7 @@ class StagingTests(Fixture):
                 "allow": ["Read", "Skill(deep-research)", "Workflow(deep-research)",
                           "WebSearch", "WebFetch(domain:docs.python.org)"],
                 "deny": ["Bash", "PowerShell", "Edit", "Write", "NotebookEdit"]},
-            "disableAllHooks": True})
+            "disableAllHooks": True, "switchModelsOnFlag": False})
 
     def test_corpus_extract_writes_the_agent_file_and_no_skill(self):
         self.prepare("corpus-extract")
@@ -532,8 +552,8 @@ print(json.dumps(results))
 '''
 
 
-@unittest.skipUnless(PREFIX and sys.platform == "darwin",
-                     "set OSS_RESEARCH_SRT_PREFIX to the pinned srt install (macOS)")
+@unittest.skipUnless(PREFIX and sys.platform in ("darwin", "linux"),
+                     "set OSS_RESEARCH_SRT_PREFIX to the pinned srt install (macOS, Linux)")
 class StagedBoundaryTests(Fixture):
     """The real srt 0.0.77 with a non-AI probe: staged config cannot change."""
 
@@ -543,7 +563,7 @@ class StagedBoundaryTests(Fixture):
 
     def sandbox(self, profile, steps):
         policy = worker.build_policy(self.input, self.run_dir, self.root / "claude",
-                                     staged=self.staged(profile))
+                                     staged=self.staged(profile), runtime=self.runtime)
         policy["filesystem"]["allowRead"] += FIXTURE_READ
         policy_file = worker.prepare_run(self.run_dir, policy)
         record = worker.stage_research_config(self.run_dir, self.staged(profile))
@@ -622,7 +642,12 @@ class StagedBoundaryTests(Fixture):
                 self.assertTrue(result["ok"], result)
             else:
                 self.assertFalse(result["ok"], result)
-                self.assertEqual(result["errno"], "Operation not permitted", result)
+                if LINUX and result["errno"] == "No such file or directory":
+                    # run/policy is not readable to the child on Linux, so its
+                    # files look absent inside; the control is that they exist.
+                    self.assertTrue(Path(step["path"]).exists(), result)
+                    continue
+                self.assertIn(result["errno"], DENIED, result)
         self.assertTrue((self.run_dir / "output/report.md").is_file())
 
     def test_deep_research_staged_config_is_immutable_and_output_is_writable(self):

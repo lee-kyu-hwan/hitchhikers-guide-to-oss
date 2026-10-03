@@ -1,0 +1,616 @@
+"""Local tests for stage_inputs.py over the workflow's synthetic offline fixture.
+
+Every answer below is a hand-written stand-in for a model call. Nothing here
+starts a model, opens the network, or reads a real corpus or credential: the
+fixture blocks sockets and process spawning on import.
+
+  /opt/homebrew/bin/python3 -B -m unittest docs/research/oss-e2e-2026-09-28/test_stage_inputs.py
+"""
+
+from __future__ import annotations
+
+import json
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+import tempfile
+import unittest
+from unittest import mock
+
+# Kept before the fixture blocks process spawning: only the FIFO test uses it,
+# to read in a separate process that a timeout can stop.
+_REAL_EXECUTE_CHILD = subprocess.Popen._execute_child
+
+HERE = Path(__file__).resolve().parent
+REPO = HERE.parents[2]
+sys.path.insert(0, str(REPO / "dot_agents/skills/researching-open-source-contributions/tests"))
+sys.path.insert(0, str(HERE))
+
+import offline_fixture as fx  # noqa: E402  (installs the offline guards first)
+import stage_inputs  # noqa: E402
+
+LENSES = ("blind", "correctness", "maintenance", "review", "structure")
+GENERATED_AT = "2026-09-28T00:00:00Z"
+
+
+def collect(directory: Path) -> dict:
+    """The production collector over the fixture world, with the real request's cap and budget."""
+    directory.mkdir()
+    routes, interval = fx.collector_routes()
+    client = fx.collector.GhApiClient(api_version=fx.API_VERSION, budget=fx.collector.RequestBudget(60),
+                                      sleeper=fx.collector_tests.FakeSleep(), clock=lambda: fx.EPOCH,
+                                      opener=fx.CollectorOpener(routes), token_provider=lambda: None)
+    paths = {"corpus": directory / "corpus.json", "manifest": directory / "manifest.json",
+             "inventory": directory / "inventory.md"}
+    fx.collector.collect(client, [fx.REPO], interval, outcome="all", max_per_repository=3, request_budget=60,
+                         output=paths["corpus"], manifest_output=paths["manifest"],
+                         markdown_output=paths["inventory"], captured_at=fx.CAPTURED_AT, api_version=fx.API_VERSION)
+    return paths
+
+
+def workflow(*argv) -> tuple[int, str, str]:
+    return fx.workflow.run_main(fx.workflow.main, list(argv))
+
+
+def stage(*argv) -> tuple[int, dict, str]:
+    code, stdout, stderr = fx.workflow.run_main(stage_inputs.main, list(argv))
+    return code, (json.loads(stdout) if code == 0 else None), stderr
+
+
+class StagePipelineTests(unittest.TestCase):
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
+        paths = collect(self.root / "collected")
+        request = fx.base_request(target=None)
+        request["mode"] = "offline-fixture"
+        request["source"]["max_per_repository"] = 3
+        request["source"]["request_budget"] = 60
+        request["budget"]["total_api_requests"] = 60
+        (self.root / "request.json").write_text(json.dumps(request), encoding="utf-8")
+        self.run = str(self.root / "run")
+        for argv in (("init", "--request", str(self.root / "request.json")),
+                     ("adopt-collection", "--corpus", str(paths["corpus"]), "--manifest", str(paths["manifest"]),
+                      "--inventory", str(paths["inventory"])),
+                     ("digest",)):
+            code, _, stderr = workflow(argv[0], "--run-dir", self.run, *argv[1:])
+            self.assertEqual(code, 0, stderr)
+        self.context = stage_inputs.Context(self.run)
+        self.corpus = self.context.corpus
+        self.key = {section["pr_id"]: key for key, section in self.context.keymap["sections"].items()}
+        self.pr = {record["pull_request"]["number"]: record["pr_id"] for record in self.corpus["records"]}
+        self.url = {record["pr_id"]: record["pull_request"]["url"] for record in self.corpus["records"]}
+        self.answers = self.root / "answers"
+        self.answers.mkdir()
+
+    # -- stand-in answers ----------------------------------------------------
+
+    def write(self, name, document) -> str:
+        path = self.answers / name
+        path.write_text(json.dumps(document, ensure_ascii=False), encoding="utf-8")
+        return str(path)
+
+    def evidence(self, number, role="supports"):
+        pr_id = self.pr[number]
+        return {"pr": self.key[pr_id], "role": role, "quote": fx.PULLS[number]["quote"], "claim": "synthetic claim"}
+
+    def extract_results(self, *, bad_quote=False):
+        paths = []
+        for lens in LENSES:
+            answer = {"lens": lens, "patterns": [], "observations": [], "rejected": []}
+            if lens == "blind":
+                answer["patterns"].append({
+                    "title": "jittered backoff", "description": fx.SYNTHETIC, "kind": "convention",
+                    "evidence": [self.evidence(101), self.evidence(102)], "applicability": [], "counterconditions": [],
+                    "search_clues": [fx.PATTERN_CLUE], "expected_tests": [], "maintainer_judgment_required": [],
+                    "confidence": "low", "confidence_reason": fx.SYNTHETIC})
+            if lens == "review":
+                quote = fx.PULLS[101]["quote"] + (" (reworded)" if bad_quote else "")
+                answer["observations"].append({"pr": self.key[self.pr[101]], "note": fx.SYNTHETIC, "quote": quote})
+            paths.append(self.write("extract-%s.result.json" % lens, answer))
+        return paths
+
+    def synthesis(self, *, candidates=True):
+        items = [{"id": "C1", "statement": fx.SYNTHETIC + " jittered backoff", "found_by": "blind",
+                  "cited_prs": [self.key[self.pr[101]], self.key[self.pr[102]]]}] if candidates else []
+        return self.write("synthesis.result.json", {"candidates": items, "dropped": []})
+
+    def verify_result(self):
+        checks = [dict(pr=self.key[self.pr[n]], holds=True, quote=fx.PULLS[n]["quote"], reason="synthetic") for n in (101, 102)]
+        return self.write("verify-C1.result.json", {
+            "id": "C1", "verdict": "supported", "evidence_checks": checks, "counterexamples": [], "distinct_prs": 2,
+            "distinct_repos": 1, "actionable": True, "actionable_reason": fx.SYNTHETIC, "confidence": "low",
+            "revised_statement": fx.SYNTHETIC + " pattern: retry loops use jittered exponential backoff."})
+
+    def final_answer(self, *, with_pattern=True, **overrides):
+        records = {}
+        for number, pr_id in self.pr.items():
+            url = self.url[pr_id]
+            records[pr_id] = {
+                "change_summary": {"value": fx.SYNTHETIC + " change", "basis": "fact", "evidence_links": [url]},
+                "motivation": {"value": None, "basis": "unknown", "evidence_links": []},
+                "review_judgment": {"value": fx.SYNTHETIC + " approved", "basis": "fact", "evidence_links": [url]},
+                "closure_reason": {"value": None, "basis": "unknown", "evidence_links": []},
+                "test_evidence": [],
+                "pattern_ids": ["PAT-001"] if with_pattern else [],
+                "evidence_links": [url],
+                "provenance_mode": "independent-reimplementation",
+                "confidence": {"level": "low", "evidence": [fx.SYNTHETIC], "limitations": [fx.SYNTHETIC_LIMITATION]},
+            }
+        patterns = []
+        if with_pattern:
+            patterns.append({
+                "pattern_id": "PAT-001", "description": fx.SYNTHETIC + " pattern: retry loops use jittered exponential backoff.",
+                "evidence_pr_ids": [self.pr[101], self.pr[102]], "applicability": [fx.SYNTHETIC],
+                "counterconditions": [fx.SYNTHETIC], "search_clues": [fx.PATTERN_CLUE], "expected_tests": [fx.SYNTHETIC],
+                "maintainer_judgment_required": [fx.SYNTHETIC], "provenance_mode": "independent-reimplementation",
+                "confidence": {"level": "low", "evidence": ['%s "%s"' % (self.pr[n], fx.PULLS[n]["quote"]) for n in (101, 102)],
+                               "limitations": [fx.SYNTHETIC_LIMITATION]}})
+        answer = {"records": records, "patterns": patterns,
+                  "extraction_ledger": fx.SYNTHETIC + " digest in 1 shard; lenses all five; executor test stand-in",
+                  "limitations": [fx.SYNTHETIC_LIMITATION]}
+        answer.update(overrides)
+        return answer
+
+    def extract_args(self):
+        return [a for path in self.extract_results() for a in ("--extract-result", path)]
+
+    def run_stages(self, *, candidates=True):
+        code, extract, stderr = stage("extract-inputs", "--run-dir", self.run, "--out", str(self.root / "in-extract"))
+        self.assertEqual(code, 0, stderr)
+        results = self.extract_results()
+        args = [a for path in results for a in ("--extract-result", path)]
+        code, synthesis_stage, stderr = stage("synthesis-input", "--run-dir", self.run, *args, "--out", str(self.root / "in-synthesis"))
+        self.assertEqual(code, 0, stderr)
+        synthesis = self.synthesis(candidates=candidates)
+        code, verify_stage, stderr = stage("verify-inputs", "--run-dir", self.run, "--synthesis", synthesis, *args,
+                                           "--out", str(self.root / "in-verify"))
+        self.assertEqual(code, 0, stderr)
+        verify = [self.verify_result()] if candidates else []
+        code, final_stage, stderr = stage("final-input", "--run-dir", self.run, "--synthesis", synthesis, *args,
+                                          *[a for path in verify for a in ("--verify-result", path)],
+                                          "--out", str(self.root / "in-final"))
+        self.assertEqual(code, 0, stderr)
+        return results, verify, (extract, synthesis_stage, verify_stage, final_stage)
+
+    def assemble(self, answer, name="analysis.json"):
+        return stage("assemble", "--run-dir", self.run, "--final", self.write("final.result.json", answer),
+                     "--generated-at", GENERATED_AT, "--out", str(self.root / name))
+
+    # -- tests ---------------------------------------------------------------
+
+    def test_full_path_with_a_pattern_ends_analysis_only(self):
+        results, verify, stages = self.run_stages()
+        extract, synthesis_stage, verify_stage, final_stage = stages
+        self.assertEqual([call["input_dir"] for call in extract["calls"]], ["extract-" + lens for lens in LENSES])
+        for call in extract["calls"]:
+            task = (self.root / "in-extract" / call["input_dir"] / "task.txt").read_bytes()
+            self.assertEqual(task, (self.context.extract_prompts / (call["input_dir"] + ".md")).read_bytes())
+        self.assertEqual(synthesis_stage["quotes"], {"verified": 3, "total": 3})
+        self.assertEqual([call["input_dir"] for call in verify_stage["calls"]], ["verify-C1"])
+        tasks = [p for p in self.root.glob("in-*/*/task.txt")]
+        self.assertEqual(len(tasks), 5 + 1 + 1 + 1)
+        for task in tasks:
+            text = task.read_text(encoding="utf-8")
+            self.assertLessEqual(len(text.encode("utf-8")), stage_inputs.PROMPT_MAX_BYTES)
+            self.assertNotIn(str(self.root), text)
+            self.assertNotIn(str(REPO), text)
+        final_text = (self.root / "in-final" / "final" / "task.txt").read_text(encoding="utf-8")
+        self.assertIn(fx.PULLS[101]["quote"], final_text)
+
+        code, summary, stderr = self.assemble(self.final_answer())
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(summary["patterns"], ["PAT-001"])
+        analysis = json.loads((self.root / "analysis.json").read_text(encoding="utf-8"))
+        # Output identity: every corpus field survives; only analysis fields are added.
+        for original, enriched in zip(self.corpus["records"], analysis["records"]):
+            self.assertEqual({k: v for k, v in enriched.items() if k not in ("analysis", "analysis_history")}, original)
+            self.assertEqual(enriched["analysis"]["evidence_manifest"]["completeness"],
+                             original["evidence_snapshot"]["completeness"])
+        self.assertTrue(analysis["limitations"][0].startswith("pattern-extraction: "))
+
+        extraction = [a for path in results + verify for a in ("--extraction-result", path)]
+        code, stdout, stderr = workflow("adopt-analysis", "--run-dir", self.run, "--analysis", str(self.root / "analysis.json"),
+                                        "--origin", "synthetic-fixture", *extraction)
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(json.loads(stdout)["status"], "complete")
+        code, report_path, stderr = workflow("report", "--run-dir", self.run)
+        self.assertEqual(code, 0, stderr)
+        report = Path(report_path.strip()).read_text(encoding="utf-8")
+        self.assertIn("Outcome: `analysis-only`", report)
+        self.assertIn("unspecified (candidate verification skipped)", report)
+        code, stdout, _ = workflow("status", "--run-dir", self.run)
+        status = json.loads(stdout)
+        self.assertEqual({s: status["stages"][s]["status"] for s in ("discovery", "locus-search", "record")},
+                         {"discovery": "skipped", "locus-search": "skipped", "record": "skipped"})
+
+    def test_no_candidate_is_an_honest_insufficient_result(self):
+        results, verify, stages = self.run_stages(candidates=False)
+        self.assertEqual(stages[2]["calls"], [])
+        self.assertEqual(verify, [])
+        code, summary, stderr = self.assemble(self.final_answer(with_pattern=False))
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(summary["patterns"], [])
+        extraction = [a for path in results for a in ("--extraction-result", path)]
+        code, stdout, stderr = workflow("adopt-analysis", "--run-dir", self.run, "--analysis", str(self.root / "analysis.json"),
+                                        "--origin", "synthetic-fixture", *extraction)
+        self.assertEqual(json.loads(stdout)["status"], "no-patterns", stderr)
+        code, report_path, stderr = workflow("report", "--run-dir", self.run)
+        self.assertIn("Outcome: `insufficient`", Path(report_path.strip()).read_text(encoding="utf-8"))
+
+    def test_assemble_refuses_what_the_model_must_not_decide(self):
+        self.run_stages()
+        pr_id = self.pr[101]
+        overriding = self.final_answer()
+        overriding["records"][pr_id]["files_changed"] = ["invented.py"]
+        missing = self.final_answer()
+        del missing["records"][pr_id]
+        stolen = self.final_answer()
+        stolen["patterns"][0]["source_licenses"] = [{"pr_id": pr_id, "spdx_id": "GPL-3.0"}]
+        mismatch = self.final_answer()
+        mismatch["records"][pr_id]["pattern_ids"] = []
+        foreign = self.final_answer()
+        foreign["records"][pr_id]["change_summary"]["evidence_links"] = ["https://example.invalid/x"]
+        unknown = self.final_answer()
+        unknown["records"][pr_id]["closure_reason"] = {"value": "rejected", "basis": "unknown", "evidence_links": []}
+        extra = self.final_answer(extra=True)
+        cases = {"deterministic field": overriding, "missing record": missing, "pattern deterministic": stolen,
+                 "pattern_ids mismatch": mismatch, "foreign link": foreign, "unknown with value": unknown, "extra key": extra}
+        for label, answer in cases.items():
+            with self.subTest(label):
+                code, _, stderr = self.assemble(answer, name=label.replace(" ", "-") + ".json")
+                self.assertEqual(code, 2, label)
+                self.assertFalse((self.root / (label.replace(" ", "-") + ".json")).exists())
+
+    def test_reworded_quote_fails_the_existing_validator(self):
+        self.run_stages()
+        answer = self.final_answer()
+        answer["patterns"][0]["confidence"]["evidence"][0] = '%s "%s"' % (self.pr[101], "jittered backoff that nobody wrote here")
+        code, _, stderr = self.assemble(answer)
+        self.assertEqual(code, 2)
+        self.assertIn("validate_corpus rejected", stderr)
+        self.assertFalse((self.root / "analysis.json").exists())
+
+    def test_a_failed_extraction_quote_is_dropped_not_repaired(self):
+        stage("extract-inputs", "--run-dir", self.run, "--out", str(self.root / "in-extract"))
+        args = [a for path in self.extract_results(bad_quote=True) for a in ("--extract-result", path)]
+        code, summary, stderr = stage("synthesis-input", "--run-dir", self.run, *args, "--out", str(self.root / "in-synthesis"))
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(summary["quotes"], {"verified": 2, "total": 3})
+        self.assertNotIn("extract-review.result.json", summary["clean_results"])
+        self.assertEqual(len(summary["clean_results"]), 4)
+
+    def test_inputs_are_bounded_and_strict(self):
+        stage("extract-inputs", "--run-dir", self.run, "--out", str(self.root / "in-extract"))
+        code, _, stderr = stage("extract-inputs", "--run-dir", self.run, "--out", str(self.root / "in-extract"))
+        self.assertEqual(code, 2)
+        self.assertIn("must not exist", stderr)
+        results = self.extract_results()
+        (self.answers / "link").mkdir()
+        link = self.answers / "link" / "extract-blind.result.json"
+        os.symlink(results[0], link)
+        big = self.answers / "big"
+        big.mkdir()
+        (big / "extract-blind.result.json").write_bytes(b"{" + b" " * stage_inputs.ANSWER_MAX_BYTES + b"}")
+        duplicate = self.answers / "dup"
+        duplicate.mkdir()
+        (duplicate / "extract-blind.result.json").write_text('{"lens":"blind","lens":"blind"}', encoding="utf-8")
+        for label, replacement in (("symlink", str(link)), ("oversized", str(big / "extract-blind.result.json")),
+                                   ("duplicate key", str(duplicate / "extract-blind.result.json"))):
+            with self.subTest(label):
+                paths = [replacement if Path(p).name == "extract-blind.result.json" else p for p in results]
+                args = [a for path in paths for a in ("--extract-result", path)]
+                code, _, _ = stage("synthesis-input", "--run-dir", self.run, *args, "--out", str(self.root / ("s-" + label)))
+                self.assertEqual(code, 2, label)
+        # Missing a lens, or a synthesis citing one PR, is refused.
+        args = [a for path in results[1:] for a in ("--extract-result", path)]
+        self.assertEqual(stage("synthesis-input", "--run-dir", self.run, *args, "--out", str(self.root / "s-missing"))[0], 2)
+        single = self.write("single.json", {"candidates": [{"id": "C1", "statement": "x", "cited_prs": [self.key[self.pr[101]]]}],
+                                            "dropped": []})
+        self.assertEqual(stage("verify-inputs", "--run-dir", self.run, "--synthesis", single, *self.extract_args(), "--out", str(self.root / "v"))[0], 2)
+
+    def test_counts_are_capped_and_refused_not_truncated(self):
+        limits = json.loads((HERE / "run_limits.json").read_text(encoding="utf-8"))
+        self.assertEqual(stage_inputs.MAX_MODEL_CALLS, 12)
+        keys = [self.key[self.pr[101]], self.key[self.pr[102]]]
+        many = [{"id": "C%d" % n, "statement": "x", "cited_prs": keys} for n in range(1, limits["max_patterns"] + 2)]
+        dropped = [{"idea": "x", "reason": "y"}] * (limits["max_rejected"] + 1)
+        for label, answer in (("candidates", {"candidates": many, "dropped": []}),
+                              ("dropped", {"candidates": [], "dropped": dropped})):
+            with self.subTest(label):
+                path = self.write("synthesis-%s.json" % label, answer)
+                code, _, stderr = stage("verify-inputs", "--run-dir", self.run, "--synthesis", path,
+                                        *self.extract_args(), "--out", str(self.root / ("v-" + label)))
+                self.assertEqual(code, 2, label)
+                self.assertIn("at most", stderr)
+                self.assertFalse((self.root / ("v-" + label)).exists())
+        at_cap = self.write("synthesis-cap.json", {"candidates": many[:-1], "dropped": dropped[:-1]})
+        code, summary, stderr = stage("verify-inputs", "--run-dir", self.run, "--synthesis", at_cap, *self.extract_args(), "--out", str(self.root / "v-cap"))
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(len(summary["calls"]), limits["max_patterns"])
+        self.run_stages()
+        answer = self.final_answer()
+        extra = [dict(answer["patterns"][0], pattern_id="PAT-%03d" % n) for n in range(2, limits["max_patterns"] + 2)]
+        answer["patterns"] += extra
+        for record in answer["records"].values():
+            record["pattern_ids"] = [p["pattern_id"] for p in answer["patterns"]]
+        code, _, stderr = self.assemble(answer)
+        self.assertEqual(code, 2)
+        self.assertIn("at most", stderr)
+        stage("extract-inputs", "--run-dir", self.run, "--out", str(self.root / "in-extract-2"))
+        results = self.extract_results()
+        noisy = json.loads(Path(results[0]).read_text(encoding="utf-8"))
+        noisy["rejected"] = [{"idea": "x", "reason": "y"}] * (limits["max_rejected"] + 1)
+        (self.answers / "noisy").mkdir()
+        results[0] = str(self.answers / "noisy" / Path(results[0]).name)
+        Path(results[0]).write_text(json.dumps(noisy), encoding="utf-8")
+        args = [a for path in results for a in ("--extract-result", path)]
+        code, _, stderr = stage("synthesis-input", "--run-dir", self.run, *args, "--out", str(self.root / "s-noisy"))
+        self.assertEqual(code, 2)
+        self.assertIn("at most", stderr)
+
+    def test_a_fifo_answer_is_refused_without_blocking(self):
+        fifo = self.answers / "extract-blind.result.json"
+        os.mkfifo(fifo)
+        code = ("import sys; sys.path.insert(0, %r); import stage_inputs\n"
+                "try:\n    stage_inputs.read_bounded(stage_inputs.Path(%r), 1024, 'answer')\n"
+                "except stage_inputs.StageError as error:\n    print(error); sys.exit(0)\n"
+                "sys.exit(1)\n") % (str(HERE), str(fifo))
+        with mock.patch.object(subprocess.Popen, "_execute_child", _REAL_EXECUTE_CHILD):
+            completed = subprocess.run([sys.executable, "-B", "-c", code], capture_output=True, text=True, timeout=10)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn("not a regular file", completed.stdout)
+
+    # -- final-prompt budget (B3) ---------------------------------------------
+
+    def cap(self, value):
+        patcher = mock.patch.object(stage_inputs, "PROMPT_MAX_BYTES", value)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_digest_boundary_is_refused_before_any_model_call(self):
+        fixed = len(stage_inputs.final_prompt_text(self.context, [], {}, stage_inputs.EMPTY_REPORT).encode("utf-8"))
+        with mock.patch.object(stage_inputs, "PROMPT_MAX_BYTES", fixed + stage_inputs.FINAL_RESERVE_BYTES - 1):
+            code, _, stderr = stage("extract-inputs", "--run-dir", self.run, "--out", str(self.root / "over"))
+        self.assertEqual(code, 2)
+        self.assertIn("refused before the next model call", stderr)
+        self.assertFalse((self.root / "over").exists())
+        with mock.patch.object(stage_inputs, "PROMPT_MAX_BYTES", fixed + stage_inputs.FINAL_RESERVE_BYTES):
+            code, summary, stderr = stage("extract-inputs", "--run-dir", self.run, "--out", str(self.root / "at"))
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(summary["final_budget"]["fixed_bytes"], fixed)
+
+    def test_quotes_are_deduplicated_deterministically(self):
+        paths = self.extract_results()
+        report = stage_inputs.check_quotes(self.context, paths)
+        compact = stage_inputs.compact_report(report)
+        self.assertEqual(report["totals"], {"verified": 3, "total": 3})
+        self.assertEqual([(e["pr_id"], e["quote"]) for e in compact["verified_evidence"]],
+                         [(self.pr[101], fx.PULLS[101]["quote"]), (self.pr[102], fx.PULLS[102]["quote"])])
+        self.assertEqual(compact, stage_inputs.compact_report(stage_inputs.check_quotes(self.context, paths)))
+
+    def test_five_long_candidates_hit_the_budget_at_verify_inputs(self):
+        keys = [self.key[self.pr[101]], self.key[self.pr[102]]]
+        limit = stage_inputs.STATEMENT_MAX_CHARS
+        candidates = [{"id": "C%d" % n, "statement": "가" * limit, "cited_prs": keys} for n in range(1, 6)]
+        path = self.write("five.json", {"candidates": candidates, "dropped": []})
+        compact = stage_inputs.compact_report(stage_inputs.check_quotes(self.context, self.extract_results()))
+        base = len(stage_inputs.final_prompt_text(self.context, candidates, {}, compact).encode("utf-8"))
+        floor = base + 5 * stage_inputs.VERIFY_FLOOR_BYTES
+        with mock.patch.object(stage_inputs, "PROMPT_MAX_BYTES", floor - 1):
+            code, _, stderr = stage("verify-inputs", "--run-dir", self.run, "--synthesis", path, *self.extract_args(),
+                                    "--out", str(self.root / "v-over"))
+        self.assertEqual(code, 2)
+        self.assertIn("5 candidates", stderr)
+        self.assertFalse((self.root / "v-over").exists())
+        code, summary, stderr = stage("verify-inputs", "--run-dir", self.run, "--synthesis", path, *self.extract_args(),
+                                      "--out", str(self.root / "v-ok"))
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(len(summary["calls"]), 5)
+        self.assertEqual(summary["final_budget"]["floor_bytes"], floor)
+        self.assertEqual(summary["final_budget"]["guaranteed"],
+                         base + 5 * 2 * stage_inputs.VERIFY_ANSWER_MAX_BYTES <= stage_inputs.PROMPT_MAX_BYTES)
+        too_long = self.write("long.json", {"candidates": [dict(candidates[0], statement="가" * (limit + 1))], "dropped": []})
+        code, _, stderr = stage("verify-inputs", "--run-dir", self.run, "--synthesis", too_long, *self.extract_args(),
+                                "--out", str(self.root / "v-long"))
+        self.assertEqual(code, 2)
+        self.assertIn("at most %d characters" % limit, stderr)
+
+    def test_final_prompt_overflow_after_verify_is_refused_not_cut(self):
+        results, verify, _ = self.run_stages()
+        synthesis = str(self.answers / "synthesis.result.json")
+        args = [a for path in results for a in ("--extract-result", path)] + ["--verify-result", verify[0]]
+        size = (self.root / "in-final" / "final" / "task.txt").stat().st_size
+        with mock.patch.object(stage_inputs, "PROMPT_MAX_BYTES", size - 1):
+            code, _, stderr = stage("final-input", "--run-dir", self.run, "--synthesis", synthesis, *args,
+                                    "--out", str(self.root / "in-final-2"))
+        self.assertEqual(code, 2)
+        self.assertIn("dynamic overflow", stderr)
+        self.assertFalse((self.root / "in-final-2").exists())
+        big = json.loads(Path(verify[0]).read_text(encoding="utf-8"))
+        big["actionable_reason"] = "x" * stage_inputs.VERIFY_ANSWER_MAX_BYTES
+        (self.answers / "big").mkdir()
+        big_path = self.answers / "big" / "verify-C1.result.json"
+        big_path.write_text(json.dumps(big), encoding="utf-8")
+        code, _, stderr = stage("final-input", "--run-dir", self.run, "--synthesis", synthesis,
+                                *args[:-2], "--verify-result", str(big_path), "--out", str(self.root / "in-final-3"))
+        self.assertEqual(code, 2)
+        self.assertIn("verify_answer_max_bytes", stderr)
+
+
+
+OTHER = fx.OTHER_TARGET  # a second synthetic source repository
+
+
+def mixed_routes():
+    """The fixture world for REPO plus the same PRs under OTHER (own identities), one routes table."""
+    routes, interval = fx.collector_routes()
+    other = {}
+    for (path, query), (status, payload) in routes.items():
+        if path == "/versions":
+            continue
+        text = json.dumps([path, query, payload]).replace(fx.REPO, OTHER).replace(
+            fx.REPO_NODE, "R_SYNTH_FIXTURE_OTHER").replace("PR_SYNTH_FIXTURE_", "PR_SYNTH_OTHER_")
+        new_path, new_query, new_payload = json.loads(text)
+        other[(new_path, tuple(tuple(pair) for pair in new_query))] = (status, new_payload)
+    routes.update(other)
+    return routes, interval
+
+
+class MixedSourceTargetTests(unittest.TestCase):
+    """Two source repositories in one corpus (max_per_repository each) and a target repository."""
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
+        (self.root / "collected").mkdir()
+        routes, interval = mixed_routes()
+        client = fx.collector.GhApiClient(api_version=fx.API_VERSION, budget=fx.collector.RequestBudget(60),
+                                          sleeper=fx.collector_tests.FakeSleep(), clock=lambda: fx.EPOCH,
+                                          opener=fx.CollectorOpener(routes), token_provider=lambda: None)
+        paths = {name: self.root / "collected" / name for name in ("corpus.json", "manifest.json", "inventory.md")}
+        fx.collector.collect(client, [fx.REPO, OTHER], interval, outcome="all", max_per_repository=3,
+                             request_budget=60, output=paths["corpus.json"], manifest_output=paths["manifest.json"],
+                             markdown_output=paths["inventory.md"], captured_at=fx.CAPTURED_AT,
+                             api_version=fx.API_VERSION)
+        request = fx.base_request()
+        request["mode"] = "offline-fixture"
+        request["source"].update(repositories=[fx.REPO, OTHER], max_per_repository=3, request_budget=60)
+        request["target"].update(repositories=[fx.REPO], max_candidates_per_repo=5, max_candidates_total=5)
+        request["budget"]["total_api_requests"] = 60 + request["target"]["discover_request_budget"] \
+            + request["target"]["locus_request_budget"]
+        (self.root / "request.json").write_text(json.dumps(request), encoding="utf-8")
+        self.run = str(self.root / "run")
+        for argv in (("init", "--request", str(self.root / "request.json")),
+                     ("adopt-collection", "--corpus", str(paths["corpus.json"]), "--manifest",
+                      str(paths["manifest.json"]), "--inventory", str(paths["inventory.md"])),
+                     ("digest",)):
+            code, _, stderr = workflow(argv[0], "--run-dir", self.run, *argv[1:])
+            self.assertEqual(code, 0, stderr)
+        self.context = stage_inputs.Context(self.run)
+        self.answers = self.root / "answers"
+        self.answers.mkdir()
+        # (repository, number) -> (pr_id, digest key, url)
+        self.prs = {}
+        for key, section in self.context.keymap["sections"].items():
+            number = int(section["url"].rsplit("/", 1)[1])
+            self.prs[(section["repository"], number)] = (section["pr_id"], key, section["url"])
+
+    def write(self, name, document):
+        path = self.answers / name
+        path.write_text(json.dumps(document, ensure_ascii=False), encoding="utf-8")
+        return str(path)
+
+    def run_to_final(self, *, pattern):
+        code, extract, stderr = stage("extract-inputs", "--run-dir", self.run, "--out", str(self.root / "in-extract"))
+        self.assertEqual(code, 0, stderr)
+        evidence = [{"pr": self.prs[(repo, 101)][1], "role": "supports", "quote": fx.PULLS[101]["quote"], "claim": "c"}
+                    for repo in (fx.REPO, OTHER)]
+        results = []
+        for lens in LENSES:
+            answer = {"lens": lens, "patterns": [], "observations": [], "rejected": []}
+            if pattern and lens == "blind":
+                answer["patterns"].append({
+                    "title": "t", "description": fx.SYNTHETIC, "kind": "convention", "evidence": evidence,
+                    "applicability": [], "counterconditions": [], "search_clues": [fx.PATTERN_CLUE], "expected_tests": [],
+                    "maintainer_judgment_required": [], "confidence": "low", "confidence_reason": fx.SYNTHETIC})
+            results.append(self.write("extract-%s.result.json" % lens, answer))
+        args = [a for path in results for a in ("--extract-result", path)]
+        code, synthesis_stage, stderr = stage("synthesis-input", "--run-dir", self.run, *args,
+                                              "--out", str(self.root / "in-synthesis"))
+        self.assertEqual(code, 0, stderr)
+        candidates = [{"id": "C1", "statement": fx.SYNTHETIC, "cited_prs": [e["pr"] for e in evidence]}] if pattern else []
+        synthesis = self.write("synthesis.result.json", {"candidates": candidates, "dropped": []})
+        code, verify_stage, stderr = stage("verify-inputs", "--run-dir", self.run, "--synthesis", synthesis, *args,
+                                           "--out", str(self.root / "in-verify"))
+        self.assertEqual(code, 0, stderr)
+        verify = []
+        if pattern:
+            checks = [{"pr": e["pr"], "holds": True, "quote": e["quote"], "reason": "r"} for e in evidence]
+            verify.append(self.write("verify-C1.result.json", {
+                "id": "C1", "verdict": "supported", "evidence_checks": checks, "counterexamples": [], "distinct_prs": 2,
+                "distinct_repos": 2, "actionable": True, "actionable_reason": "r", "confidence": "low",
+                "revised_statement": fx.SYNTHETIC}))
+        code, final_stage, stderr = stage("final-input", "--run-dir", self.run, "--synthesis", synthesis, *args,
+                                          *[a for path in verify for a in ("--verify-result", path)],
+                                          "--out", str(self.root / "in-final"))
+        self.assertEqual(code, 0, stderr)
+        return results, verify, extract
+
+    def final_answer(self, *, pattern):
+        evidence_ids = [self.prs[(repo, 101)][0] for repo in (fx.REPO, OTHER)] if pattern else []
+        records = {}
+        for pr_id, _, url in self.prs.values():
+            records[pr_id] = {
+                "change_summary": {"value": fx.SYNTHETIC, "basis": "fact", "evidence_links": [url]},
+                "motivation": {"value": None, "basis": "unknown", "evidence_links": []},
+                "review_judgment": {"value": fx.SYNTHETIC, "basis": "fact", "evidence_links": [url]},
+                "closure_reason": {"value": None, "basis": "unknown", "evidence_links": []},
+                "test_evidence": [], "pattern_ids": ["PAT-001"] if pr_id in evidence_ids else [],
+                "evidence_links": [url], "provenance_mode": "independent-reimplementation",
+                "confidence": {"level": "low", "evidence": [fx.SYNTHETIC], "limitations": [fx.SYNTHETIC_LIMITATION]}}
+        patterns = [{
+            "pattern_id": "PAT-001", "description": fx.SYNTHETIC, "evidence_pr_ids": evidence_ids,
+            "applicability": [fx.SYNTHETIC], "counterconditions": [fx.SYNTHETIC], "search_clues": [fx.PATTERN_CLUE],
+            "expected_tests": [fx.SYNTHETIC], "maintainer_judgment_required": [fx.SYNTHETIC],
+            "provenance_mode": "independent-reimplementation",
+            "confidence": {"level": "low", "evidence": ['%s "%s"' % (pr_id, fx.PULLS[101]["quote"]) for pr_id in evidence_ids],
+                           "limitations": [fx.SYNTHETIC_LIMITATION]}}] if pattern else []
+        return {"records": records, "patterns": patterns, "extraction_ledger": fx.SYNTHETIC + " mixed-repo ledger",
+                "limitations": [fx.SYNTHETIC_LIMITATION]}
+
+    def finish(self, answer, results, verify):
+        code, _, stderr = stage("assemble", "--run-dir", self.run, "--final", self.write("final.result.json", answer),
+                                "--generated-at", GENERATED_AT, "--out", str(self.root / "analysis.json"))
+        self.assertEqual(code, 0, stderr)
+        extraction = [a for path in results + verify for a in ("--extraction-result", path)]
+        code, stdout, stderr = workflow("adopt-analysis", "--run-dir", self.run, "--analysis",
+                                        str(self.root / "analysis.json"), "--origin", "synthetic-fixture", *extraction)
+        self.assertIn(code, (0, 3), stderr)
+        code, report_path, stderr = workflow("report", "--run-dir", self.run)
+        self.assertEqual(code, 0, stderr)
+        code, stdout, _ = workflow("status", "--run-dir", self.run)
+        return Path(report_path.strip()).read_text(encoding="utf-8"), json.loads(stdout)
+
+    def test_two_sources_are_one_corpus_over_the_old_three_record_cap(self):
+        records = self.context.records
+        repositories = sorted({record["repository"]["full_name"] for record in records})
+        self.assertEqual(repositories, sorted([fx.REPO, OTHER]))
+        self.assertGreater(len(records), 3)  # the old single-repository cap of 3 would refuse this corpus
+        self.assertLessEqual(len(records), stage_inputs.MAX_RECORDS)
+        self.assertEqual(len(self.context.keymap["shards"]), 1)
+        self.assertEqual(len(self.context.extract_stems()), 5)
+
+    def test_cross_repository_pattern_with_a_target_awaits_candidate_verification(self):
+        results, verify, _ = self.run_to_final(pattern=True)
+        report, status = self.finish(self.final_answer(pattern=True), results, verify)
+        self.assertEqual(status["outcome"], "awaiting-input")
+        self.assertEqual(status["stages"]["discovery"]["status"], "not-run")
+        self.assertEqual(status["next"][0]["stage"], "discovery")
+        self.assertEqual(status["next"][0]["kind"], "external-network-step")
+        self.assertFalse(status["next"][0]["executed"])
+        self.assertIn("Outcome: `awaiting-input`", report)
+        self.assertNotIn("candidate verification skipped", report)
+
+    def test_no_pattern_with_a_target_is_insufficient_not_a_candidate_verdict(self):
+        results, verify, _ = self.run_to_final(pattern=False)
+        report, status = self.finish(self.final_answer(pattern=False), results, verify)
+        self.assertEqual(status["outcome"], "insufficient")
+        self.assertEqual(status["next"], [])
+
+    def test_a_request_over_the_bundle_caps_is_refused(self):
+        request = json.loads((Path(self.run) / "request.json").read_text(encoding="utf-8"))
+        for per_repository, repositories in ((4, [fx.REPO]), (3, [fx.REPO, OTHER, "synth-fixture-org/third"])):
+            with self.subTest(per_repository=per_repository, repositories=len(repositories)):
+                changed = json.loads(json.dumps(request))
+                changed["source"].update(max_per_repository=per_repository, repositories=repositories)
+                context = stage_inputs.Context.__new__(stage_inputs.Context)
+                context.request = changed
+                with self.assertRaises(stage_inputs.StageError):
+                    stage_inputs.Context._check_scope(context, self.context.records)
+
+
+if __name__ == "__main__":
+    unittest.main()

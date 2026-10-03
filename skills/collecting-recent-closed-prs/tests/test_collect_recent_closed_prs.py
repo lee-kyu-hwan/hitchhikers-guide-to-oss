@@ -468,6 +468,74 @@ class GhApiClientTests(unittest.TestCase):
 
         self.assertEqual(self.sleeper.delays, [125])
 
+    def test_an_explicit_server_wait_longer_than_the_fallback_cap_is_kept(self):
+        # Retry-After 600 or a reset 600 s away is the server's own wait: retrying
+        # after the 300 s fallback cap would ask again too early.
+        for headers in ({"Retry-After": "600"}, {"x-ratelimit-reset": "1600"}):
+            with self.subTest(headers=headers):
+                client = self.make_client(
+                    [FakeCompletedProcess(stdout=included_response(429, headers)),
+                     FakeCompletedProcess(stdout=included_response(200, payload="{}"))],
+                    clock=lambda: 1000,
+                )
+                client.get_json("/user")
+                self.assertEqual(self.sleeper.delays, [600])
+                self.assertEqual(client.request_events[0]["retry_delay"], 600)
+
+    def test_a_non_finite_or_malformed_server_wait_falls_back_to_the_capped_backoff(self):
+        for value in ("inf", "Infinity", "nan", "-5", "soon", "1e400", ""):
+            for name in ("Retry-After", "x-ratelimit-reset"):
+                with self.subTest(header=name, value=value):
+                    client = self.make_client(
+                        [FakeCompletedProcess(stdout=included_response(429, {name: value})),
+                         FakeCompletedProcess(stdout=included_response(200, payload="{}"))],
+                        clock=lambda: 1000,
+                    )
+                    client.get_json("/user")
+                    self.assertEqual(self.sleeper.delays, [60])  # the headerless fallback, first attempt
+
+    ZERO_GRAPHQL_QUOTA = {"x-ratelimit-resource": "graphql", "x-ratelimit-limit": "0",
+                          "x-ratelimit-remaining": "0", "x-ratelimit-used": "0", "x-ratelimit-reset": "4600"}
+
+    def test_a_graphql_403_with_no_quota_at_all_is_not_retried(self):
+        # Measured 2026-09-28: anonymous GraphQL answers 403 with limit 0. The reset
+        # brings no quota, so waiting for it only runs into the caller's timeout.
+        client = self.make_client(
+            [FakeCompletedProcess(stdout=included_response(403, self.ZERO_GRAPHQL_QUOTA,
+                                                           payload='{"message":"API rate limit exceeded"}'))],
+            clock=lambda: 1000,
+        )
+        with self.assertRaises(self.collector.ApiFailure) as raised:
+            client.get_json("/graphql")
+        self.assertEqual(raised.exception.status, 403)
+        self.assertEqual((len(self.runner.calls), client.budget.consumed, self.sleeper.delays), (1, 1, []))
+        self.assertNotIn("retry_delay", client.request_events[0])
+
+    def test_other_rate_limits_keep_their_retries(self):
+        cases = {
+            "REST endpoint": ("/user", 403, self.ZERO_GRAPHQL_QUOTA),
+            "positive graphql limit": ("/graphql", 403, dict(self.ZERO_GRAPHQL_QUOTA, **{"x-ratelimit-limit": "5000"})),
+            "graphql quota left": ("/graphql", 403, dict(self.ZERO_GRAPHQL_QUOTA, **{"x-ratelimit-remaining": "3"})),
+            "other resource": ("/graphql", 403, dict(self.ZERO_GRAPHQL_QUOTA, **{"x-ratelimit-resource": "core"})),
+            "no resource header": ("/graphql", 403, {k: v for k, v in self.ZERO_GRAPHQL_QUOTA.items()
+                                                    if k != "x-ratelimit-resource"}),
+            "no limit header": ("/graphql", 403, {k: v for k, v in self.ZERO_GRAPHQL_QUOTA.items()
+                                                 if k != "x-ratelimit-limit"}),
+            "malformed limit": ("/graphql", 403, dict(self.ZERO_GRAPHQL_QUOTA, **{"x-ratelimit-limit": "0x0"})),
+            "429 with no quota": ("/graphql", 429, self.ZERO_GRAPHQL_QUOTA),
+        }
+        for label, (endpoint, status, headers) in cases.items():
+            with self.subTest(label):
+                client = self.make_client(
+                    [FakeCompletedProcess(stdout=included_response(status, headers,
+                                                                   payload='{"message":"API rate limit exceeded"}')),
+                     FakeCompletedProcess(stdout=included_response(200, payload="{}"))],
+                    clock=lambda: 1000,
+                )
+                client.get_json(endpoint)
+                self.assertEqual(len(self.runner.calls), 2)
+                self.assertEqual(self.sleeper.delays, [3600])  # the reset, as before
+
     def test_headerless_secondary_limit_uses_capped_exponential_backoff(self):
         client = self.make_client(
             [

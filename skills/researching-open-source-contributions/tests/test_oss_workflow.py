@@ -18,6 +18,7 @@ import offline_fixture as fx  # noqa: E402  (installs the guards first)
 import json  # noqa: E402
 import os  # noqa: E402
 from pathlib import Path  # noqa: E402
+import re  # noqa: E402
 import shutil  # noqa: E402
 import socket  # noqa: E402
 import subprocess  # noqa: E402
@@ -174,6 +175,78 @@ class GuardTests(unittest.TestCase):
             self.assertNotIn(forbidden, source)
 
 
+class GateTextTests(unittest.TestCase):
+    """The skill text must not claim more than the research launcher has shown."""
+
+    def documents(self):
+        paths = (fx.SKILL_DIR / "SKILL.md", fx.SKILL_DIR / "references" / "workflow-contract.md")
+        return {path.name: " ".join(path.read_text(encoding="utf-8").split()) for path in paths}
+
+    def test_documents_name_the_one_open_launch_and_what_stays_closed(self):
+        required = (
+            "plan data with `executed: false`", "not the isolated command", "inside the Linux VM",
+            "the user's approval and the coordinator's instruction",
+            "one measured combination of profile, model, and effort", "model launch exits 3",
+            "no OS-level evidence that the boundaries hold under it",
+            "a setsid-escaped descendant survives cleanup", "Keychain isolation is unverified",
+            "fake success manifest from a probe is not a model result",
+        )
+        for name, text in self.documents().items():
+            for sentence in required:
+                self.assertIn(sentence, text, name)
+        skill = self.documents()["SKILL.md"]
+        self.assertIn("**Closed or unverified.** `auto`", skill)
+        for closed in ("staged runs (deep-research, Agent, search)", "a model run with a relay", "the whole macOS path",
+                       "No isolated entry has made the candidate reads (discovery, locus-search) against real data",
+                       "the curated collector has no isolated entry",
+                       "no path returns an assessment from an isolated model"):
+            self.assertGreater(skill.index(closed), skill.index("**Closed or unverified.**"), closed)
+        self.assertIn("General Issue sources (`issues`) are `pending-unsupported`. An isolated Issue collection entry "
+                      "exists, but its output is not connected to this workflow", skill)
+
+    def test_contract_gate_table_keeps_closed_paths_closed(self):
+        contract = (fx.SKILL_DIR / "references" / "workflow-contract.md").read_text(encoding="utf-8")
+        section = contract.split("## Isolation gate", 1)[1]
+        rows = {cells[0]: cells[1] for cells in
+                ([cell.strip() for cell in line.strip().strip("|").split("|")] for line in section.splitlines()
+                 if line.startswith("| ")) if len(cells) == 2}
+        expected = {
+            "`auto`": "closed", "staged runs (deep-research, Agent, search)": "closed", "model run with a relay": "closed",
+            "macOS, every launch": "closed", "candidate reads (discover, locus-search)": "no isolated entry",
+            "curated tracker collection": "no isolated entry", "assessment from an isolated model": "no path",
+        }
+        for path, state in expected.items():
+            self.assertTrue(rows[path].startswith(state), (path, rows[path]))
+        opened = [path for path, state in rows.items() if state.startswith("open")]
+        self.assertEqual(1, len(opened), opened)
+        self.assertIn("one measured launch", opened[0])
+        self.assertIn("no relay", opened[0])
+
+    def test_documents_carry_no_stale_claim_or_short_lived_value(self):
+        stale = ("exits 3 before any process starts", "exercised only with a non-AI probe",
+                 "only been exercised with a non-AI probe", "new research is `blocked`", "#189", "#192")
+        commit_hash = re.compile(r"\b(?=[0-9a-f]*[0-9])(?=[0-9a-f]*[a-f])[0-9a-f]{7,40}\b")
+        for name, text in self.documents().items():
+            for claim in stale:
+                self.assertNotIn(claim, text, name)
+            # The measured profile and model are named by the launcher, never here.
+            self.assertNotIn("claude-", text, name)
+            self.assertIsNone(commit_hash.search(text), name)
+            self.assertNotIn("/Users/", text, name)
+        self.assertIsNone(re.search(r"\d{4}-\d{2}-\d{2}", self.documents()["SKILL.md"]))
+
+    def test_the_boundaries_the_skill_forbids_stay_forbidden(self):
+        skill = self.documents()["SKILL.md"]
+        for rule in ("All actual research runs only inside a verified, separately isolated research process",
+                     "is not permission to call them from this host", "Make no GitHub writes",
+                     "such a lookup is not part of the recorded budget and is not allowed",
+                     "They open no network connection and start no process",
+                     "neither evaluates nor bypasses the research launcher's gate"):
+            self.assertIn(rule, skill)
+        self.assertIn("Direct research from the host session, GitHub writes, and lookups outside the recorded budget "
+                      "stay forbidden", self.documents()["workflow-contract.md"])
+
+
 class EndToEndTests(unittest.TestCase):
     def test_fixture_flow_connects_production_collector_analyzer_and_verifier(self):
         flow = Flow(self)
@@ -207,10 +280,76 @@ class EndToEndTests(unittest.TestCase):
                      "Evidence base SHA `%s`" % fx.HEAD_SHA, "External requests sent by this workflow: 0",
                      "offline fixture responses, not real API calls", "## PR cases behind each pattern",
                      fx.pull_url(101), "Remaining judgment (unconfirmed readiness): ", "| Session model / effort | unknown / unknown |",
-                     "origin `synthetic-fixture`", "do not prove that a model ran"):
+                     "origin `synthetic-fixture`", "do not prove that a model ran",
+                     "No OS isolation, credential, or launcher gate is proven here",
+                     "This workflow only adopts outputs that already exist and runs synthetic fixtures",
+                     "New research belongs to the research launcher's Linux VM entries, with the user's approval",
+                     "have no isolated path verified against real data yet",
+                     "an isolated Issue collection entry exists, but the Issue corpus is not a pull request corpus"):
             self.assertIn(text, report)
         self.assertIn("- Class: undecided (synthetic fixture)", report)
         self.assertNotIn("Candidates (assessment origin claimed: ai)", report)
+
+    def _through_locus_search(self, **assessment):
+        flow = Flow(self)
+        flow.through_analysis()
+        discovery, manifest = flow.discover()
+        flow.ok("adopt-discovery", "--discovery", str(discovery), "--manifest", str(manifest))
+        path = flow.assessment(**assessment)
+        locus, locus_manifest = flow.locus_search(path)
+        flow.ok("adopt-locus-search", "--locus-search", str(locus), "--manifest", str(locus_manifest))
+        return flow, path
+
+    def _report(self, flow):
+        flow.ok("report")
+        return (flow.run_dir / "report.md").read_text(encoding="utf-8")
+
+    def test_reproduced_with_reproduction_evidence_is_a_candidates_outcome(self):
+        flow, assessment = self._through_locus_search(status="reproduced", status_reason="none", static_reproduction=True)
+        flow.ok("record", "--assessment", str(assessment), "--origin", "synthetic-fixture")
+        status = flow.status()
+        self.assertEqual(("candidates", "complete", []), (status["outcome"], status["completeness"], status["next"]))
+        candidates = fx.read_json(flow.gen("record", "candidates.json"))["records"]
+        self.assertEqual([("reproduced", "static", "confirmed")],
+                         [(c["status"], c["reproduction"]["method"], c["readiness_checks"]["reproduction_evidence"]["result"])
+                          for c in candidates])
+        self.assertTrue(candidates[0]["reproduction"]["evidence_links"])
+        report = self._report(flow)
+        # An actionable class in a fixture run is still not a contribution candidate.
+        for text in ("Outcome: `candidates`", "## Synthetic fixture candidates (not contribution candidates)",
+                     "### CAN-001 — reproduced / none", "- Class: actionable (synthetic fixture)"):
+            self.assertIn(text, report)
+        self.assertNotIn("Candidates (assessment origin claimed: ai)", report)
+
+    def test_only_decisive_non_actionable_candidates_is_a_no_candidates_outcome(self):
+        flow, assessment = self._through_locus_search(status="not-applicable", status_reason="reproduction-failed")
+        flow.ok("record", "--assessment", str(assessment), "--origin", "synthetic-fixture")
+        status = flow.status()
+        self.assertEqual(("no-candidates", "complete", []), (status["outcome"], status["completeness"], status["next"]))
+        self.assertEqual("complete", wf.active(flow.state(), "record")["status"])
+        self.assertEqual(["not-applicable"], [c["status"] for c in fx.read_json(flow.gen("record", "candidates.json"))["records"]])
+        report = self._report(flow)
+        for text in ("Outcome: `no-candidates`", "### CAN-001 — not-applicable / reproduction-failed",
+                     "- Class: decisive non-actionable (synthetic fixture)"):
+            self.assertIn(text, report)
+
+    def test_reproduced_without_reproduction_evidence_is_refused_and_never_a_candidates_outcome(self):
+        flow, assessment = self._through_locus_search(status="reproduced", status_reason="none")
+        result = flow.cli("record", "--assessment", str(assessment), "--origin", "synthetic-fixture")
+        self.assertEqual(2, result[0], result)
+        for label in ("reproduction.method", "reproduction.evidence_links", "readiness_checks.reproduction_evidence"):
+            self.assertIn(label, result[2])
+        state = flow.state()
+        self.assertIsNone(state["stages"]["record"]["active"])
+        record_dir = flow.run_dir / "stages" / "record"
+        self.assertEqual([], sorted(p.name for p in record_dir.iterdir()) if record_dir.exists() else [])
+        status = flow.status()
+        self.assertEqual("awaiting-input", status["outcome"])
+        self.assertEqual(("record", "rejected"), (status["last_rejection"]["command"], status["last_rejection"]["result"]))
+        report = self._report(flow)
+        self.assertIn("No candidate record yet.", report)
+        self.assertNotIn("Outcome: `candidates`", report)
+        self.assertNotIn("- Class: actionable", report)
 
     def test_status_before_collection_prints_plan_data_only(self):
         flow = Flow(self)
@@ -220,6 +359,11 @@ class EndToEndTests(unittest.TestCase):
         step = status["next"][0]
         self.assertEqual(("collect", "external-network-step", False), (step["stage"], step["kind"], step["executed"]))
         self.assertIn("not evaluated", step["note"])
+        for text in ("plan data; executed=false", "not the isolated command",
+                     "only through the research launcher's Linux VM entries, with the user's approval"):
+            self.assertIn(text, step["note"])
+        # Recent-closed collection has an isolated entry that made real reads; the note claims no more than that.
+        self.assertNotIn("No isolated entry has run this step", step["note"])
         self.assertIn("--request-budget", step["argv"])
 
     def test_digest_then_waiting_for_ai_analysis(self):
@@ -230,6 +374,10 @@ class EndToEndTests(unittest.TestCase):
         flow.ok("digest")
         step = flow.status()["next"][0]
         self.assertEqual(("analysis", "awaiting-ai"), (step["stage"], step["kind"]))
+        for text in ("never run in this session", "one measured read-only launch", "every other model launch is closed",
+                     "Adopting an existing AI output offline is allowed"):
+            self.assertIn(text, step["detail"])
+        self.assertNotIn("gate is unverified", step["detail"])
 
 
 class ResultKindTests(unittest.TestCase):
@@ -333,9 +481,14 @@ class ReuseAndResumeTests(unittest.TestCase):
         # A new process only has the run directory; status names the next step.
         step = flow.status()["next"][0]
         self.assertEqual(("discovery", "external-network-step", False), (step["stage"], step["kind"], step["executed"]))
+        self.assertIn("No isolated entry has run this step against real data yet", step["note"])
         discovery, manifest = flow.discover()
         flow.ok("adopt-discovery", "--discovery", str(discovery), "--manifest", str(manifest))
-        self.assertEqual("assessment", flow.status()["next"][0]["stage"])
+        assessment, locus = flow.status()["next"]
+        self.assertEqual(("assessment", "awaiting-ai"), (assessment["stage"], assessment["kind"]))
+        self.assertIn("No isolated path returns an assessment yet", assessment["detail"])
+        self.assertEqual(("locus-search", False), (locus["stage"], locus["executed"]))
+        self.assertIn("No isolated entry has run this step against real data yet", locus["note"])
 
     def test_changed_input_needs_replace_and_invalidates_downstream(self):
         flow = Flow(self)
@@ -457,6 +610,88 @@ class RejectionTests(unittest.TestCase):
             self.assertTrue(wf.validate_request(request), label)
 
 
+class NullTargetTests(unittest.TestCase):
+    """`target: null` means collection and analysis only; nothing is verified against a borrowed target."""
+
+    def _through_digest(self):
+        flow = Flow(self, fx.base_request(target=None))
+        flow.ok("init", "--request", str(flow.request_path))
+        _, _, paths = flow.collect()
+        flow.adopt_collection(paths)
+        flow.ok("digest")
+        return flow, paths
+
+    def _assert_skipped(self, status):
+        for stage in wf.CANDIDATE_STAGES:
+            self.assertEqual(("skipped", [wf.TARGET_UNSPECIFIED]),
+                             (status["stages"][stage]["status"], status["stages"][stage]["reasons"]), stage)
+        self.assertEqual([(stage, "skipped", False) for stage in wf.CANDIDATE_STAGES],
+                         [(s["stage"], s["kind"], s["executed"]) for s in status["next"]])
+
+    def _report(self, flow):
+        flow.ok("report")
+        report = (flow.run_dir / "report.md").read_text(encoding="utf-8")
+        self.assertIn("| Target repositories | unspecified (candidate verification skipped) |", report)
+        self.assertIn("| Candidate caps | not applicable (no target) |", report)
+        self.assertNotIn("`%s`" % fx.REPO, report.split("| Target repositories |", 1)[1].split("\n", 1)[0])
+        self.assertIn("Not verified: no target repository was specified", report)
+        return report
+
+    def test_null_target_contract(self):
+        self.assertEqual([], wf.validate_request(fx.base_request(target=None)))
+        cases = {
+            "empty list": fx.base_request(target__repositories=[]),
+            "zero discover budget": fx.base_request(target__discover_request_budget=0),
+            "zero locus budget": fx.base_request(target__locus_request_budget=0),
+            "not an object": fx.base_request(target=[]),
+        }
+        for label, request in cases.items():
+            self.assertTrue(wf.validate_request(request), label)
+
+    def test_null_target_without_patterns_is_insufficient_and_skips_candidates(self):
+        flow, paths = self._through_digest()
+        flow.ok("adopt-analysis", "--analysis", str(flow.analysis_file(with_pattern=False)), "--origin", "synthetic-fixture", code=3)
+        status = flow.status()
+        self.assertEqual(("insufficient", "complete"), (status["outcome"], status["completeness"]))
+        self._assert_skipped(status)
+        result = flow.cli("adopt-discovery", "--discovery", str(paths["corpus"]), "--manifest", str(paths["manifest"]))
+        self.assertEqual(2, result[0])
+        self.assertIn("target-unspecified", result[2])
+        report = self._report(flow)
+        self.assertIn("Outcome: `insufficient`", report)
+        self.assertIn("| discovery | skipped | - | - | no target repository was specified", report)
+
+    def test_null_target_with_patterns_is_analysis_only_never_a_candidate_verdict(self):
+        flow, _ = self._through_digest()
+        flow.ok("adopt-analysis", "--analysis", str(flow.analysis_file()), "--origin", "synthetic-fixture")
+        status = flow.status()
+        self.assertEqual("analysis-only", status["outcome"])
+        self.assertNotIn(status["outcome"], ("candidates", "no-candidates", "awaiting-input"))
+        self._assert_skipped(status)
+        # A real verifier output for some repository still cannot enter a run that named no target.
+        discovery, manifest = flow.discover()
+        for argv in (("adopt-discovery", "--discovery", str(discovery), "--manifest", str(manifest)),
+                     ("adopt-locus-search", "--locus-search", str(discovery), "--manifest", str(manifest)),
+                     ("record", "--assessment", str(discovery), "--origin", "synthetic-fixture")):
+            result = flow.cli(*argv)
+            self.assertEqual(2, result[0], argv)
+            self.assertIn("target-unspecified", result[2], argv)
+        state = flow.state()
+        self.assertEqual([None, None, None], [state["stages"][s]["active"] for s in wf.CANDIDATE_STAGES])
+        report = self._report(flow)
+        self.assertIn("Outcome: `analysis-only`", report)
+        self.assertNotIn("## Synthetic fixture candidates", report)
+        self.assertNotIn("## Candidates (assessment origin claimed: ai)", report)
+
+    def test_object_target_keeps_candidate_verification(self):
+        flow = Flow(self)
+        flow.through_analysis()
+        status = flow.status()
+        self.assertEqual("awaiting-input", status["outcome"])
+        self.assertEqual(("discovery", "external-network-step"), (status["next"][0]["stage"], status["next"][0]["kind"]))
+        self.assertEqual("not-run", status["stages"]["discovery"]["status"])
+
+
 class CuratedTrackerTests(unittest.TestCase):
     """curated-tracker: the production curated collector over the local fake opener, then the shared stages."""
 
@@ -472,6 +707,7 @@ class CuratedTrackerTests(unittest.TestCase):
         self.assertEqual(["collect_curated_contribution_prs.py", "collect", "--tracker-repo", fx.TRACKER,
                           "--issue", str(fx.TRACKER_ISSUE), "--max-prs", "5", "--request-budget", "200"], step["argv"][:10])
         self.assertIn("not evaluated", step["note"])
+        self.assertIn("No isolated entry has run this step against real data yet", step["note"])
         run, opener, paths = flow.curated_collect()
         self.assertEqual(0, run.exit_code)
         self.assertEqual(2, flow.adopt_curated(paths, "--inventory", str(paths["corpus"]), code=2)[0])

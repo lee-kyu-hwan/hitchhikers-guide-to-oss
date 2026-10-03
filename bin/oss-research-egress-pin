@@ -1,0 +1,724 @@
+#!/usr/bin/env python3
+"""Pin the two fixed egress names of an OSS research run inside the Linux guest.
+
+This is one layer of the Linux research boundary, not the boundary itself.
+The research child stays in its bwrap network namespace and reaches the
+network only through the srt proxy (hostname allow list) and the #192 relay
+(read-only GitHub endpoints). This tool narrows what the non-sandboxed
+processes of the research uid (srt proxy, relay, supervisor) can dial: a root
+step resolves ``api.github.com`` and ``api.anthropic.com`` once per run through
+an explicit resolver, accepts only public IPv4 answers, and opens exactly those
+addresses on TCP 443 for a bounded time. DNS stays closed for the research uid,
+so names cannot be rebound during the run.
+
+Commands (run as root in the dedicated guest):
+
+  apply  --run-id ID --ttl SECONDS --resolver IPV4   close, resolve, pin, record
+  verify [--run-id ID]                                check the live pin (exit 3 when not ok)
+  clear  [--run-id ID]                                close and remove the pin
+
+One root-owned lock serializes pin operations on the VM, and an active,
+unexpired pin of another run is never overwritten.
+
+``apply`` is a fail-closed transaction: the allow set is emptied first, then
+the validated hosts block, the nft elements (kernel timeout = TTL), and last the
+manifest are written. Any failure leaves the allow set empty and no manifest.
+The manifest lives on tmpfs (/run), and the allow set is rebuilt empty at boot,
+so a reboot or an interrupted run leaves nothing open. If closing itself fails,
+the command exits 4 ("cleanup-failed"): the kernel timeout still bounds the
+allow set, but nothing may launch until it passes. Nothing here reads a
+credential, and the command line has no option that weakens a check.
+See docs/research/2026-09-28-78-network-boundary-plan.md.
+"""
+
+from __future__ import annotations
+
+import argparse
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+import hashlib
+import ipaddress
+import json
+import os
+from pathlib import Path
+import re
+import secrets
+import socket
+import stat
+import struct
+import subprocess
+import sys
+import tempfile
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
+
+
+SCHEMA_VERSION = "1.0.0"
+PINNED_NAMES = ("api.github.com", "api.anthropic.com")
+PINNED_PORT = 443
+DNS_PORT = 53
+QUERIES_PER_NAME = 2
+MIN_TTL_SECONDS = 60
+MAX_TTL_SECONDS = 3600
+MAX_ADDRESSES_PER_NAME = 16
+DNS_TIMEOUT_SECONDS = 5.0
+RUN_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
+
+NFT = "/usr/sbin/nft"
+NFT_TABLE = ("inet", "oss_research")
+NFT_SET = "egress4"
+HOSTS_PATH = Path("/etc/hosts")
+STATE_DIR = Path("/run/oss-research-egress")
+MANIFEST_NAME = "manifest.json"
+BEGIN_MARK = "# BEGIN oss-research-egress-pin"
+END_MARK = "# END oss-research-egress-pin"
+
+# Every IPv4 range that is not ordinary public unicast, listed explicitly so the
+# verdict does not depend on the Python runtime's ipaddress tables (Python 3.9
+# does not treat 192.0.0.192 or all of 192.0.0.0/24 as non-global; 3.13+ does).
+# Source: IANA IPv4 Special-Purpose Address Registry plus platform endpoints.
+DENIED_NETWORKS = tuple(ipaddress.ip_network(n) for n in (
+    "0.0.0.0/8",          # "this network"
+    "10.0.0.0/8",         # private
+    "100.64.0.0/10",      # shared address space / CGNAT (incl. 100.100.100.200 metadata)
+    "127.0.0.0/8",        # loopback
+    "169.254.0.0/16",     # link-local (incl. 169.254.169.254 metadata)
+    "172.16.0.0/12",      # private
+    "192.0.0.0/24",       # IETF protocol assignments (incl. 192.0.0.192 metadata)
+    "192.0.2.0/24",       # TEST-NET-1
+    "192.31.196.0/24",    # AS112-v4
+    "192.52.193.0/24",    # AMT
+    "192.88.99.0/24",     # deprecated 6to4 relay anycast
+    "192.168.0.0/16",     # private (incl. Lima guest network 192.168.5.0/24)
+    "192.175.48.0/24",    # direct delegation AS112
+    "198.18.0.0/15",      # benchmarking
+    "198.51.100.0/24",    # TEST-NET-2
+    "203.0.113.0/24",     # TEST-NET-3
+    "224.0.0.0/4",        # multicast
+    "240.0.0.0/4",        # reserved, incl. 255.255.255.255 broadcast
+    "168.63.129.16/32",   # Azure platform endpoint (publicly routable form)
+))
+
+TYPE_A, TYPE_CNAME, TYPE_AAAA = 1, 5, 28
+CLASS_IN = 1
+
+
+class PinError(Exception):
+    """Refused pin; the allow set is left empty."""
+
+
+def utc_now() -> datetime:
+    return datetime.now(timezone.utc).replace(microsecond=0)
+
+
+def iso(moment: datetime) -> str:
+    return moment.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def parse_iso(value: object) -> Optional[datetime]:
+    if not isinstance(value, str):
+        return None
+    try:
+        return datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+
+
+def sha256_text(text: str) -> str:
+    return "sha256:" + hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def tool_revision() -> str:
+    return "sha256:" + hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
+
+
+# ---------------------------------------------------------------------------
+# Address policy
+# ---------------------------------------------------------------------------
+
+
+def address_problem(text: str) -> Optional[str]:
+    """None for a public IPv4 unicast address, otherwise the reason it is refused."""
+    try:
+        address = ipaddress.ip_address(text)
+    except ValueError:
+        return "not an IP address"
+    if address.version != 4:
+        return "not IPv4"
+    for network in DENIED_NETWORKS:
+        if address in network:
+            return "special-purpose or platform range %s" % network
+    # Second opinion from the runtime; it can only add refusals, never remove one.
+    if address.is_private or address.is_reserved or address.is_multicast or not address.is_global:
+        return "not globally routable (runtime ipaddress)"
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Minimal DNS client (A query over UDP to one explicit resolver)
+# ---------------------------------------------------------------------------
+
+
+def _encode_name(name: str) -> bytes:
+    out = b""
+    for label in name.rstrip(".").split("."):
+        raw = label.encode("ascii")
+        if not 0 < len(raw) < 64:
+            raise PinError("invalid DNS label in %r" % name)
+        out += bytes([len(raw)]) + raw
+    return out + b"\x00"
+
+
+def _read_name(message: bytes, offset: int, depth: int = 0) -> Tuple[str, int]:
+    labels: List[str] = []
+    jumped_end: Optional[int] = None
+    while True:
+        if offset >= len(message) or depth > 16:
+            raise PinError("malformed DNS name")
+        length = message[offset]
+        if length & 0xC0 == 0xC0:
+            if offset + 1 >= len(message):
+                raise PinError("malformed DNS pointer")
+            pointer = ((length & 0x3F) << 8) | message[offset + 1]
+            if jumped_end is None:
+                jumped_end = offset + 2
+            if pointer >= offset:
+                raise PinError("forward DNS pointer")
+            offset, depth = pointer, depth + 1
+            continue
+        if length & 0xC0:
+            raise PinError("unsupported DNS label type")
+        offset += 1
+        if length == 0:
+            break
+        if offset + length > len(message):
+            raise PinError("truncated DNS label")
+        labels.append(message[offset:offset + length].decode("ascii", "strict").lower())
+        offset += length
+    return ".".join(labels), (jumped_end if jumped_end is not None else offset)
+
+
+def build_query(name: str, query_id: int) -> bytes:
+    header = struct.pack("!HHHHHH", query_id, 0x0100, 1, 0, 0, 0)
+    return header + _encode_name(name) + struct.pack("!HH", TYPE_A, CLASS_IN)
+
+
+def parse_answer(name: str, query_id: int, message: bytes) -> List[str]:
+    """Return the IPv4 addresses for ``name``; refuse anything unexpected."""
+    if len(message) < 12:
+        raise PinError("short DNS response")
+    rid, flags, qd, an, _ns, _ar = struct.unpack("!HHHHHH", message[:12])
+    if rid != query_id:
+        raise PinError("DNS response id mismatch")
+    if not flags & 0x8000:
+        raise PinError("DNS message is not a response")
+    if flags & 0x0200:
+        raise PinError("truncated DNS response")
+    if flags & 0x000F:
+        raise PinError("DNS error rcode %d" % (flags & 0x000F))
+    if qd != 1:
+        raise PinError("DNS response must echo one question")
+    qname, offset = _read_name(message, 12)
+    if offset + 4 > len(message):
+        raise PinError("truncated DNS question")
+    qtype, qclass = struct.unpack("!HH", message[offset:offset + 4])
+    offset += 4
+    if (qname, qtype, qclass) != (name, TYPE_A, CLASS_IN):
+        raise PinError("DNS response question does not match the query")
+    wanted = name
+    addresses: List[str] = []
+    for _ in range(an):
+        owner, offset = _read_name(message, offset)
+        if offset + 10 > len(message):
+            raise PinError("truncated DNS record")
+        rtype, rclass, _ttl, rdlength = struct.unpack("!HHIH", message[offset:offset + 10])
+        offset += 10
+        rdata_start, offset = offset, offset + rdlength
+        if offset > len(message):
+            raise PinError("truncated DNS record data")
+        if rclass != CLASS_IN:
+            raise PinError("non-IN DNS record")
+        if rtype == TYPE_CNAME:
+            if owner != wanted:
+                raise PinError("CNAME for an unrelated name")
+            wanted, _ = _read_name(message, rdata_start)
+        elif rtype == TYPE_A:
+            if owner != wanted or rdlength != 4:
+                raise PinError("A record for an unrelated name")
+            addresses.append(socket.inet_ntoa(message[rdata_start:offset]))
+        elif rtype == TYPE_AAAA:
+            raise PinError("IPv6 answer refused")
+        else:
+            raise PinError("unexpected DNS record type %d" % rtype)
+    if not addresses:
+        raise PinError("no IPv4 answer for %s" % name)
+    if len(addresses) > MAX_ADDRESSES_PER_NAME:
+        raise PinError("too many addresses for %s" % name)
+    return addresses
+
+
+def udp_exchange(resolver: Tuple[str, int], payload: bytes, timeout: float = DNS_TIMEOUT_SECONDS) -> bytes:
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+        sock.settimeout(timeout)
+        sock.connect(resolver)
+        sock.send(payload)
+        return sock.recv(4096)
+
+
+Exchange = Callable[[Tuple[str, int], bytes], bytes]
+
+
+def resolve_pins(resolver: Tuple[str, int], exchange: Exchange = udp_exchange,
+                 queries: int = QUERIES_PER_NAME) -> Tuple[Dict[str, List[str]], List[dict]]:
+    """Query each fixed name ``queries`` times; every answer must be public IPv4.
+
+    Pins the addresses present in every answer. A private, mixed, IPv6, or
+    changing (rebinding) answer refuses the whole pin.
+    """
+    pins: Dict[str, List[str]] = {}
+    log: List[dict] = []
+    for name in PINNED_NAMES:
+        common: Optional[set] = None
+        for attempt in range(queries):
+            query_id = secrets.randbelow(0x10000)
+            try:
+                answer = parse_answer(name, query_id, exchange(resolver, build_query(name, query_id)))
+            except (OSError, UnicodeDecodeError, struct.error) as error:
+                raise PinError("DNS query for %s failed: %s" % (name, error)) from error
+            problems = {a: address_problem(a) for a in answer}
+            bad = {a: p for a, p in problems.items() if p}
+            log.append({"name": name, "attempt": attempt + 1, "answers": sorted(answer),
+                        "refused": bad})
+            if bad:
+                raise PinError("%s resolved to refused addresses: %s" % (
+                    name, ", ".join("%s (%s)" % item for item in sorted(bad.items()))))
+            common = set(answer) if common is None else common & set(answer)
+        if not common:
+            raise PinError("%s answers changed between queries (possible rebinding)" % name)
+        pins[name] = sorted(common, key=lambda a: tuple(int(p) for p in a.split(".")))
+    return pins, log
+
+
+# ---------------------------------------------------------------------------
+# Environment (injected in tests; production paths are fixed)
+# ---------------------------------------------------------------------------
+
+
+def run_nft(args: Sequence[str]) -> str:
+    result = subprocess.run([NFT, *args], capture_output=True, text=True, check=False,
+                            env={"PATH": "/usr/sbin:/usr/bin:/sbin:/bin"}, timeout=30)
+    if result.returncode != 0:
+        raise PinError("nft %s failed: %s" % (" ".join(args[:3]), result.stderr.strip()))
+    return result.stdout
+
+
+@dataclass
+class Env:
+    hosts_path: Path = HOSTS_PATH
+    state_dir: Path = STATE_DIR
+    nft: Callable[[Sequence[str]], str] = run_nft
+    exchange: Exchange = udp_exchange
+    owner_uid: int = 0
+    now: Callable[[], datetime] = utc_now
+    require_root: bool = True
+    table: Tuple[str, str] = NFT_TABLE
+    set_name: str = NFT_SET
+
+    @property
+    def manifest_path(self) -> Path:
+        return self.state_dir / MANIFEST_NAME
+
+
+# ---------------------------------------------------------------------------
+# hosts block
+# ---------------------------------------------------------------------------
+
+
+def hosts_block(run_id: str, pins: Dict[str, List[str]]) -> str:
+    lines = ["%s %s" % (BEGIN_MARK, run_id)]
+    for name in PINNED_NAMES:
+        lines += ["%s %s" % (address, name) for address in pins[name]]
+    lines.append("%s %s" % (END_MARK, run_id))
+    return "\n".join(lines) + "\n"
+
+
+def strip_block(text: str) -> str:
+    out, inside = [], False
+    for line in text.splitlines(keepends=True):
+        if line.startswith(BEGIN_MARK):
+            inside = True
+            continue
+        if inside and line.startswith(END_MARK):
+            inside = False
+            continue
+        if not inside:
+            out.append(line)
+    if inside:
+        raise PinError("hosts file has an unterminated pin block")
+    return "".join(out)
+
+
+def current_block(text: str) -> Optional[str]:
+    lines = text.splitlines(keepends=True)
+    for index, line in enumerate(lines):
+        if line.startswith(BEGIN_MARK):
+            for end in range(index, len(lines)):
+                if lines[end].startswith(END_MARK):
+                    return "".join(lines[index:end + 1])
+            return None
+    return None
+
+
+def write_atomic(path: Path, text: str, mode: int) -> None:
+    fd, tmp = tempfile.mkstemp(prefix="." + path.name + ".", dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(tmp, mode)
+        os.replace(tmp, path)
+    except BaseException:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+        raise
+
+
+def replace_hosts(env: Env, block: Optional[str]) -> None:
+    original = env.hosts_path.read_text(encoding="utf-8")
+    base = strip_block(original)
+    if not base.endswith("\n") and base:
+        base += "\n"
+    updated = base + (block or "")
+    if updated != original:
+        mode = stat.S_IMODE(env.hosts_path.stat().st_mode)
+        write_atomic(env.hosts_path, updated, mode)
+
+
+# ---------------------------------------------------------------------------
+# nft set
+# ---------------------------------------------------------------------------
+
+
+def nft_close(env: Env) -> None:
+    env.nft(["flush", "set", env.table[0], env.table[1], env.set_name])
+
+
+def nft_elements(pins: Dict[str, List[str]]) -> List[str]:
+    return sorted({"%s . %d" % (address, PINNED_PORT) for addresses in pins.values() for address in addresses})
+
+
+def nft_open(env: Env, elements: List[str], ttl: int) -> None:
+    body = ", ".join("%s timeout %ds" % (element, ttl) for element in elements)
+    env.nft(["add", "element", env.table[0], env.table[1], env.set_name, "{ %s }" % body])
+
+
+# nft JSON prints set-element "timeout" and "expires" in whole seconds. Measured
+# on the Debian 13 guest with nftables 1.1.3 (json_schema_version 1): an element
+# added with "timeout 120s" lists "timeout": 120, "expires": 119, while the text
+# output shows "timeout 2m expires 1m59s980ms". A different unit fails verify
+# closed, because timeout must equal the TTL.
+NFT_JSON_TIME_UNIT = "seconds"
+
+
+def nft_live_set(env: Env) -> Tuple[List[str], List[str], List[Tuple[object, object]]]:
+    """(flags, elements "ip . port", per-element (timeout, expires)) of the live allow set."""
+    data = json.loads(env.nft(["-j", "list", "set", env.table[0], env.table[1], env.set_name]))
+    sets = [item["set"] for item in data.get("nftables", []) if isinstance(item, dict) and isinstance(item.get("set"), dict)]
+    if len(sets) != 1:
+        raise PinError("nft did not return exactly one allow set")
+    entry = sets[0]
+    flags = entry.get("flags") or []
+    found: List[str] = []
+    timeouts: List[Tuple[object, object]] = []
+    for element in entry.get("elem", []) or []:
+        if isinstance(element, dict) and "elem" in element:
+            inner = element["elem"]
+            value, timeout = inner.get("val"), (inner.get("timeout"), inner.get("expires"))
+        else:
+            value, timeout = element, (None, None)
+        concat = value.get("concat") if isinstance(value, dict) else None
+        if not (isinstance(concat, list) and len(concat) == 2):
+            raise PinError("unexpected nft set element %r" % (element,))
+        found.append("%s . %s" % (concat[0], concat[1]))
+        timeouts.append(timeout)
+    return (flags if isinstance(flags, list) else [flags]), sorted(found), timeouts
+
+
+# ---------------------------------------------------------------------------
+# Manifest
+# ---------------------------------------------------------------------------
+
+
+MANIFEST_KEYS = {"schema_version", "tool", "tool_revision", "run_id", "created_at", "expires_at",
+                 "ttl_seconds", "resolver", "port", "pins", "queries", "hosts_block_sha256",
+                 "nft_table", "nft_set", "nft_elements", "nft_elements_sha256"}
+TOOL_NAME = "oss-research-egress-pin"
+
+
+def manifest_sha256(manifest: dict) -> str:
+    return sha256_text(json.dumps(manifest, sort_keys=True, separators=(",", ":")))
+
+
+def _check_private_dir(env: Env) -> None:
+    info = os.lstat(env.state_dir)
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != env.owner_uid or info.st_mode & 0o022:
+        raise PinError("state directory must be a real directory owned by the pin owner and not group/other writable")
+
+
+def ensure_state_dir(env: Env) -> None:
+    try:
+        os.mkdir(env.state_dir, 0o755)
+    except FileExistsError:
+        pass
+    _check_private_dir(env)
+
+
+class _Lock:
+    """Root-owned exclusive lock for one pin operation at a time on this VM."""
+
+    def __init__(self, env: Env):
+        self.path = env.state_dir / "lock"
+        self.fd: Optional[int] = None
+
+    def __enter__(self) -> "_Lock":
+        import fcntl
+        self.fd = os.open(self.path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+        try:
+            fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as error:
+            os.close(self.fd)
+            self.fd = None
+            raise PinError("another pin operation holds the lock") from error
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        if self.fd is not None:
+            os.close(self.fd)
+
+
+# ---------------------------------------------------------------------------
+# Commands
+# ---------------------------------------------------------------------------
+
+
+def _require_root(env: Env) -> None:
+    if env.require_root and (os.geteuid() != 0 or not sys.platform.startswith("linux")):
+        raise PinError("run as root inside the Linux research guest")
+
+
+def _resolver(text: str) -> Tuple[str, int]:
+    try:
+        address = ipaddress.ip_address(text)
+    except ValueError as error:
+        raise PinError("resolver must be an IPv4 literal") from error
+    if address.version != 4 or address.is_unspecified or address.is_multicast:
+        raise PinError("resolver must be a unicast IPv4 literal")
+    return str(address), DNS_PORT
+
+
+class CleanupFailed(PinError):
+    """Closing the allow set failed; it may stay open until its kernel timeout."""
+
+
+def _close_all(env: Env) -> List[str]:
+    """Close first, then remove hosts block and manifest. Returns failures (never raises)."""
+    failures: List[str] = []
+    for label, step in (("nft", lambda: nft_close(env)), ("hosts", lambda: replace_hosts(env, None)),
+                        ("manifest", lambda: env.manifest_path.unlink(missing_ok=True))):
+        try:
+            step()
+        except Exception as error:  # noqa: BLE001 - reported to the caller, never swallowed
+            failures.append("%s: %s" % (label, error))
+    return failures
+
+
+def clear(env: Env, run_id: Optional[str] = None) -> dict:
+    """Close the allow set and remove the pin. With --run-id, refuse another run's pin."""
+    _require_root(env)
+    ensure_state_dir(env)
+    with _Lock(env):
+        if run_id is not None:
+            current = _read_manifest(env)
+            if isinstance(current, dict) and current.get("run_id") not in (None, run_id):
+                raise PinError("the active pin belongs to run %r" % current.get("run_id"))
+        failures = _close_all(env)
+    if failures:
+        raise CleanupFailed("clear incomplete (%s); do not launch until the kernel timeout passes"
+                            % "; ".join(failures))
+    return {"status": "cleared"}
+
+
+def _read_manifest(env: Env) -> Optional[object]:
+    try:
+        return json.loads(env.manifest_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+
+
+def apply(env: Env, run_id: str, ttl: int, resolver: Tuple[str, int]) -> dict:
+    _require_root(env)
+    if RUN_ID.fullmatch(run_id or "") is None:
+        raise PinError("run id must match %s" % RUN_ID.pattern)
+    if isinstance(ttl, bool) or not isinstance(ttl, int) or not MIN_TTL_SECONDS <= ttl <= MAX_TTL_SECONDS:
+        raise PinError("ttl must be an integer between %d and %d seconds" % (MIN_TTL_SECONDS, MAX_TTL_SECONDS))
+    ensure_state_dir(env)
+    with _Lock(env):
+        # A live pin of another run is never overwritten; wait for its expiry or clear it by run id.
+        active = verify(env)
+        if active["ok"] and active["run_id"] != run_id:
+            raise PinError("run %r holds an active pin until %s" % (active["run_id"], active["expires_at"]))
+        # 1. Close: the allow set is empty and no manifest vouches for anything.
+        nft_close(env)
+        env.manifest_path.unlink(missing_ok=True)
+        try:
+            pins, log = resolve_pins(resolver, env.exchange)
+            block = hosts_block(run_id, pins)
+            elements = nft_elements(pins)
+            # 2. hosts, 3. nft (kernel timeout = ttl), 4. manifest last. The manifest window starts
+            # after the elements exist, so the kernel lease never outlives the manifest.
+            replace_hosts(env, block)
+            nft_open(env, elements, ttl)
+            created = env.now()
+            manifest = {
+                "schema_version": SCHEMA_VERSION, "tool": TOOL_NAME, "tool_revision": tool_revision(),
+                "run_id": run_id, "created_at": iso(created), "expires_at": iso(created + timedelta(seconds=ttl)),
+                "ttl_seconds": ttl, "resolver": "%s:%d" % resolver, "port": PINNED_PORT, "pins": pins,
+                "queries": log, "hosts_block_sha256": sha256_text(block),
+                "nft_table": " ".join(env.table), "nft_set": env.set_name,
+                "nft_elements": elements, "nft_elements_sha256": sha256_text("\n".join(elements)),
+            }
+            write_atomic(env.manifest_path, json.dumps(manifest, indent=2, sort_keys=True) + "\n", 0o644)
+        except BaseException as error:
+            failures = _close_all(env)
+            if failures:
+                raise CleanupFailed("pin failed (%s) and cleanup is incomplete (%s); the allow set may stay "
+                                    "open for at most %d s (kernel timeout); do not launch"
+                                    % (error, "; ".join(failures), ttl)) from error
+            raise
+    return {"status": "pinned", "run_id": run_id, "expires_at": manifest["expires_at"],
+            "manifest_sha256": manifest_sha256(manifest), "nft_elements": elements}
+
+
+def verify(env: Env, run_id: Optional[str] = None) -> dict:
+    """Return {"ok": bool, "problems": [...], ...}; any doubt is a problem."""
+    problems: List[str] = []
+    path = env.manifest_path
+    try:
+        _check_private_dir(env)
+        info = os.lstat(path)
+    except (FileNotFoundError, PinError) as error:
+        return {"ok": False, "problems": ["no trusted manifest: %s" % error], "run_id": None, "expires_at": None}
+    if not stat.S_ISREG(info.st_mode) or info.st_uid != env.owner_uid or info.st_mode & 0o022:
+        problems.append("manifest must be a regular file owned by the pin owner and not group/other writable")
+    manifest = _read_manifest(env)
+    if not isinstance(manifest, dict) or set(manifest) != MANIFEST_KEYS:
+        return {"ok": False, "problems": problems + ["manifest unreadable or keys differ from schema %s" % SCHEMA_VERSION],
+                "run_id": None, "expires_at": None}
+    fixed = {"schema_version": SCHEMA_VERSION, "tool": TOOL_NAME, "tool_revision": tool_revision(),
+             "port": PINNED_PORT, "nft_table": " ".join(env.table), "nft_set": env.set_name}
+    for key, value in fixed.items():
+        if manifest[key] != value:
+            problems.append("manifest %s must be %r" % (key, value))
+    if not isinstance(manifest["run_id"], str) or RUN_ID.fullmatch(manifest["run_id"]) is None:
+        problems.append("manifest run id is invalid")
+    elif run_id is not None and manifest["run_id"] != run_id:
+        problems.append("manifest belongs to another run")
+    if not isinstance(manifest["resolver"], str) or re.fullmatch(r"\d{1,3}(\.\d{1,3}){3}:\d{1,5}", manifest["resolver"]) is None:
+        problems.append("manifest resolver is invalid")
+    if not isinstance(manifest["queries"], list):
+        problems.append("manifest queries must be a list")
+    ttl = manifest["ttl_seconds"]
+    created, expires = parse_iso(manifest["created_at"]), parse_iso(manifest["expires_at"])
+    now = env.now()
+    if isinstance(ttl, bool) or not isinstance(ttl, int) or not MIN_TTL_SECONDS <= ttl <= MAX_TTL_SECONDS:
+        problems.append("manifest ttl is out of bounds")
+    elif created is None or expires is None or expires - created != timedelta(seconds=ttl):
+        problems.append("manifest times do not match its ttl")
+    elif now >= expires:
+        problems.append("pin expired at %s" % manifest["expires_at"])
+    elif now < created:
+        problems.append("manifest created in the future")
+    pins = manifest["pins"]
+    if not isinstance(pins, dict) or sorted(pins) != sorted(PINNED_NAMES):
+        problems.append("pins must name exactly %s" % ", ".join(PINNED_NAMES))
+    else:
+        for name, addresses in pins.items():
+            if not isinstance(addresses, list) or not 0 < len(addresses) <= MAX_ADDRESSES_PER_NAME \
+                    or len(set(map(str, addresses))) != len(addresses):
+                problems.append("%s must pin 1-%d distinct addresses" % (name, MAX_ADDRESSES_PER_NAME))
+                continue
+            for address in addresses:
+                reason = address_problem(address) if isinstance(address, str) else "not a string"
+                if reason:
+                    problems.append("%s pin %r refused: %s" % (name, address, reason))
+    if not problems:
+        expected = nft_elements(pins)
+        if manifest["nft_elements"] != expected or manifest["nft_elements_sha256"] != sha256_text("\n".join(expected)):
+            problems.append("manifest nft elements do not match its pins")
+        block = current_block(env.hosts_path.read_text(encoding="utf-8"))
+        if block is None or sha256_text(block) != manifest["hosts_block_sha256"] or \
+                block != hosts_block(manifest["run_id"], pins):
+            problems.append("hosts pin block is missing or changed")
+        try:
+            flags, live, timeouts = nft_live_set(env)
+        except (PinError, ValueError) as error:
+            problems.append("nft allow set unreadable: %s" % error)
+        else:
+            if "timeout" not in flags:
+                problems.append("nft allow set lacks the timeout flag (no kernel lease)")
+            if live != expected:
+                problems.append("live nft allow set differs from the manifest")
+            remaining = (expires - now).total_seconds()
+
+            def bad_lease(timeout: object, left: object) -> bool:
+                for number in (timeout, left):
+                    if isinstance(number, bool) or not isinstance(number, int):
+                        return True
+                # timeout is what apply set (the TTL); the kernel's remaining time must not
+                # outlive the manifest (its window starts after the elements exist).
+                return timeout != ttl or not 0 <= left <= ttl or left > remaining + 1
+            if any(bad_lease(t, left) for t, left in timeouts):
+                problems.append("a live nft element lease is missing, not %s-based, or outlives the manifest"
+                                % NFT_JSON_TIME_UNIT)
+    return {"ok": not problems, "problems": problems, "run_id": manifest.get("run_id"),
+            "expires_at": manifest.get("expires_at"), "manifest_sha256": manifest_sha256(manifest)}
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
+    sub = parser.add_subparsers(dest="command", required=True)
+    p_apply = sub.add_parser("apply", help="close, resolve, and pin the fixed names for one run")
+    p_apply.add_argument("--run-id", required=True)
+    p_apply.add_argument("--ttl", required=True, type=int)
+    p_apply.add_argument("--resolver", required=True, help="IPv4 literal of the trusted resolver (port 53)")
+    p_verify = sub.add_parser("verify", help="check the live pin against its manifest")
+    p_verify.add_argument("--run-id")
+    p_clear = sub.add_parser("clear", help="close the allow set and remove the pin")
+    p_clear.add_argument("--run-id", help="refuse when the active pin belongs to another run")
+    return parser
+
+
+def main(argv: Optional[Sequence[str]] = None, env: Optional[Env] = None) -> int:
+    args = build_parser().parse_args(argv)
+    env = env or Env()
+    try:
+        if args.command == "apply":
+            result = apply(env, args.run_id, args.ttl, _resolver(args.resolver))
+        elif args.command == "verify":
+            result = verify(env, args.run_id)
+            print(json.dumps(result, sort_keys=True))
+            return 0 if result["ok"] else 3
+        else:
+            result = clear(env, args.run_id)
+    except CleanupFailed as error:
+        print(json.dumps({"status": "cleanup-failed", "closed": False, "error": str(error)}, sort_keys=True))
+        return 4
+    except PinError as error:
+        print(json.dumps({"status": "refused", "error": str(error)}, sort_keys=True))
+        return 2
+    print(json.dumps(result, sort_keys=True))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

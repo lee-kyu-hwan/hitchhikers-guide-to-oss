@@ -1,0 +1,355 @@
+#!/usr/bin/env python3
+"""The non-AI Issue collection entry: general Issues through the relay, inside srt.
+
+Linux guest only, as the research user inside the unit wrapper
+(executable_oss-research-linux-run --entry collect-issues):
+
+    executable_oss-research-collect-issues --out-dir OUT --repo OWNER/NAME \\
+        --date-field created|updated|closed --state open|closed|all \\
+        --start-at 2026-03-28T00:00:00Z --end-at 2026-09-28T00:00:00Z \\
+        [--max-per-repo 20] [--request-budget 60] [--timeout 300]
+
+It is the PR collection entry (executable_oss-research-collect) with the Issue
+collector behind it, and nothing else changes: the same worker pieces (relay,
+build_policy(model=False), Supervisor, area checks), the same bounded reads of
+the child's files and the same envelope shape. The PR entry and its limits are
+untouched; this file loads it only for load_worker and file_entry.
+
+There is no model, credential, profile, prompt or permission mode here. The
+date field has no default: the caller names it. There is no label option (the
+relay refuses a quoted search). The relay is the one the worker already starts:
+its ready sources are the Issue collector and its closed-PR sibling, it allows
+the Issue reads (search, the Issue, its comments and timeline) and the one fixed
+IssueEvidence GraphQL query, and it holds no credential. An anonymous GraphQL
+query can fail upstream; the collector then keeps those facts unknown and the
+collection partial.
+
+The child is executable_oss-research-relay-issues --require-proxy (the adapter
+that runs collect_open_source_issues.py with the relay as its transport). It
+reads only the worker's Linux system set plus this collection's own set: the
+pinned python, the relay-collect adapter it loads beside itself, the Issue
+collector skill's revision files, the sibling collector script it loads, and
+the UTC tz file.
+
+Limits are fixed here: at most MAX_ISSUES Issues in all (repositories x
+max-per-repo), a request budget of at most MAX_REQUEST_BUDGET (the relay gets
+the same budget), an explicit UTC interval of at most MAX_INTERVAL_DAYS days.
+
+Status is the collector's, never raised: its exit 0 with a complete collection
+is "succeeded" (exit 0); its exit 3 is "partial" (exit EXIT_PARTIAL), because
+the cap, the budget or an unknown GraphQL category left it incomplete; anything
+else is "failed" (exit 4). Every outcome is kept.
+
+Output, in OUT/run: output/{corpus.json, collection-manifest.json,
+transport.json} from the child, and in result/ manifest.json (this run),
+relay.log, stderr.log and collection-envelope.json, which binds every file's
+size and sha256 to the request, the child's exit code and the relay's ready
+sources. The host checks it with
+tests/fixtures/oss_research_worker/linux/verify_pickup.py --issues.
+"""
+
+from __future__ import annotations
+
+import argparse
+from datetime import datetime, timedelta, timezone
+import hashlib
+import importlib.machinery
+import importlib.util
+import json
+import os
+from pathlib import Path
+import re
+import sys
+from typing import NamedTuple
+
+MAX_ISSUES = 20
+MAX_REQUEST_BUDGET = 60
+MAX_INTERVAL_DAYS = 184
+MAX_TIMEOUT_SECONDS = 1800.0
+RELAY_MAX_RESPONSE_BYTES = 4 * 1024 * 1024
+RELAY_RESPONSE_BYTE_BUDGET = 64 * 1024 * 1024
+RELAY_TIMEOUT_SECONDS = 30.0
+ADAPTER_TIMEOUT_SECONDS = "30"
+ADAPTER = "executable_oss-research-relay-issues"
+# The files beside the adapter that it loads by path (its ADAPTER: the
+# relay-collect adapter, whose RelayOpener it reuses). Measured on the guest:
+# without it the adapter stops with FileNotFoundError inside srt. A test keeps
+# this equal to the adapter's own constant.
+ADAPTER_DEPENDENCIES = ("executable_oss-research-relay-collect",)
+DATE_FIELDS = ("created", "updated", "closed")
+STATES = ("open", "closed", "all")
+INSTANT = re.compile(r"\A\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ\Z")
+TZ_READ = ("/usr/share/zoneinfo/UTC", os.path.realpath("/usr/share/zoneinfo/UTC"))
+# The Issue collector's own SKILL_REVISION_PATHS (collect_open_source_issues.py).
+# A test keeps the two equal.
+COLLECTOR_REVISION_FILES = ("SKILL.md", "agents/openai.yaml", "references/collection-contract.md",
+                            "references/github-api-contract.md",
+                            "scripts/collect_open_source_issues.py",
+                            "tests/test_collect_open_source_issues.py")
+OUTPUTS = ("corpus.json", "collection-manifest.json", "transport.json")
+ENVELOPE_SCHEMA = "oss-research-issue-collection-envelope/1"
+UPSTREAM = "github-rest-via-relay"
+ENTRY = "dot_local/bin/executable_oss-research-collect-issues"
+MODE = "collect-issues"
+
+EXIT_OK = 0
+EXIT_BAD_INPUT = 2
+EXIT_BLOCKED = 3
+EXIT_FAILED = 4
+EXIT_PARTIAL = 5
+# The collector's exit codes (collecting-open-source-issues SKILL.md).
+COLLECTOR_COMPLETE = 0
+COLLECTOR_PARTIAL = 3
+
+
+class IssueCollection(NamedTuple):
+    repositories: tuple[str, ...]
+    date_field: str
+    state: str
+    start_at: str
+    end_at: str
+    max_per_repo: int
+    request_budget: int
+
+    def as_request(self) -> dict:
+        return {"repositories": list(self.repositories), "date_field": self.date_field,
+                "state": self.state, "start_at": self.start_at, "end_at": self.end_at,
+                "max_per_repo": self.max_per_repo, "request_budget": self.request_budget}
+
+
+def load_collect_entry(here: Path = Path(__file__)):
+    """The PR collection entry beside this file, for load_worker and file_entry."""
+    path = Path(os.path.realpath(here)).with_name("executable_oss-research-collect")
+    loader = importlib.machinery.SourceFileLoader("oss_research_collect_entry", str(path))
+    module = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
+    loader.exec_module(module)
+    return module
+
+
+def checked_collection(worker, repositories: list[str], date_field: str, state: str,
+                       start_at: str, end_at: str, max_per_repo: int,
+                       request_budget: int) -> IssueCollection:
+    """Raise ValueError unless the request is inside this entry's fixed limits."""
+    worker.checked_relay_request(repositories, request_budget, RELAY_MAX_RESPONSE_BYTES,
+                                 RELAY_RESPONSE_BYTE_BUDGET, RELAY_TIMEOUT_SECONDS)
+    for label, value, limit in (("max per repo", max_per_repo, MAX_ISSUES),
+                                ("request budget", request_budget, MAX_REQUEST_BUDGET)):
+        if type(value) is not int or not 1 <= value <= limit:
+            raise ValueError(f"{label} must be an integer from 1 to {limit}")
+    if max_per_repo * len(repositories) > MAX_ISSUES:
+        raise ValueError(f"repositories x max per repo must be at most {MAX_ISSUES} Issues")
+    if date_field not in DATE_FIELDS:
+        raise ValueError("date field must be one of " + ", ".join(DATE_FIELDS))
+    if state not in STATES:
+        raise ValueError("state must be one of " + ", ".join(STATES))
+    if date_field == "closed" and state == "open":
+        raise ValueError("an open Issue has no closed date")
+    instants = []
+    for label, value in (("start", start_at), ("end", end_at)):
+        if INSTANT.match(value or "") is None:
+            raise ValueError(f"--{label}-at must be an explicit UTC instant YYYY-MM-DDTHH:MM:SSZ")
+        instants.append(datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc))
+    if not instants[0] < instants[1] or instants[1] - instants[0] > timedelta(days=MAX_INTERVAL_DAYS):
+        raise ValueError(f"the interval must be forward and at most {MAX_INTERVAL_DAYS} days")
+    return IssueCollection(tuple(repositories), date_field, state, start_at, end_at, max_per_repo,
+                           request_budget)
+
+
+def collector_file(worker) -> Path:
+    """The reviewed Issue collector the relay also hashes (its "issues" source)."""
+    _, skills = worker.trusted_relay(Path(worker.__file__))
+    return (skills / dict(worker.RELAY_SOURCES)["issues"]).resolve(strict=True)
+
+
+def sibling_file(worker) -> Path:
+    """The closed-PR collector the Issue collector loads (the relay's "sibling")."""
+    _, skills = worker.trusted_relay(Path(worker.__file__))
+    return (skills / dict(worker.RELAY_SOURCES)["sibling"]).resolve(strict=True)
+
+
+def adapter_file(worker) -> Path:
+    return Path(os.path.realpath(worker.__file__)).with_name(ADAPTER)
+
+
+def collection_read(worker, python: str) -> list[str]:
+    skill = collector_file(worker).parents[1]
+    adapter = adapter_file(worker)
+    return [python, *[str(adapter.with_name(name)) for name in ADAPTER_DEPENDENCIES],
+            *[str(skill / relative) for relative in COLLECTOR_REVISION_FILES],
+            str(sibling_file(worker)), *TZ_READ]
+
+
+def adapter_arguments(worker, collection: IssueCollection, port: int, run_dir: Path) -> list[str]:
+    _, skills = worker.trusted_relay(Path(worker.__file__))
+    output = run_dir / "output"
+    argv = ["--relay-url", f"http://127.0.0.1:{port}", "--skills-dir", str(skills),
+            "--transport-record", str(output / "transport.json"),
+            "--timeout-seconds", ADAPTER_TIMEOUT_SECONDS,
+            "--max-response-bytes", str(RELAY_MAX_RESPONSE_BYTES)]
+    for repository in collection.repositories:
+        argv += ["--repo", repository]
+    return argv + ["--date-field", collection.date_field, "--state", collection.state,
+                   "--start-at", collection.start_at, "--end-at", collection.end_at,
+                   "--max-per-repo", str(collection.max_per_repo),
+                   "--request-budget", str(collection.request_budget),
+                   "--output", str(output / "corpus.json"),
+                   "--manifest", str(output / "collection-manifest.json"),
+                   "--require-proxy"]
+
+
+def run_status(exit_code, problems: list[str]) -> str:
+    """succeeded, partial or failed: the collector's own exit, never raised."""
+    if problems:
+        return "failed"
+    return "succeeded" if exit_code == COLLECTOR_COMPLETE else "partial"
+
+
+def recorder(worker, collect_entry, collection: IssueCollection, upstream: str, unit: str | None):
+    """The record function run_supervised calls instead of the model collect()."""
+
+    def record(run_dir: Path, exit_code, stdout: str, stderr: str, failures: list[str],
+               relay: dict | None) -> bool:
+        moved = worker.parent_path_problems(run_dir)
+        if moved:
+            print("OSS Issue collection not recorded: " + "; ".join(moved), file=sys.stderr)
+            return False
+        result = run_dir / "result"
+        relay = dict(relay or {})
+        (result / "relay.log").write_text(relay.pop("stderr", ""), encoding="utf-8")
+        (result / "stderr.log").write_text(stderr, encoding="utf-8")
+        problems = list(failures)
+        if exit_code is None:
+            problems.append("no exit code: the supervisor stopped the child")
+        elif exit_code not in (COLLECTOR_COMPLETE, COLLECTOR_PARTIAL):
+            problems.append(f"collection exit code {exit_code}")
+        files = {}
+        for name in OUTPUTS:
+            entry, why = collect_entry.file_entry(run_dir / "output" / name)
+            if entry is None:
+                problems.append(f"output {name}: {why}")
+            else:
+                files[name] = entry
+        problems += worker.area_problems(run_dir)
+        status = run_status(exit_code, problems)
+        manifest = {"kind": "issue-collection", "status": status,
+                    "exit_code": exit_code, "failures": list(failures), "problems": problems,
+                    "policy_sha256": hashlib.sha256(
+                        (run_dir / "policy/srt-settings.json").read_bytes()).hexdigest(),
+                    "request": collection.as_request(), "relay": relay}
+        (result / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+        for name in ("relay.log", "manifest.json"):
+            files["run-manifest.json" if name == "manifest.json" else name] = \
+                collect_entry.file_entry(result / name)[0]
+        envelope = {"schema": ENVELOPE_SCHEMA, "entry": ENTRY, "upstream": upstream, "unit": unit,
+                    "request": collection.as_request(), "adapter_exit": exit_code,
+                    "relay": {key: relay.get(key) for key in ("sources", "relay_sha256", "port")},
+                    "files": files}
+        (result / "collection-envelope.json").write_text(json.dumps(envelope, indent=1),
+                                                        encoding="utf-8")
+        return status != "failed"
+
+    return record
+
+
+def run_collection(worker, collect_entry, runtime: list[str], out: Path,
+                   collection: IssueCollection, seconds: float, launch,
+                   upstream: str = UPSTREAM, drop_read: tuple[str, ...] = ()) -> bool:
+    """One supervised Issue collection in OUT/input (empty) and OUT/run.
+
+    launch is the worker's relay_launch for this request. Tests hand the same
+    launch with local fixture infrastructure beside it (never through a
+    command-line option); drop_read is for the read-set counterexamples only.
+    """
+    inputs = out / "input"
+    inputs.mkdir(mode=0o700)
+    run_dir = worker.checked_run_dir(out / "run", inputs.resolve())
+    python = os.path.realpath(sys.executable)
+    adapter = adapter_file(worker)
+    ports = {}
+
+    def policy_for(port):
+        ports["relay"] = port
+        policy = worker.build_policy(inputs.resolve(), run_dir, adapter, port, model=False,
+                                     runtime=runtime)
+        policy["filesystem"]["allowRead"] += collection_read(worker, python)
+        policy["filesystem"]["allowRead"] = [path for path in policy["filesystem"]["allowRead"]
+                                             if path not in drop_read]
+        return policy
+
+    def command_for(policy_file):
+        if ports.get("relay") is None:
+            # The relay failed (the supervisor recorded why); no child is started.
+            return ["/nonexistent/no-relay-port"]
+        return worker.sandboxed(runtime, policy_file, [python, "-B", str(adapter),
+                                                       *adapter_arguments(worker, collection,
+                                                                          ports["relay"], run_dir)])
+
+    environment = worker.build_environment({name: os.environ[name] for name in ("PATH", "LANG")
+                                            if name in os.environ}, run_dir)
+    return worker.run_supervised(
+        inputs.resolve(), run_dir, worker.PROFILES[0], seconds, launch, policy_for, command_for,
+        environment, record=recorder(worker, collect_entry, collection, upstream,
+                                     os.environ.get(worker.UNIT_ENV_MARKER)))
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--out-dir", required=True, type=Path)
+    parser.add_argument("--repo", action="append", required=True)
+    parser.add_argument("--date-field", required=True)
+    parser.add_argument("--state", required=True)
+    parser.add_argument("--start-at", required=True)
+    parser.add_argument("--end-at", required=True)
+    parser.add_argument("--max-per-repo", type=int, default=MAX_ISSUES)
+    parser.add_argument("--request-budget", type=int, default=MAX_REQUEST_BUDGET)
+    parser.add_argument("--timeout", type=float, default=300.0)
+    options = parser.parse_args(argv)
+    collect_entry = load_collect_entry()
+    worker = collect_entry.load_worker()
+    try:
+        collection = checked_collection(worker, options.repo, options.date_field, options.state,
+                                        options.start_at, options.end_at, options.max_per_repo,
+                                        options.request_budget)
+        if not 0 < options.timeout <= MAX_TIMEOUT_SECONDS:
+            raise ValueError(f"timeout must be above 0 and at most {MAX_TIMEOUT_SECONDS:g}")
+        out = options.out_dir
+        if out.is_symlink() or not out.is_dir() or any(out.iterdir()):
+            raise ValueError("--out-dir must be an existing empty directory")
+    except ValueError as error:
+        print(f"OSS Issue collection did not start: {error}", file=sys.stderr)
+        return EXIT_BAD_INPUT
+    try:
+        if sys.platform != "linux":
+            raise worker.Blocked("the Issue collection entry runs on the Linux guest only")
+        if not worker.parent_eof_guard(dict(os.environ)):
+            raise worker.Blocked("the Issue collection entry runs only inside the unit wrapper")
+        runtime = worker.verify_runtime(Path(os.environ.get("OSS_RESEARCH_SRT_PREFIX", "")),
+                                        os.environ.get("PATH", ""))
+        problems = worker.platform_problems(Path(runtime[1]).parents[4], sys.platform)
+        if problems:
+            raise worker.Blocked("this host cannot run srt isolated: " + "; ".join(problems))
+        if adapter_file(worker).is_symlink() or not adapter_file(worker).is_file():
+            raise worker.Blocked(f"the Issue adapter is not installed: {adapter_file(worker)}")
+        request = worker.checked_relay_request(list(collection.repositories), collection.request_budget,
+                                               RELAY_MAX_RESPONSE_BYTES, RELAY_RESPONSE_BYTE_BUDGET,
+                                               RELAY_TIMEOUT_SECONDS)
+        launch = worker.relay_launch(request, dict(os.environ))
+        kept = run_collection(worker, collect_entry, runtime, out.resolve(), collection,
+                              options.timeout, launch)
+    except worker.Blocked as error:
+        print(f"OSS Issue collection blocked: {error}", file=sys.stderr)
+        return EXIT_BLOCKED
+    try:
+        manifest = json.loads((out / "run/result/manifest.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        manifest = {}
+    status = manifest.get("status") if kept else "failed"
+    print(json.dumps({"mode": MODE, "entry": ENTRY, "status": status,
+                      "manifest": {key: manifest.get(key) for key in ("status", "exit_code",
+                                                                      "failures", "problems")}}))
+    return {"succeeded": EXIT_OK, "partial": EXIT_PARTIAL}.get(status, EXIT_FAILED)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

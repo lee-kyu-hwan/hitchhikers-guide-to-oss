@@ -1,13 +1,19 @@
 #!/usr/bin/env python3
 """Start a read-only Claude worker for OSS research inside the sandbox runtime.
 
-The real launch is closed. The pinned srt install and the shape of a
-profile-bound credential file are checked, but no real launch has been
-measured with them. The code that hands the credential to the child and
-checks it was not exposed sits behind that gate and runs only in tests with
-fake sentinels. The corpus-extract and deep-research profiles (reviewed
-skill sources staged under a hash pin, writes to them denied) sit behind the
-same gate. See docs/research/oss-research-worker.md.
+The real launch is closed except for the launches listed in MEASURED_LAUNCHES.
+The pinned srt install and the shape of a profile-bound credential file are
+checked first. Then only a request that equals a measured launch in every field
+reads the credential and starts: on Linux, the Debian 13 guest, read-only,
+dontAsk, no relay, claude-profile2, claude-opus-5-5 at medium, inside the unit
+wrapper, with the measured node and Claude files. macOS has no measured launch,
+so main stays closed there. Everything else stays behind the gate: auto, a
+relay, the corpus-extract and deep-research profiles (reviewed skill sources
+staged under a hash pin, writes to them denied), another profile, model or
+effort. SYSTEM_READ_MEASURED["linux"] is False: the Linux read set counts as
+measured for that one launch only, not in general. The code that hands the
+credential to the child and checks it was not exposed runs in tests with fake
+sentinels and in that measured launch. See docs/research/oss-research-worker.md.
 """
 
 from __future__ import annotations
@@ -26,6 +32,7 @@ import stat
 import signal
 import subprocess
 import sys
+import threading
 import time
 from typing import NamedTuple
 
@@ -39,6 +46,15 @@ PROFILES = ("claude-profile1", "claude-profile2")
 INHERITED_VARIABLES = ("PATH", "LANG", "LC_ALL", "LC_CTYPE", "TERM")
 # Model endpoint only. OAuth sign-in/refresh domains depend on the auth decision.
 ALLOWED_DOMAINS = ("api.anthropic.com",)
+# Linux: the same endpoint on 443 only (README ":port" suffix). The macOS
+# policy keeps its measured form.
+ALLOWED_DOMAINS_LINUX = ("api.anthropic.com:443",)
+# Linux: addresses an allowed name must not resolve to (README
+# network.deniedResolvedAddresses). srt already denies loopback, link-local,
+# metadata and this host's own addresses; private and CGNAT space (which holds
+# the Lima host gateway 192.168.5.0/24) is only denied when listed.
+DENIED_RESOLVED_LINUX = ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "100.64.0.0/10",
+                         "fc00::/7")
 WRITABLE_AREAS = ("home", "tmp", "output")
 # The only system paths opened under denyRead "/", measured on srt 0.0.77 with
 # Claude Code 2.1.283 (--version/--help) and a Python probe:
@@ -48,6 +64,73 @@ WRITABLE_AREAS = ("home", "tmp", "output")
 # - /private/etc/hosts: the one file behind that lookup.
 # /etc/passwd, /etc/ssh, /usr/local, /usr/bin and the rest stay unreadable.
 SYSTEM_READ = ("/usr/share/icu", "/etc", "/private/etc/hosts")
+# Linux (bubblewrap under srt 0.0.77), measured on the Debian 13 arm64 guest
+# (2026-09-28) with Claude 2.1.283 --version/--help and the non-AI probes:
+# - /usr/lib: the dynamic loader and libraries. /usr/lib/aarch64-linux-gnu with
+#   the loader alone was not enough (bash did not start).
+# - /usr/bin/bash: srt runs the command through bash inside bwrap.
+# - /usr/bin/socat: srt's in-sandbox proxy listeners.
+# - /etc/hosts: "localhost" in srt's proxy variables.
+# srt opens a symlink itself, not what it points at, so build_policy adds each
+# entry's resolved target too (Debian's /usr/bin/socat -> socat1, measured).
+# The pinned apply-seccomp is added from the runtime (build_policy). A model
+# request (TLS roots and the rest) is not measured, so the gate stays closed.
+# /etc as a whole is never opened (it holds passwd, ssh and the rest there).
+SYSTEM_READ_LINUX = ("/usr/lib", "/usr/bin/bash", "/usr/bin/socat", "/etc/hosts")
+SYSTEM_READ_BY_PLATFORM = {"darwin": SYSTEM_READ, "linux": SYSTEM_READ_LINUX}
+SYSTEM_READ_MEASURED = {"darwin": True, "linux": False}
+
+
+class MeasuredLaunch(NamedTuple):
+    """One launch configuration observed end to end with a real model."""
+    os_id: str
+    os_version: str
+    machine: str
+    node_sha256: str
+    claude_sha256: str
+    execution_profile: str
+    permission_mode: str
+    relay: bool
+    profile: str
+    model: str
+    effort: str
+
+
+# The launches that were measured, per platform. Linux: the Debian 13 arm64
+# guest, srt 0.0.77 (pinned as above), node v24.20.0 and Claude 2.1.283 by the
+# sha256 of their real files, read-only, dontAsk, no relay, claude-profile2,
+# claude-opus-5-5 at medium (docs/research/2026-09-28-189-linux-model-evidence.md
+# section 3: the run 2a7abff; 9.1: the path-level read-set ablation; 10.3: the
+# review of the original read-set contract). SYSTEM_READ_MEASURED["linux"]
+# stays False: the Linux read set is taken as measured for this launch only,
+# not in general. Not measured: the minimality of /usr/lib file by file (the
+# original contract is path-level; no syscall trace is required). Every other
+# configuration (auto, a staged profile, a relay, another profile, model,
+# effort, OS, node or Claude) stays closed. macOS has no measured launch.
+MEASURED_LAUNCHES = {
+    "linux": MeasuredLaunch(
+        os_id="debian", os_version="13", machine="aarch64",
+        node_sha256="23a5637c2470fde09fcc1acc77c1b92e04e3d7e3e6e80ff7df6f5831958d1477",
+        claude_sha256="346d294f0103d6fc0de11ac953579b5c62dfa90698a4cfc486b6f927c615e697",
+        execution_profile="read-only", permission_mode="dontAsk", relay=False,
+        profile="claude-profile2", model="claude-opus-5-5", effort="medium"),
+}
+OS_RELEASE = Path("/etc/os-release")
+MAX_PINNED_BINARY_BYTES = 1024 * 1024 * 1024
+# What srt 0.0.77 needs on Linux (checkLinuxDependencies, checkDependenciesCommon).
+# srt finds them on PATH; the runner accepts only these root-owned files.
+LINUX_TOOL_DIR = Path("/usr/bin")
+LINUX_TOOLS = ("bwrap", "socat", "rg")
+LINUX_PATH = "/usr/bin:/bin"
+# The guest's root installs the pinned srt under this directory (for example
+# /opt/oss-research/srt-0.0.77); a prefix anywhere else is refused.
+LINUX_RUNTIME_PARENT = Path("/opt")
+# srt 0.0.77 ships apply-seccomp for these only; without it srt warns and runs
+# with Unix socket creation unrestricted, so the runner refuses instead.
+SECCOMP_ARCHES = {"aarch64": "arm64", "arm64": "arm64", "x86_64": "x64", "amd64": "x64"}
+# A host directory shared into the VM (Lima virtiofs/9p/sshfs) is refused.
+HOST_MOUNT_TYPES = ("virtiofs", "9p", "fuse.sshfs")
+LINUX_PREFLIGHT_SECONDS = 5.0
 # The only srt install the gate accepts: a local prefix made by
 #   npm install --prefix <prefix> --save-exact --ignore-scripts \
 #     @anthropic-ai/sandbox-runtime@0.0.77
@@ -85,7 +168,42 @@ EXPOSURE_SECONDS = 30.0
 # Claude permission modes the child may be started with. Choosing auto only
 # changes this CLI argument; nothing here shows what auto blocks.
 PERMISSION_MODES = ("dontAsk", "auto")
+# Settings the child always gets through --settings (flag settings). With
+# switchModelsOnFlag false a flagged request ends the turn with a refusal in
+# non-interactive mode instead of switching the session to another model
+# (code.claude.com/docs/en/model-config, "ask before switching"; measured on
+# Linux: the default switched claude-opus-5-5 to claude-opus-4-8). --help of
+# 2.1.283 says --restricted keeps --settings; its effect under --safe-mode and
+# a real refusal with it set are not verified.
+CHILD_SETTINGS = {"switchModelsOnFlag": False}
 DEFAULT_PERMISSION_MODE = "dontAsk"
+# Model and effort as the user names them, passed through unchanged. Claude
+# 2.1.283 --help (run inside srt on the Linux guest, no network, no login)
+# lists --model <model> (an alias or a full name) and --effort <level> with
+# these levels. Nothing here picks a default; a live run needs both.
+EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
+# One opaque argument: printable ASCII without spaces, 1-128 characters, not
+# starting with "-". It keeps every form the CLI accepts (claude-opus-5-5[1m]).
+MODEL_NAME = re.compile(r"[!-,.-~][!-~]{0,127}")
+
+
+class Selection(NamedTuple):
+    """The user's explicit model and effort for one run; opaque to the runner."""
+
+    model: str
+    effort: str
+
+    def check(self) -> "Selection":
+        if not isinstance(self.model, str) or MODEL_NAME.fullmatch(self.model) is None:
+            raise ValueError("model must be 1-128 printable ASCII characters without spaces, "
+                             "not starting with '-'")
+        if self.effort not in EFFORT_LEVELS:
+            raise ValueError(f"effort must be one of {', '.join(EFFORT_LEVELS)}")
+        return self
+
+    def argv(self) -> list[str]:
+        self.check()
+        return ["--model", self.model, "--effort", self.effort]
 
 
 class StagedSource(NamedTuple):
@@ -251,7 +369,13 @@ def checked_input(input_dir: Path, prompt_file: Path, home: Path) -> tuple[Path,
         raise ValueError("prompt must be a regular file inside the input directory")
     if resolved.stat().st_size > MAX_PROMPT_BYTES:
         raise ValueError("prompt is too large")
-    prompt = resolved.read_text(encoding="utf-8")
+    # One read of the bytes, strict UTF-8, newlines kept: the child gets exactly
+    # the file's text and prompt_sha256 is the file's bytes (no read_text CRLF
+    # translation, no second read).
+    try:
+        prompt = resolved.read_bytes().decode("utf-8")
+    except UnicodeDecodeError:
+        raise ValueError("prompt must be nonempty UTF-8 text without NUL") from None
     if not prompt.strip() or "\0" in prompt:
         raise ValueError("prompt must be nonempty UTF-8 text without NUL")
     return input_dir, prompt
@@ -324,6 +448,278 @@ def verify_runtime(prefix: Path | None, path: str | None) -> list[str]:
     if node is None:
         raise Blocked("node is not on PATH; srt cannot start")
     return [node, str(cli)]
+
+
+def system_read(platform: str) -> tuple[str, ...]:
+    """The system paths the policy opens on this platform, or Blocked."""
+    if platform not in SYSTEM_READ_BY_PLATFORM:
+        raise Blocked(f"no sandbox policy for platform {platform!r}; not starting unisolated")
+    return SYSTEM_READ_BY_PLATFORM[platform]
+
+
+def apply_seccomp_path(prefix: Path, machine: str) -> Path:
+    """The pinned tree's apply-seccomp for this machine, or Blocked."""
+    if machine not in SECCOMP_ARCHES:
+        raise Blocked(f"srt {SRT_VERSION} has no apply-seccomp for {machine!r}")
+    return (prefix / "node_modules" / SRT_PACKAGE / "vendor/seccomp"
+            / SECCOMP_ARCHES[machine] / "apply-seccomp")
+
+
+def ancestor_problems(label: str, path: Path, owner: int, root: Path) -> list[str]:
+    """Every directory above path, as written and as resolved, up to and
+    including root: owned by owner and not writable by group or others.
+
+    Otherwise whoever may write one of them can rename what lies below and
+    put another file in its place between this check and the launch.
+    """
+    root = Path(os.path.realpath(root))
+    chains = {Path(os.path.abspath(path)).parent, Path(os.path.realpath(path)).parent}
+    problems = []
+    for start in sorted(chains):
+        if start != root and root not in start.parents:
+            problems.append(f"{label} is outside {root}: {start}")
+            continue
+        for directory in [start, *start.parents]:
+            try:
+                info = os.stat(directory)
+            except OSError as error:
+                problems.append(f"{label}: directory {directory} is unusable: {error.strerror}")
+                break
+            if info.st_uid != owner:
+                problems.append(f"{label}: directory {directory} is not owned by uid {owner}")
+            elif info.st_mode & 0o022:
+                problems.append(f"{label}: directory {directory} is writable by group or others")
+            if directory == root:
+                break
+    return problems
+
+
+def file_problems(label: str, path: Path, owner: int, root: Path,
+                  executable: bool = True) -> list[str]:
+    """A regular, owner-held file nobody else can change or replace, never set-id.
+
+    A symlink is followed once and its target checked the same way; the
+    directories above both spellings are checked up to root (ancestor_problems).
+    """
+    try:
+        info = os.stat(path)
+    except OSError as error:
+        return [f"{label} is unusable: {error.strerror}"]
+    problems = []
+    if not stat.S_ISREG(info.st_mode):
+        problems.append(f"{label} is not a regular file")
+    if info.st_uid != owner:
+        problems.append(f"{label} must be owned by uid {owner}")
+    if info.st_mode & 0o022:
+        problems.append(f"{label} is writable by group or others")
+    if info.st_mode & (stat.S_ISUID | stat.S_ISGID):
+        problems.append(f"{label} is set-id")
+    if executable and not info.st_mode & stat.S_IXUSR:
+        problems.append(f"{label} is not executable")
+    return problems + ancestor_problems(label, path, owner, root)
+
+
+def tree_owner_problems(prefix: Path, owner: int, root: Path,
+                        label: str = "srt prefix") -> list[str]:
+    """The srt prefix lies under root/opt, its ancestors are owner-held and
+    closed (ancestor_problems), and every entry in it is owned by owner, not
+    writable by group or others, no special file, no link leading outside it.
+    The first offender inside the prefix is reported. label names the tree in
+    messages (the Linux unit wrapper checks its source tree the same way)."""
+    trusted = Path(os.path.realpath(root / LINUX_RUNTIME_PARENT.relative_to("/")))
+    resolved = Path(os.path.realpath(prefix))
+    if trusted not in resolved.parents:
+        return [f"{label} must be installed under {LINUX_RUNTIME_PARENT}: {resolved}"]
+    # A name below the tree, so the directory checks start at the tree itself.
+    problems = ancestor_problems(label, resolved / "-", owner, root)
+
+    def offender(path: Path) -> str | None:
+        info = os.lstat(path)
+        if info.st_uid != owner:
+            return f"{label} entry is not owned by uid {owner}: {path}"
+        if stat.S_ISLNK(info.st_mode):
+            target = Path(os.path.realpath(path))
+            if target != resolved and resolved not in target.parents:
+                return f"{label} link leads outside it: {path}"
+            return None
+        if not (stat.S_ISDIR(info.st_mode) or stat.S_ISREG(info.st_mode)):
+            return f"special file in the {label}: {path}"
+        if info.st_mode & 0o022:
+            return f"{label} entry is writable by group or others: {path}"
+        return None
+
+    errors: list[OSError] = []
+    try:
+        for current, directories, files in os.walk(resolved, onerror=errors.append):
+            for name in directories + files:
+                if found := offender(Path(current) / name):
+                    return problems + [found]
+    except OSError as error:
+        return problems + [f"{label} cannot be checked: {error.strerror}"]
+    if errors:
+        return problems + [f"{label} cannot be fully listed: {errors[0].strerror}"]
+    return problems
+
+
+def read_proc(path: Path) -> str | None:
+    try:
+        return path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+
+
+def linux_static_problems(prefix: Path, *, root: Path = Path("/"),
+                          machine: str | None = None, euid: int | None = None,
+                          owner: int = 0) -> list[str]:
+    """What rules out a Linux launch, read from files only: no process starts.
+
+    The tools and the whole srt prefix must belong to owner (root), and so must
+    every directory above them: the guest installs srt as root under /opt, so
+    the research user can run it but never change or replace it between this
+    check and the launch. root, machine, euid and owner exist for
+    the fake-host tests;
+    the runner passes none of them. Anything that cannot be read is a problem.
+    Whether bubblewrap and apply-seccomp actually get their namespaces is not
+    known from files; linux_execution_preflight starts them, apart from main.
+    """
+    machine = os.uname().machine if machine is None else machine
+    euid = os.geteuid() if euid is None else euid
+    problems = []
+    if euid == 0:
+        problems.append("running as uid 0; the research user must be unprivileged")
+    version = read_proc(root / "proc/version")
+    if version is None:
+        problems.append("cannot read /proc/version")
+    elif "microsoft" in version.lower() and "wsl2" not in version.lower():
+        problems.append("WSL1 has no bubblewrap support")
+    for tool in LINUX_TOOLS:
+        problems += file_problems(tool, root / LINUX_TOOL_DIR.relative_to("/") / tool,
+                                  owner, root)
+    problems += tree_owner_problems(prefix, owner, root)
+    try:
+        seccomp = apply_seccomp_path(prefix, machine)
+    except Blocked as error:
+        problems.append(str(error))
+    else:
+        if seccomp.is_symlink():
+            problems.append("apply-seccomp must not be a symlink")
+        else:
+            problems += file_problems("apply-seccomp", seccomp, owner, root)
+    limit = (read_proc(root / "proc/sys/user/max_user_namespaces") or "").strip()
+    if not limit.isascii() or not limit.isdigit():
+        problems.append("cannot read user.max_user_namespaces as an integer")
+    elif int(limit) == 0:
+        problems.append("user namespaces are disabled (user.max_user_namespaces = 0)")
+    clone = root / "proc/sys/kernel/unprivileged_userns_clone"
+    if clone.exists() and (read_proc(clone) or "").strip() != "1":
+        problems.append("unprivileged user namespaces are disabled or unreadable")
+    if not (root / "sys/fs/cgroup/cgroup.controllers").is_file():
+        problems.append("cgroup v2 is not mounted at /sys/fs/cgroup")
+    mounts = read_proc(root / "proc/self/mountinfo")
+    if mounts is None:
+        problems.append("cannot read /proc/self/mountinfo")
+    else:
+        for line in mounts.splitlines():
+            fields = line.partition(" - ")[2].split()
+            if fields and fields[0] in HOST_MOUNT_TYPES:
+                problems.append(f"host share mounted: {fields[0]} at {line.split()[4]}")
+    return problems
+
+
+# Exit 0 when socket(AF_UNIX) is created, 3 when a policy refuses it (EPERM,
+# EACCES), 4 on any other error (EMFILE, ENOMEM, ...), which proves nothing.
+# srt 0.0.77's filter is expected to return EPERM (the helper binary names
+# only that errno). The Debian guest run gave exit 3; the errno itself was not recorded.
+AF_UNIX_PROBE = ("import errno,socket,sys\n"
+                 "try:\n socket.socket(socket.AF_UNIX).close()\n"
+                 "except OSError as error:\n"
+                 " print(error.errno)\n"
+                 " sys.exit(3 if error.errno in (errno.EPERM, errno.EACCES) else 4)\n")
+
+
+def linux_execution_preflight(prefix: Path, environ: dict[str, str], *,
+                              machine: str | None = None, python: str | None = None,
+                              run=subprocess.run) -> list[str]:
+    """Start bubblewrap and apply-seccomp once each and report what failed.
+
+    This starts processes, so main never calls it: the guest task runs it by
+    hand next to the static check, passing the research user's environment,
+    which must hold no SSH agent. The AF_UNIX result counts only beside its
+    control: the same probe must create the socket outside apply-seccomp.
+    """
+    machine = os.uname().machine if machine is None else machine
+    python = str(Path(sys.executable).resolve()) if python is None else python
+    environment = {"PATH": LINUX_PATH}
+    problems = []
+    if "SSH_AUTH_SOCK" in environ:
+        problems.append("SSH_AUTH_SOCK is set; no SSH agent may reach the research user")
+    try:
+        seccomp = str(apply_seccomp_path(prefix, machine))
+    except Blocked as error:
+        return problems + [str(error)]
+    bwrap = [str(LINUX_TOOL_DIR / "bwrap"), "--unshare-user", "--unshare-pid",
+             "--unshare-net", "--ro-bind", "/", "/", "--proc", "/proc", "--dev", "/dev",
+             "/bin/true"]
+    probe = [python, "-I", "-c", AF_UNIX_PROBE]
+    checks = (("bubblewrap namespaces", bwrap, 0),
+              ("apply-seccomp start", [seccomp, "/bin/true"], 0),
+              ("AF_UNIX control", probe, 0),
+              ("AF_UNIX under apply-seccomp", [seccomp, *probe], 3))
+    for label, argv, expected in checks:
+        try:
+            completed = run(argv, env=environment, stdin=subprocess.DEVNULL,
+                            capture_output=True, text=True, timeout=LINUX_PREFLIGHT_SECONDS)
+        except (OSError, subprocess.SubprocessError) as error:
+            problems.append(f"{label}: {type(error).__name__}")
+            continue
+        if completed.returncode != expected:
+            problems.append(f"{label}: exit {completed.returncode}, expected {expected}")
+    return problems
+
+
+def platform_problems(prefix: Path, platform: str) -> list[str]:
+    """The file-only checks require_runtime adds per platform (none on macOS)."""
+    system_read(platform)
+    if platform == "linux":
+        return linux_static_problems(prefix)
+    return []
+
+
+# Set by the Linux unit wrapper (executable_oss-research-linux-run) on the unit
+# it starts; its stdin is then the wrapper's pipe.
+UNIT_ENV_MARKER = "OSS_RESEARCH_UNIT"
+PARENT_GONE_EXIT = 75
+
+
+def parent_eof_guard(environ: dict[str, str]) -> bool:
+    """Inside the wrapper's unit, end this process once the wrapper is gone.
+
+    The wrapper holds the only write end of this process's stdin. When the
+    wrapper exits, for any reason including SIGKILL, stdin reads EOF and this
+    process exits at once; the unit's KillMode=control-group then ends every
+    process left in its cgroup (relay, srt, research child, setsid escapees).
+    Children never hold that pipe: Supervisor starts them with stdin
+    /dev/null and closes every other descriptor. Returns False without the
+    marker, and raises Blocked when the marker is set but stdin is no pipe.
+    """
+    if UNIT_ENV_MARKER not in environ:
+        return False
+    try:
+        if not stat.S_ISFIFO(os.fstat(0).st_mode):
+            raise Blocked("unit stdin is not the wrapper's pipe; not running unguarded")
+    except OSError as error:
+        raise Blocked(f"unit stdin is unusable: {error.strerror}")
+
+    def watch() -> None:
+        try:
+            while os.read(0, 4096):
+                pass
+        except OSError:
+            pass
+        os._exit(PARENT_GONE_EXIT)
+
+    threading.Thread(target=watch, name="parent-eof-guard", daemon=True).start()
+    return True
 
 
 class Credential:
@@ -429,33 +825,186 @@ def load_credential(profile: str, credential: Path, *forbidden: Path) -> Credent
     return Credential(profile, token.removesuffix("\n"))
 
 
+class LaunchRequest(NamedTuple):
+    """What main is about to start, compared field by field with MEASURED_LAUNCHES.
+
+    unit_problems is why this process is not the unit wrapper's (unit_problems()
+    on Linux); the measured launch ran in that unit, so any problem closes it."""
+    execution_profile: str
+    permission_mode: str
+    relay: bool
+    selection: "Selection | None"
+    unit_problems: tuple[str, ...]
+
+
+UNIT_NAME = re.compile(r"oss-research-[0-9a-f]{16}")
+PROC_CGROUP = Path("/proc/self/cgroup")
+
+
+def unit_problems(environ: dict[str, str], guarded: bool) -> list[str]:
+    """Why this process is not running inside the unit wrapper's unit.
+
+    The marker alone proves nothing (anyone can set it). The wrapper's contract
+    is: a root-checked tree, a systemd unit named by the marker, and this
+    process's stdin as the wrapper's pipe (parent_eof_guard armed). So all
+    three are required: the marker's form, the parent EOF guard, and this
+    process's own cgroup being that unit's (cgroup v2, read from /proc).
+    """
+    marker = environ.get(UNIT_ENV_MARKER)
+    if marker is None:
+        return ["not started by the unit wrapper (no unit marker)"]
+    problems = []
+    if UNIT_NAME.fullmatch(marker) is None:
+        problems.append("the unit marker is malformed")
+    if not guarded:
+        problems.append("the parent EOF guard is not armed")
+    try:
+        lines = PROC_CGROUP.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeError):
+        lines = []
+    if lines != [f"0::/system.slice/{marker}.service"]:
+        problems.append("this process is not in the wrapper unit's cgroup")
+    return problems
+
+
+def os_release(path: Path | None = None) -> dict[str, str]:
+    """KEY=VALUE pairs of os-release (quotes removed), or {} when unreadable."""
+    path = OS_RELEASE if path is None else path
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError):
+        return {}
+    pairs = {}
+    for line in text.splitlines():
+        key, sep, value = line.partition("=")
+        if sep and key.strip() and not key.startswith("#"):
+            pairs[key.strip()] = value.strip().strip("'\"")
+    return pairs
+
+
+def file_sha256(path: Path, limit: int = MAX_PINNED_BINARY_BYTES) -> str | None:
+    """sha256 of a regular file of at most limit bytes, streamed; None otherwise."""
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError:
+        return None
+    try:
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode) or info.st_size > limit:
+            return None
+        digest = hashlib.sha256()
+        while chunk := os.read(descriptor, 1 << 20):
+            digest.update(chunk)
+        return digest.hexdigest()
+    finally:
+        os.close(descriptor)
+
+
+def measured_launch_problems(platform: str, profile: str, launch: LaunchRequest | None) -> list[str]:
+    """Why this launch is not the measured one (empty when it is exactly that)."""
+    scope = MEASURED_LAUNCHES.get(platform)
+    if scope is None:
+        return [f"no launch has been measured on {platform}"]
+    if launch is None:
+        return ["no launch request to compare with the measured launch"]
+    problems = list(launch.unit_problems)
+    selection = launch.selection
+    for label, got, want in (
+            ("execution profile", launch.execution_profile, scope.execution_profile),
+            ("permission mode", launch.permission_mode, scope.permission_mode),
+            ("relay", "a relay" if launch.relay else "none", "a relay" if scope.relay else "none"),
+            ("profile", profile, scope.profile),
+            ("model", selection.model if selection else None, scope.model),
+            ("effort", selection.effort if selection else None, scope.effort)):
+        if got != want:
+            problems.append(f"{label} {got} is not the measured {want}")
+    return problems
+
+
+def measured_runtime_problems(platform: str, runtime: list[str], path: str | None
+                              ) -> tuple[str | None, list[str]]:
+    """(claude, problems): the host, node and Claude must be the measured ones."""
+    scope = MEASURED_LAUNCHES[platform]
+    problems = []
+    release = os_release()
+    if (release.get("ID"), release.get("VERSION_ID")) != (scope.os_id, scope.os_version):
+        problems.append(f"the host is not {scope.os_id} {scope.os_version}")
+    if os.uname().machine != scope.machine:
+        problems.append(f"the machine is not {scope.machine}")
+    # The worker itself: root-held and unwritable, as the unit wrapper's bootstrap
+    # checks its whole tree before it starts this file.
+    problems += file_problems("worker", Path(os.path.realpath(__file__)), 0, Path("/"),
+                              executable=False)
+    node = Path(os.path.realpath(runtime[0]))
+    problems += file_problems("node", node, 0, Path("/"))
+    if file_sha256(node) != scope.node_sha256:
+        problems.append("node is not the measured node (sha256)")
+    found = shutil.which("claude", path=path) if path else None
+    if found is None:
+        return None, problems + ["claude is not on PATH"]
+    claude = Path(os.path.realpath(found))
+    problems += file_problems("claude", claude, 0, Path("/"))
+    if file_sha256(claude) != scope.claude_sha256:
+        problems.append("claude is not the measured Claude (sha256)")
+    return str(claude), problems
+
+
 def require_runtime(profile: str, prefix: Path | None, path: str | None,
                     credential: Path | None = None,
-                    forbidden: tuple[Path, ...] = ()) -> tuple[list[str], str, Credential]:
-    """Raise Blocked until a real launch has been measured.
+                    forbidden: tuple[Path, ...] = (),
+                    platform: str | None = None,
+                    launch: LaunchRequest | None = None) -> tuple[list[str], str, Credential]:
+    """Raise Blocked unless this is exactly a launch that has been measured.
 
-    The runtime and credential-file checks are real. Passing them only says
-    the inputs are in place: no launch of Claude with this policy and a bound
-    credential has been observed yet. Do not replace this with a flag.
-    While closed, the credential's metadata is checked but its token is never
-    read; an opened gate would return load_credential's result instead.
+    The runtime and credential-file checks are real. On a platform with a
+    measured launch (MEASURED_LAUNCHES; Linux only), the gate opens for that
+    one configuration: every field of launch must match, and the host, node
+    and Claude must be the measured files. Only then is the token read
+    (load_credential) and returned. Anything else is Blocked, with the token
+    unread: until those checks passed, only the credential's metadata is
+    looked at. On Linux the file-only prerequisites are checked too; nothing
+    is started for them (linux_execution_preflight is a separate, manual step).
     """
+    platform = sys.platform if platform is None else platform
     runtime = verify_runtime(prefix, path)
+    problems = platform_problems(Path(runtime[1]).parents[4], platform)
+    if problems:
+        raise Blocked(f"srt {SRT_VERSION} verified at {runtime[1]}, but this {platform} "
+                      "host cannot run it isolated: " + "; ".join(problems))
+    scope_problems = measured_launch_problems(platform, profile, launch)
+    if not SYSTEM_READ_MEASURED[platform] and scope_problems:
+        # Only the measured launch stands in for the unmeasured read set.
+        raise Blocked(
+            f"isolated launch is closed: srt {SRT_VERSION} verified at {runtime[1]}, "
+            f"but the {platform} system read set is not measured yet beyond the one measured "
+            "launch: " + "; ".join(scope_problems))
     if credential is None:
         raise Blocked(
             f"isolated launch is closed: srt {SRT_VERSION} verified at {runtime[1]}, "
             f"but no credential binding for {profile}")
     checked_credential(profile, credential, *forbidden)
-    raise Blocked(
-        f"isolated launch is closed: srt {SRT_VERSION} and the {profile} credential "
-        "file are checked, but no real launch has been measured with them")
+    if scope_problems:
+        raise Blocked(
+            f"isolated launch is closed: srt {SRT_VERSION} and the {profile} credential "
+            "file are checked, but no real launch has been measured with them: "
+            + "; ".join(scope_problems))
+    claude, problems = measured_runtime_problems(platform, runtime, path)
+    if problems:
+        raise Blocked("isolated launch is closed: this is not the measured runtime: "
+                      + "; ".join(problems))
+    return runtime, claude, load_credential(profile, credential, *forbidden)
 
 
 def build_environment(parent: dict[str, str], run_dir: Path,
-                      credential: Credential | None = None) -> dict[str, str]:
+                      credential: Credential | None = None,
+                      platform: str | None = None) -> dict[str, str]:
     """The child's environment: the allowlist, run paths and, only when given,
-    the checked credential. The relay never gets it (relay_environment)."""
+    the checked credential. The relay never gets it (relay_environment).
+    On Linux PATH is LINUX_PATH, so srt finds the bwrap, socat and rg that
+    linux_static_problems checked, never an earlier one on the parent's PATH."""
     environment = {name: parent[name] for name in INHERITED_VARIABLES if name in parent}
+    if (sys.platform if platform is None else platform) == "linux":
+        environment["PATH"] = LINUX_PATH
     environment["HOME"] = str(run_dir / "home")
     environment["TMPDIR"] = str(run_dir / "tmp")
     environment["CLAUDE_CONFIG_DIR"] = str(run_dir / "home/.claude")
@@ -464,10 +1013,37 @@ def build_environment(parent: dict[str, str], run_dir: Path,
     return environment
 
 
+def runtime_prefix(runtime: list[str] | None) -> Path | None:
+    """The srt prefix of a verify_runtime argv, or None for any other shape."""
+    if runtime is None or len(runtime) < 2:
+        return None
+    cli = Path(runtime[1])
+    tail = ("node_modules", *SRT_PACKAGE.split("/"), "dist", "cli.js")
+    if cli.parts[-len(tail):] != tail:
+        return None
+    return cli.parents[len(tail) - 1]
+
+
+def linux_link_targets(paths: list[str]) -> list[str]:
+    """Resolved targets of the entries that are symlinks, not already listed."""
+    targets = []
+    for path in paths:
+        target = os.path.realpath(path)
+        if target != path and target not in paths and target not in targets:
+            targets.append(target)
+    return targets
+
+
 def build_policy(input_dir: Path, run_dir: Path, claude: Path,
                  relay_port: int | None = None, model: bool = True,
-                 staged: StagedRun | None = None) -> dict:
+                 staged: StagedRun | None = None, platform: str | None = None,
+                 runtime: list[str] | None = None) -> dict:
     """srt settings using only keys documented in the sandbox-runtime README.
+
+    The system read paths are the platform's (system_read). On Linux srt runs
+    the pinned apply-seccomp inside bwrap, so the policy opens that one file,
+    found from runtime (the argv verify_runtime returned); without runtime it
+    is not opened and srt fails to start the command (measured, fail closed).
 
     The model endpoint is allowed only for a model run (model=False is the
     non-AI relay-only probe); the relay port only after its ready line checked.
@@ -476,7 +1052,20 @@ def build_policy(input_dir: Path, run_dir: Path, claude: Path,
     configuration path under run/home/.claude; srt 0.0.77 also refused
     renaming their parent directories (measured, test_oss_research_worker_skills).
     """
-    domains = list(ALLOWED_DOMAINS) if model else []
+    platform = sys.platform if platform is None else platform
+    read = list(system_read(platform))
+    targets = [str(input_dir), str(run_dir), str(claude)]
+    if platform == "linux":
+        read += linux_link_targets(read)
+        prefix = runtime_prefix(runtime)
+        if prefix is not None and os.uname().machine in SECCOMP_ARCHES:
+            read.append(str(apply_seccomp_path(prefix, os.uname().machine)))
+        # An allowRead over the run directory re-binds the writable areas under
+        # it read-only (srt 0.0.77 on Linux, measured); they stay readable as
+        # allowWrite paths, and policy/ and result/ stay unreadable to the child.
+        targets.remove(str(run_dir))
+    domains = list(ALLOWED_DOMAINS_LINUX if platform == "linux" else ALLOWED_DOMAINS) \
+        if model else []
     deny_write = [str(run_dir / "policy"), str(run_dir / "result")]
     if staged is not None:
         domains += staged.check().web_domains
@@ -485,10 +1074,10 @@ def build_policy(input_dir: Path, run_dir: Path, claude: Path,
                        for name in (*PROTECTED_CONFIG_DIRECTORIES, *PROTECTED_CONFIG_FILES)]
     if relay_port is not None:
         domains.append(f"127.0.0.1:{relay_port}")
-    return {
+    policy = {
         "filesystem": {
             "denyRead": ["/"],
-            "allowRead": [*SYSTEM_READ, str(input_dir), str(run_dir), str(claude)],
+            "allowRead": [*read, *targets],
             "allowWrite": [str(run_dir / name) for name in WRITABLE_AREAS],
             "denyWrite": deny_write,
         },
@@ -500,6 +1089,15 @@ def build_policy(input_dir: Path, run_dir: Path, claude: Path,
             "allowLocalBinding": False,
         },
     }
+    if platform == "linux":
+        policy["network"]["deniedResolvedAddresses"] = list(DENIED_RESOLVED_LINUX)
+        # srt starts its in-sandbox proxy as `socat` from PATH, but it binds a
+        # symlinked read entry at its target only, so Debian's /usr/bin/socat
+        # (-> socat1) is absent inside and the proxy never listens (measured).
+        # socatPath is in srt 0.0.77's settings schema (sandbox-config.js), not
+        # its README; measured to take effect: with it the proxy answers.
+        policy["socatPath"] = os.path.realpath(LINUX_TOOL_DIR / "socat")
+    return policy
 
 
 class RelayRequest(NamedTuple):
@@ -625,7 +1223,10 @@ def sandboxed(runtime: list[str], policy: Path, argv: list[str]) -> list[str]:
 
 
 def build_command(runtime: list[str], policy: Path, claude: str, prompt: str,
-                  permission_mode: str = DEFAULT_PERMISSION_MODE) -> list[str]:
+                  permission_mode: str = DEFAULT_PERMISSION_MODE,
+                  selection: Selection | None = None) -> list[str]:
+    """The read-only run's argv. selection, when given, adds --model and
+    --effort before the permission flags; without it the argv is unchanged."""
     if permission_mode not in PERMISSION_MODES:
         raise ValueError(f"permission mode must be one of {', '.join(PERMISSION_MODES)}")
     return sandboxed(runtime, policy, [
@@ -639,6 +1240,8 @@ def build_command(runtime: list[str], policy: Path, claude: str, prompt: str,
         "--no-chrome",
         "--disable-slash-commands",
         "--setting-sources", "",
+        "--settings", json.dumps(CHILD_SETTINGS),
+        *(selection.argv() if selection is not None else []),
         "--permission-mode", permission_mode,
         "--permission-prompts", "none",
         "--tools", READ_TOOLS,
@@ -658,7 +1261,8 @@ def staged_rules(staged: StagedRun) -> tuple[list[str], list[str]]:
 
 def build_staged_command(runtime: list[str], policy: Path, claude: str, prompt: str,
                          run_dir: Path, staged: StagedRun,
-                         permission_mode: str = DEFAULT_PERMISSION_MODE) -> list[str]:
+                         permission_mode: str = DEFAULT_PERMISSION_MODE,
+                         selection: Selection | None = None) -> list[str]:
     """The argv of a corpus-extract or deep-research run.
 
     It is build_command's argv without the profile's dropped flags, plus the
@@ -670,9 +1274,12 @@ def build_staged_command(runtime: list[str], policy: Path, claude: str, prompt: 
         raise ValueError(f"permission mode must be one of {', '.join(PERMISSION_MODES)}")
     spec = staged.check().spec
     allow, _ = staged_rules(staged)
-    base = build_command(runtime, policy, claude, prompt, permission_mode)
+    base = build_command(runtime, policy, claude, prompt, permission_mode, selection)
     head = base[:base.index("--permission-mode")]
     head = [argument for argument in head if argument not in spec.dropped]
+    # One --settings only: the staged settings file carries CHILD_SETTINGS.
+    at = head.index("--settings", head.index(claude))
+    head = head[:at] + head[at + 2:]
     extra = ["--settings", str(run_dir / "home/.claude/settings.json")]
     if spec.agents is not None:
         extra += ["--agents", str(run_dir / "policy/claude-agents.json")]
@@ -774,7 +1381,7 @@ def stage_research_config(run_dir: Path, staged: StagedRun) -> dict:
                       "sha256": write_staged(config / source.staged, data, 0o444)})
     allow, deny = staged_rules(staged)
     settings = json.dumps({"permissions": {"allow": allow, "deny": deny},
-                           "disableAllHooks": True}, indent=2).encode()
+                           "disableAllHooks": True, **CHILD_SETTINGS}, indent=2).encode()
     files.append({"source": None, "staged": "settings.json",
                   "sha256": write_staged(config / "settings.json", settings, 0o444)})
     record = {"profile": staged.profile, "source_root": str(staged.source_root.resolve()),
@@ -855,11 +1462,14 @@ class Supervisor:
         if reason not in self.failures:
             self.failures.append(reason)
 
-    def start(self, argv: list[str], environment: dict[str, str], cwd: Path) -> subprocess.Popen:
+    def start(self, argv: list[str], environment: dict[str, str], cwd: Path,
+              stdin=subprocess.DEVNULL) -> subprocess.Popen:
+        """stdin is /dev/null for the relay and the research child, so neither
+        holds a pipe of the parent's; only the Linux unit wrapper passes PIPE."""
         if self.remaining() <= 0:
             raise TimeoutError("deadline passed; no new process is started")
         process = subprocess.Popen(
-            argv, cwd=cwd, env=environment, stdin=subprocess.DEVNULL,
+            argv, cwd=cwd, env=environment, stdin=stdin,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
         self.processes.append(process)
         return process
@@ -947,7 +1557,7 @@ class Supervisor:
     def cleanup(self) -> None:
         """Kill every group, reap within CLEANUP_SECONDS, and record survivors.
 
-        Killed descendants may linger briefly as zombies of launchd, so a group
+        Killed descendants may linger briefly as zombies of init, so a group
         counts as surviving only if it still exists when the cleanup time is up.
         """
         for process in self.processes:
@@ -1056,6 +1666,11 @@ class ExposureScan:
         return None
 
     def file_holds(self, path: Path) -> bool:
+        # Only regular files hold data to scan. Sockets (srt puts its proxy
+        # sockets in run/tmp on Linux), FIFOs and devices are not opened: an
+        # open of a socket fails and would leave the scan incomplete (measured).
+        if not stat.S_ISREG(os.lstat(path).st_mode):
+            return False
         descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
         try:
             if not stat.S_ISREG(os.fstat(descriptor).st_mode):
@@ -1148,10 +1763,31 @@ def result_problems(exit_code: int | None, stdout: str) -> tuple[list[str], str 
     return problems, text
 
 
+def observed_models(stdout: str) -> list[str] | None:
+    """Model names the result JSON reports under modelUsage, if it has any."""
+    try:
+        usage = json.loads(stdout).get("modelUsage")
+    except (ValueError, AttributeError):
+        return None
+    if not isinstance(usage, dict) or not usage:
+        return None
+    return sorted(name for name in usage if isinstance(name, str))
+
+
+def prompt_sha256(prompt: str) -> str:
+    """sha256 (lowercase hex) of the validated prompt as the child gets it: the
+    text checked_input returned, UTF-8 encoded (the prompt file's own bytes:
+    checked_input decodes them strictly and keeps every newline). It is taken from that string,
+    never by reopening the file, so a later change to the file cannot move it.
+    It binds a result to its input; it is no evidence that a model ran."""
+    return hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+
+
 def collect(run_dir: Path, profile: str, exit_code: int | None,
             stdout: str, stderr: str, failures: list[str] = (),
             relay: dict | None = None, credential: Credential | None = None,
-            permission_mode: str | None = None, staged: dict | None = None) -> bool:
+            permission_mode: str | None = None, staged: dict | None = None,
+            selection: Selection | None = None, prompt_digest: str | None = None) -> bool:
     """Record the outcome. The report is data: it is never executed here.
 
     failures are the supervisor's reasons (timeout, output bound, relay
@@ -1205,6 +1841,16 @@ def collect(run_dir: Path, profile: str, exit_code: int | None,
     }
     if permission_mode is not None:
         manifest["permission_mode"] = permission_mode
+    if prompt_digest is not None:
+        manifest["prompt_sha256"] = prompt_digest
+    if selection is not None:
+        # What the user asked for. It is not what ran: observed_models comes
+        # only from the result itself, when it names models.
+        manifest["requested_model"] = selection.model
+        manifest["requested_effort"] = selection.effort
+    observed = observed_models(stdout)
+    if observed is not None:
+        manifest["observed_models"] = observed
     if staged is not None:
         manifest["execution_profile"] = staged["profile"]
         manifest["staged"] = staged
@@ -1230,7 +1876,9 @@ def collect(run_dir: Path, profile: str, exit_code: int | None,
 def run_supervised(input_dir: Path, run_dir: Path, profile: str, seconds: float,
                    relay: RelayLaunch | None, policy_for, command_for,
                    environment: dict[str, str], credential: Credential | None = None,
-                   permission_mode: str | None = None, stage=None) -> bool:
+                   permission_mode: str | None = None, stage=None,
+                   selection: Selection | None = None, prompt_digest: str | None = None,
+                   record=None) -> bool:
     """Start the relay (if any) and the sandboxed child under one deadline.
 
     policy_for(port) builds the policy once the relay's ready line checked out
@@ -1243,8 +1891,13 @@ def run_supervised(input_dir: Path, run_dir: Path, profile: str, seconds: float,
     argv or environment, or in the child's argv, nothing of that process starts.
     stage(run_dir), when given, stages the configuration after prepare_run and
     returns its record; a Blocked from it is recorded and the child never starts.
+    record, when given, replaces collect for a child that is no model run (the
+    non-AI collection entry): record(run_dir, exit_code, stdout, stderr,
+    failures, relay_record) -> bool. A model run always goes through collect.
     """
     require_profile(credential, profile)
+    if record is not None and credential is not None:
+        raise Blocked("a credential run is a model run; its result goes through collect")
     supervisor = Supervisor(seconds)
     port, relay_record, relay_process, exit_code = None, None, None, None
     staged_record = None
@@ -1297,9 +1950,12 @@ def run_supervised(input_dir: Path, run_dir: Path, profile: str, seconds: float,
         relay_record["stderr"] = text(supervisor.data["relay stderr"])
     if supervisor.failures:
         exit_code = None
+    if record is not None:
+        return record(run_dir, exit_code, text(supervisor.data["stdout"]),
+                      text(supervisor.data["stderr"]), list(supervisor.failures), relay_record)
     return collect(run_dir, profile, exit_code, text(supervisor.data["stdout"]),
                    text(supervisor.data["stderr"]), supervisor.failures, relay_record,
-                   credential, permission_mode, staged_record)
+                   credential, permission_mode, staged_record, selection, prompt_digest)
 
 
 def run_research(runtime: list[str], claude: str, prompt: str, input_dir: Path,
@@ -1307,8 +1963,12 @@ def run_research(runtime: list[str], claude: str, prompt: str, input_dir: Path,
                  relay: RelayLaunch | None, parent: dict[str, str],
                  permission_mode: str = DEFAULT_PERMISSION_MODE,
                  credential: Credential | None = None,
-                 staged: StagedRun | None = None) -> bool:
+                 staged: StagedRun | None = None,
+                 selection: Selection | None = None) -> bool:
     """The Claude run: model endpoint plus the relay port once it is ready.
+
+    A run with a credential is a live model run: it needs the user's explicit
+    selection (model and effort) and is Blocked before anything without one.
 
     Reached only past require_runtime, which is closed; tests call it directly.
     A credential of another profile is Blocked before anything is built.
@@ -1316,22 +1976,31 @@ def run_research(runtime: list[str], claude: str, prompt: str, input_dir: Path,
     profile's configuration is staged and its argv and policy are used.
     """
     require_profile(credential, profile)
+    if selection is not None:
+        selection.check()
+    elif credential is not None:
+        raise Blocked("a live run needs the user's explicit --model and --effort; "
+                      "no default is chosen")
     if staged is None:
         return run_supervised(
             input_dir, run_dir, profile, seconds, relay,
-            lambda port: build_policy(input_dir, run_dir, Path(claude), port),
+            lambda port: build_policy(input_dir, run_dir, Path(claude), port,
+                                      runtime=runtime),
             lambda policy_file: build_command(runtime, policy_file, claude, prompt,
-                                              permission_mode),
-            build_environment(parent, run_dir, credential), credential, permission_mode)
+                                              permission_mode, selection),
+            build_environment(parent, run_dir, credential), credential, permission_mode,
+            selection=selection, prompt_digest=prompt_sha256(prompt))
     staged.check()
     checked_staged_input(input_dir)
     return run_supervised(
         input_dir, run_dir, profile, seconds, relay,
-        lambda port: build_policy(input_dir, run_dir, Path(claude), port, staged=staged),
+        lambda port: build_policy(input_dir, run_dir, Path(claude), port, staged=staged,
+                                  runtime=runtime),
         lambda policy_file: build_staged_command(runtime, policy_file, claude, prompt,
-                                                 run_dir, staged, permission_mode),
+                                                 run_dir, staged, permission_mode, selection),
         build_environment(parent, run_dir, credential), credential, permission_mode,
-        lambda directory: stage_research_config(directory, staged))
+        lambda directory: stage_research_config(directory, staged), selection,
+        prompt_sha256(prompt))
 
 
 def positive_seconds(value: str) -> float:
@@ -1351,6 +2020,11 @@ def main() -> int:
                         help=f"local npm prefix holding {SRT_PACKAGE}@{SRT_VERSION}")
     parser.add_argument("--credential-file", type=Path,
                         help=f"<dir>/<profile>/{CREDENTIAL_NAME} made by the user")
+    parser.add_argument("--model",
+                        help="the model for the child, exactly as the user names it "
+                             "(passed to claude --model); no default")
+    parser.add_argument("--effort", choices=EFFORT_LEVELS,
+                        help="the effort for the child (passed to claude --effort); no default")
     parser.add_argument("--permission-mode", choices=PERMISSION_MODES,
                         default=DEFAULT_PERMISSION_MODE,
                         help="Claude permission mode for the child; auto only changes "
@@ -1373,6 +2047,12 @@ def main() -> int:
     parser.add_argument("--relay-response-byte-budget", type=int, default=64 * 1024 * 1024)
     parser.add_argument("--relay-timeout-seconds", type=float, default=30.0)
     arguments = parser.parse_args()
+    parent = dict(os.environ)  # read once; only allowlisted names reach any child
+    try:
+        guarded = parent_eof_guard(parent)
+    except Blocked as error:
+        print(f"OSS research worker blocked: {error}", file=sys.stderr)
+        return EXIT_BLOCKED
     try:
         input_dir, prompt = checked_input(
             arguments.input_dir, arguments.prompt_file, Path.home())
@@ -1381,6 +2061,10 @@ def main() -> int:
             arguments.relay_repo, arguments.relay_request_budget,
             arguments.relay_max_response_bytes, arguments.relay_response_byte_budget,
             arguments.relay_timeout_seconds) if arguments.relay_repo else None
+        if (arguments.model is None) != (arguments.effort is None):
+            raise ValueError("give --model and --effort together, or neither")
+        selection = Selection(arguments.model, arguments.effort).check() \
+            if arguments.model is not None else None
         if arguments.execution_profile == DEFAULT_EXECUTION_PROFILE:
             if arguments.web_domain:
                 raise ValueError("web domains are for the deep-research profile only")
@@ -1395,9 +2079,17 @@ def main() -> int:
         return EXIT_BAD_INPUT
     try:
         runtime, claude, credential = require_runtime(
-            arguments.profile, arguments.runtime_prefix, os.environ.get("PATH"),
-            arguments.credential_file, (input_dir, run_dir))
-        relay = relay_launch(relay_request, dict(os.environ)) if relay_request else None
+            arguments.profile, arguments.runtime_prefix, parent.get("PATH"),
+            arguments.credential_file, (input_dir, run_dir),
+            launch=LaunchRequest(arguments.execution_profile, arguments.permission_mode,
+                                 relay_request is not None, selection,
+                                 tuple(unit_problems(parent, guarded))))
+        # Past the gate a model run starts next: without the user's explicit
+        # model and effort it never does, and no default is picked.
+        if selection is None:
+            raise Blocked("a model run needs the user's explicit --model and --effort; "
+                          "no default is chosen")
+        relay = relay_launch(relay_request, parent) if relay_request else None
         if staged is not None:
             staged = staged._replace(source_root=reviewed_source_root(Path(__file__)))
     except (Blocked, OSError) as error:
@@ -1405,8 +2097,11 @@ def main() -> int:
         return EXIT_BLOCKED
     try:
         succeeded = run_research(runtime, claude, prompt, input_dir, run_dir, arguments.profile,
-                                 arguments.timeout, relay, dict(os.environ),
-                                 arguments.permission_mode, credential, staged)
+                                 arguments.timeout, relay, parent,
+                                 arguments.permission_mode, credential, staged, selection)
+    except Blocked as error:
+        print(f"OSS research worker blocked: {error}", file=sys.stderr)
+        return EXIT_BLOCKED
     except (OSError, subprocess.SubprocessError) as error:
         print(f"OSS research worker failed: {error}", file=sys.stderr)
         return EXIT_FAILED

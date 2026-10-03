@@ -61,7 +61,7 @@ EXTRACT_TAIL = """패턴의 기준:
 
 출력: 설명·코드펜스 없이 아래 형태의 JSON 객체 하나만 출력한다. 문자열 값은 한국어로 쓰되 quote 는 원문 그대로 둔다.
 {
-  "lens": "<이번 관점 이름>",
+  "lens": "<LENS_ID>",
   "patterns": [
     {
       "title": "짧은 이름",
@@ -210,8 +210,10 @@ def extract(digest_dir, out_dir, lenses):
                 + lens
                 + " — "
                 + LENSES[lens]
+                # The answer's "lens" is the machine id alone, never the description above.
+                + '\n출력의 "lens" 값은 정확히 "' + lens + '" 이다(설명 없이 이 식별자 그대로).'
                 + "\n\n"
-                + EXTRACT_TAIL
+                + EXTRACT_TAIL.replace('"<LENS_ID>"', '"' + lens + '"')
                 + "\n"
             )
             written.append(_write(prompts, "extract-" + lens + suffix + ".md", prompt))

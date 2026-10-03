@@ -235,6 +235,9 @@ probe가 fork한 자손이 `os.setsid()`에 **성공**했다. 그 자손은 stdo
 프로파일 아래에 있을 것으로 보지만, 이것은 확인하지 않았다. 완전한 정리를
 보장하지 못하므로 게이트는 닫힌 채 둔다. sudo나 다른 권한 우회는 쓰지 않았다.
 
+Linux(bubblewrap)에서는 이 자손이 srt의 PID namespace와 함께 죽을 것으로
+예상한다(「Linux (bubblewrap) 대응」). **미측정**이다. macOS의 FAIL은 그대로다.
+
 ### 환경 변수 (허용 목록)
 
 부모 환경에서 `PATH`, `LANG`, `LC_ALL`, `LC_CTYPE`, `TERM`만 넘긴다.
@@ -634,18 +637,189 @@ Linux 게스트 안의 별도 로그인(`.credentials.json`), API key·`apiKeyHe
    게이트는 토큰 내용을 읽지 않는다.
    아래 실제 시험 게이트를 통과한 뒤 여는 코드를 별도로 리뷰한다.
 
+## Linux (bubblewrap) 대응 — Debian 13 게스트 비AI 실측
+
+설계는 `docs/research/2026-09-28-189-linux-runtime-plan.md`에 있다. 실측 증거·명령·로그는
+`docs/research/2026-09-28-189-linux-isolation-evidence.md`에 있다. 2026-09-28 Lima VM
+`oss-research-debian`(Debian 13 arm64, bubblewrap 0.12.0)에서 조사 사용자 `ossresearch`로
+돌렸다. 게스트 전체 시험 240건 OK(skip 6)이고, cgroup·결과 회수 fixture도 통과했다.
+**모델 요청 경로는 측정하지 않았다**(게이트 닫힘).
+
+- **macOS 불변**: `SYSTEM_READ`(macOS 실측값), 정책 키, argv, 닫힌 게이트 메시지와
+  순서는 그대로다. `build_policy`·`build_environment`·`require_runtime`에 `platform`
+  인자(기본 `sys.platform`)가 붙었을 뿐이다.
+- **플랫폼별 읽기**: `system_read(platform)`. Linux `SYSTEM_READ_LINUX`는 실측값
+  `/usr/lib`, `/usr/bin/bash`, `/usr/bin/socat`, `/etc/hosts`다. 그 밖에 추가되는 것은 둘이다.
+  하나는 링크 항목의 대상(Debian `/usr/bin/socat1`)이다. 다른 하나는 `runtime`으로 찾은 고정
+  prefix의 `apply-seccomp` 한 파일이다(`build_policy(runtime=…)`). srt는 bwrap 안에서 명령을
+  bash로 돌리고 apply-seccomp를 실행한다. multiarch 디렉터리와 loader만으로는 bash가 뜨지
+  않았다. Linux에서는 **run 디렉터리를 읽기 목록에서 뺀다**. 넣으면 그 아래 쓰기 영역이
+  읽기 전용으로 덮인다(실측). 쓰기 영역은 allowWrite로 읽힌다. policy·result는 자식에게
+  보이지 않는다. 모델 요청 경로(TLS 루트 등)는 측정하지 않았으므로
+  `SYSTEM_READ_MEASURED["linux"] = False`다. `/etc` 전체, `/home`, `/tmp`, `/proc`,
+  `/usr/bin` 전체는 넣지 않는다(오프라인 시험이 고정한다). 알 수 없는 플랫폼은 `Blocked`다.
+- **Linux 네트워크 정책(오프라인 검증만, 게스트 미검증)**: 모델 endpoint를
+  `api.anthropic.com:443`으로 좁힌다(README `:port` 접미사). `network.deniedResolvedAddresses`에
+  `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`(Lima host gateway·DNS 포함), `100.64.0.0/10`,
+  `fc00::/7`을 둔다(README 키). srt는 loopback·link-local·metadata·자기 주소를 원래 거부한다.
+  macOS 정책은 실측된 형태 그대로다. srt·조사 child·relay·unit 환경에 `*_PROXY`가 없음을
+  시험으로 고정했다. srt 자체 환경에 proxy 변수가 있으면 parent proxy로 나가 resolved-address
+  검사가 빠지기 때문이다(README 「Resolved-address check」).
+- **`socatPath`(Linux만)**: srt는 링크 읽기 항목을 대상에만 bind한다. 그래서
+  `/usr/bin/socat`이라는 이름이 안에 없고 in-sandbox 프록시가 뜨지 않았다. 정책 최상위에
+  `socatPath`(해석된 socat)를 넣는다. srt 0.0.77 설정 schema 키이고 README에는 없다.
+  넣은 뒤 프록시 응답을 실측했다. macOS 정책 키는 README 키 그대로다.
+- **Linux 자식 PATH**: `build_environment`가 Linux에서 `PATH=/usr/bin:/bin`으로 고정한다.
+  srt는 bwrap·socat·rg를 PATH로 찾으므로, 검사한 바로 그 파일을 쓰게 한다.
+- **파일 검사 `linux_static_problems`** (프로세스를 띄우지 않는다. `require_runtime`이
+  `verify_runtime` 뒤에 부른다): 비root, WSL1 아님, `/usr/bin`의 `bwrap`·`socat`·`rg`가
+  root 소유 일반 파일이고 set-id·group/other 쓰기가 없음(심볼릭 링크는 대상을 검사),
+  srt prefix가 `/opt` 아래로 해석되고 그 안 전체가 root 소유이며 group/other 쓰기·특수
+  파일·prefix 밖으로 가는 링크가 없음, 이 아키텍처의 `apply-seccomp`가 링크가 아닌 root
+  소유 실행 파일. 도구·`apply-seccomp`·prefix 위의 **조상 디렉터리 전체**(적힌 경로와
+  해석된 경로 양쪽, `/`까지)도 root 소유·group/other 쓰기 없음이어야 한다. 쓰기 가능한
+  조상이 있으면 검사 뒤에 rename으로 바꿔치기할 수 있기 때문이다.
+  `user.max_user_namespaces`가 양의 정수, Debian식 `unprivileged_userns_clone`이
+  있으면 1, cgroup v2, `mountinfo`에 호스트 공유(virtiofs·9p·fuse.sshfs) 없음.
+  읽지 못한 파일은 문제로 센다. Ubuntu의 AppArmor userns 제한 값만으로는 거부하지
+  않는다(전용 profile이면 1이어도 된다). 판정은 실행 preflight가 한다.
+- **srt prefix 소유와 위치**: 게스트 root가 `/opt` 아래(예:
+  `/opt/oss-research/srt-0.0.77`)에 설치한 prefix만 받는다. 조사 uid는 실행만 하고
+  검사와 기동 사이에 바꾸거나 바꿔치기할 수 없어야 하기 때문이다. 조사 uid가
+  `npm ci`한 prefix, `/opt` 밖 prefix, `/opt` 안의 링크가 밖을 가리키는 prefix는
+  거부된다.
+- **실행 preflight `linux_execution_preflight(prefix, environ)`**: bwrap의
+  user·PID·net namespace + 새 `/proc` 조합, `apply-seccomp /bin/true`, AF_UNIX
+  대조군(밖에서 생성 성공 exit 0)과 apply-seccomp 아래 AF_UNIX(EPERM·EACCES만 exit 3,
+  EMFILE 같은 다른 오류는 exit 4로 실패)를 각각 5초 상한으로 띄운다. 조사 사용자
+  환경에 `SSH_AUTH_SOCK`이 있으면 실패다. **프로세스를 띄우므로 `main`은 부르지 않는다.**
+  게스트 task가 `RealLinuxPreflightTests`로 따로 부른다.
+- **게이트**: Linux에서는 파일 검사에 문제가 있으면 그 목록으로, 없으면 "system read
+  set is not measured yet"으로 `Blocked`(exit 3)다. 두 경우 모두 토큰을 읽지 않고
+  relay·조사 프로세스·run 디렉터리를 만들지 않는다
+  (`test_oss_research_worker_linux.LinuxClosedGateTests`).
+- **시험 플랫폼화**: runtime·supervisor·skills 시험은 `darwin`·`linux`에서 실행된다.
+  짧은 임시 경로(`/private/tmp`·`/tmp`), fixture 읽기 경로, Linux 경로 대체, 플랫폼별
+  거부 errno를 나눴다. Linux에서 거부로 세는 errno는 EPERM·EROFS·EBUSY다. ENOENT는
+  호스트에 그 경로(쓰기면 부모)가 있을 때만 센다. EACCES는 세지 않는다. 직접 TCP 거부는
+  같은 포트에 호스트에서 접속되는 대조군이 있어야 센다. rename의 EXDEV(바인드 마운트
+  경계)와 없는 denyWrite 경로 생성의 EEXIST(srt 읽기 전용 stub, 실행 뒤 잔여 없음 확인)도
+  센다. `/tmp` 쓰기는 srt 전용 tmpfs에 남고 호스트에 닿지 않음을 확인한다(격리된 쓰기).
+  Keychain, ICU 크래시, local binding 시험은 macOS 전용이다. 게스트에 git이 없어 git
+  push 시험은 skip이다.
+- **게스트 서비스**: resolved varlink와 D-Bus system bus socket은 srt 밖 조사 사용자는
+  connect할 수 있다(대조군). srt 안에서는 거부됐다(`GuestServiceTests`).
+- **cgroup 층**: `tests/fixtures/oss_research_worker/linux/cgroup_escape.py`가 먼저 유닛
+  없이 setsid 자손이 살아남는지 확인한다(대조군). 그다음 `systemd-run`
+  (`KillMode=control-group`) 유닛에서는 같은 자손이 남지 않음을 확인한다(3회 통과).
+- **unit wrapper(실행 경로 연결)**: `dot_local/bin/executable_oss-research-linux-run`. 게스트
+  관리자(root)가 실행하고, 고정 inner(제품 실행기 또는 비AI 검증 entry
+  `linux/unit_inner.py`)를 `systemd-run --wait --pipe --collect --uid=ossresearch
+  -p KillMode=control-group` 고정 argv로 한 unit에 넣는다. 실행기의 `parent_eof_guard`는
+  wrapper 종료(SIGKILL 포함) 때 stdin EOF로 unit 주 프로세스를 끝낸다. wrapper는 timeout·
+  SIGTERM/SIGINT 때도, 정상 종료 때도 항상 unit을 끝내고 unit 소멸·cgroup 소멸을 확인한다.
+  게스트 실측(정상·timeout·SIGTERM·wrapper SIGKILL·worker entry 닫힌 게이트) 5건 ×4회 통과는
+  리뷰 수정 **전** `3b26c50` 기준이다. 수정본(import 전 stdlib 신뢰 검사·PATH 제한·MemoryMax·정리
+  오류 보존·run lock·none 모드 idle 확인)과 `--egress pin` 통합(B egress-pin 호출, fixture TLS)의
+  게스트 재검증은 `docs/research/2026-09-28-189-cgroup-integration.md` 9절(E1·E2·E3)에 있다.
+  근거는 `docs/research/2026-09-28-189-cgroup-integration.md`에 있다. 실제 조사 실행은 아직
+  unit으로 돌리지 않았다(게이트 닫힘).
+- **결과 회수**: `linux/supervised_run.py`(실 srt + relay + 비AI probe)의 run/result를
+  호스트가 `limactl shell … tar` 스트림(상한 64 MiB)으로 받는다. `linux/verify_pickup.py`가
+  `data` filter로 풀고 파일 집합·manifest `succeeded`·`report.md` 해시를 확인한다.
+- **Linux setsid 시험**: 자손이 보고한 pid는 namespace pid라 `os.kill`로 판정하지
+  않는다. 자손 argv에 있는 고유 marker 경로를 호스트 `/proc/*/cmdline`에서 찾는다
+  (`processes_holding`). 먼저 살아 있는 대조 프로세스를 찾아 scan이 보이는지
+  확인한다. `/proc`를 읽지 못하거나 자기 자신이 안 보이면 "남은 프로세스 없음"이
+  아니라 오류다.
+
+## 모델·effort 전달 (계약만, live 미검증)
+
+- 근거: 고정된 Claude 2.1.283을 게스트 srt 안에서 `--help`로만 실행했다(허용 도메인 없음, 새 HOME, 인증·config·keychain 조회 없음, 모델 호출 없음). `--model <model>`(alias 또는 전체 이름)과 `--effort <level>`(`low, medium, high, xhigh, max`)이 있었다. 로그: `~/.oss-research-vm/logs/a189cg-claude-help-flags.log`(help 본문 sha256 `6bc118c7…d6f4`).
+- 입력: `--model`·`--effort`는 둘 다 주거나 둘 다 생략한다. model은 한 인자로 그대로 넘기는 opaque 문자열이다. 인쇄 가능 ASCII 1–128자이고 공백·제어문자·선행 `-`는 거부한다. `claude-opus-5-5[1m]` 같은 CLI 표현은 그대로 둔다(argv라 셸을 거치지 않는다). effort는 help enum이다. 실행기는 기본값을 고르지 않고 값을 바꾸지 않는다.
+- argv: `build_command`·`build_staged_command`는 값이 있을 때만 permission 플래그 앞에 `--model X --effort Y`를 넣는다. 없으면 argv가 이전과 byte 단위로 같다.
+- live 조건: main은 게이트를 지난 직후, relay나 child를 만들기 전에 두 값이 없으면 `Blocked`(exit 3)다. 게이트를 test double로 열어도 기본 모델로 호출되지 않는다(`SelectionGateTests`). `run_research`도 credential이 있는 run에서 selection이 없으면 시작 전에 `Blocked`다. 지금 main은 닫힌 게이트에서 exit 3이다. 값을 줘도 마찬가지다.
+- 노출 검사: credential 정확값 검사는 새 manifest 필드(`requested_*`)에도 적용된다. 값이 들어 있으면 manifest를 쓰지 않는다.
+- 기록: manifest의 `requested_model`·`requested_effort`는 요청값일 뿐이다. 실제 모델 성공을 뜻하지 않는다. 결과 JSON에 `modelUsage`가 있을 때만 `observed_models`를 따로 남긴다.
+- 값은 사용자가 나중에 준다. 전용 oauth-token 미확인 blocker는 그대로다.
+
+## 비AI 수집 entry (`executable_oss-research-collect`)
+
+조사 worker(`executable_oss-research-worker`의 `main`)와 수집 entry는 역할이 다른 별개 프로그램이다. unit wrapper에서는 `--entry worker|collect|verify`로 고른다.
+
+| | worker `main` | 수집 entry `collect` |
+|---|---|---|
+| 하는 일 | 격리된 Claude 조사 child(모델 호출) | 최근 닫힌 PR 수집(비AI): relay와 검토된 collector를 srt 안에서 실행 |
+| 게이트 | `require_runtime`: 측정된 launch 하나(Linux: Debian 13 aarch64, 측정 node·claude sha256, read-only, dontAsk, relay 없음, claude-profile2, claude-opus-5-5 medium, unit wrapper 안)만 열고 나머지는 닫는다. `SYSTEM_READ_MEASURED["linux"]`는 False다(`2026-09-28-189-linux-model-evidence.md` 11절) | 모델 gate와 무관하다. 모델·credential·profile·prompt·permission 인자와 코드 경로가 없다(시험이 확인). 그래서 모델 gate를 우회하는 수단이 될 수 없다 |
+| srt 정책 | `build_policy(model=True)`: 모델 endpoint, 모델 readset | `build_policy(model=False)`: relay loopback port만. 읽기는 Linux 시스템 집합과 수집 전용 집합(pinned python, collector의 `SKILL_REVISION_PATHS` 6개 파일, tz `UTC`와 대상) |
+| 재사용 | — | worker의 `relay_launch`·`build_policy`·`run_supervised`(모델 run이 아닐 때만 쓰는 `record` 인자)·`parent_eof_guard`·`verify_runtime`·`platform_problems`. 코드를 복제하지 않았다 |
+| 상한 | 사용자 선택 | 고정: PR 3개/저장소, 요청 예산 60(relay 예산도 같다), 명시 UTC 구간 31일 이하, relay 응답 4 MiB·총 64 MiB, 30 s |
+| 결과 | `result/manifest.json`, `report.md` 등 | `run/output`(corpus·collection-manifest·inventory·transport)과 `run/result`(manifest·relay.log·stderr.log·collection-envelope). 출력 파일은 regular·16 MiB 이하만 O_NOFOLLOW·비차단으로 읽어 hash한다 |
+| 회수 | `verify_pickup.py`(기본·auto 계약) | `verify_pickup.py --collect --collector-sha256 <호스트 검토 sha> --wrapper-record <root wrapper JSON> --upstream github-rest-via-relay|loopback-mock` |
+
+- upstream·base URL·proxy를 넘기는 CLI 옵션이나 env는 없다. relay는 api.github.com에만 간다.
+- 시험(`unit_inner.py collect`)은 같은 `run_collection`에 local mock upstream과 relay용 시험 `sitecustomize`만 옆에 둔다. 이때 envelope의 `upstream`은 `loopback-mock`이다. live 채택은 `--upstream github-rest-via-relay`를 요구하므로 mock 결과는 live로 받아지지 않는다.
+- 실측과 한계: `2026-09-28-189-linux-model-evidence.md` 10절. 실제 GitHub 조회와 relay→pin→api.github.com은 아직 실행하지 않았다.
+
+## 후보 verifier 읽기 entry (`executable_oss-research-candidate-reads`)
+
+후보 verifier(`verifying-open-source-contribution-candidates`)의 GitHub 읽기 두 단계, `discover`와 `locus-search`를 비AI로 격리 안에서 실행하는 entry다. 수집 entry(`collect`, `collect-issues`)와 같은 구조이고 모델 gate와 무관하다. unit wrapper에서는 `--entry candidate-reads`로 고른다(시험 fixture entry `verify`와 다르다). mock(loopback)으로만 검증했다. 실제 GitHub 조회와 익명 `/search/code` 응답은 측정하지 않았다.
+
+```text
+executable_oss-research-candidate-reads --out-dir OUT --input-dir IN --stage discover \
+    --repo OWNER/NAME --pattern PAT-001 [--pattern ...] [--max-candidates-per-repo 5] \
+    [--max-candidates-total 5] [--max-clues-per-pattern 5] [--request-budget 60] [--timeout 300]
+executable_oss-research-candidate-reads --out-dir OUT --input-dir IN --stage locus-search \
+    --repo OWNER/NAME [--clue TEXT ...] [--max-clues-per-locus 5] [--request-budget 60] [--timeout 300]
+```
+
+| | 계약 |
+|---|---|
+| 하는 일 | relay(`relay_launch`, 인증 없는 GET 허용목록)를 부모가 띄우고, srt 안에서 `executable_oss-research-relay-verify --require-proxy`가 검토된 verifier를 skills 디렉터리에서 경로로 불러 `discover` 또는 `locus-search`를 실행한다. srt의 loopback proxy로만 relay에 닿는다(직접 접속은 srt netns가 거부) |
+| 없는 것 | 모델·credential·profile·prompt·permission 경로, upstream·base URL·proxy 옵션, clone(`--allow-clone`·`--clone-root`·`--keep-clone`·`--fixture-dir`·`--api-version`을 넘기지 않는다), markdown 출력. 대상 저장소 코드는 실행하지 않는다(static 읽기만). 시험이 이것들을 고정한다 |
+| 정책 | `build_policy(model=False)`: relay loopback port 하나만 `allowedDomains`. 부모의 proxy·토큰 변수는 넘기지 않는다 |
+| 입력 | `--input-dir`는 단계가 정한 파일만 정확히 담는다: `discover`는 `analysis.json`, `locus-search`는 `discovery.json`과 `assessment.json`. 각 파일은 O_NOFOLLOW·비차단으로 여는 regular 파일, 4 MiB 이하, group·other 쓰기 불가, 중복 키·NaN 없는 JSON 객체다. 디렉터리도 group·other 쓰기 불가다. discover는 요청한 패턴이 분석에 있고 superseded가 아니어야 하고, locus-search는 discovery가 정확히 이 저장소 하나의 것이고 assessment가 그 discovery의 sha256에 묶여 있어야 한다 |
+| 고정 상한 | 대상 저장소 1개(relay는 소유자의 `.github` 저장소도 허용: verifier의 정책 읽기가 필요로 한다), 패턴 1~5개(`PAT-<n>`), 후보 `per repo`·`total` 각 1~5, 패턴당 단서 1~5, locus당 단서 1~5, `--clue` 5개 이하·각 200자 이하(따옴표·역슬래시·제어문자·가장자리 공백 없음), 요청 예산 1~60(relay도 같은 예산), timeout 1800 s 이하. 범위 밖 인자·입력은 **relay를 띄우기 전에** exit 2다 |
+| srt 읽기 집합 | Linux 시스템 집합 + 이 entry의 집합: pinned python, 어댑터가 옆에서 불러오는 `executable_oss-research-relay-collect`, verifier의 `REVISION_PATHS` 7개 파일(`SKILL.md`, `agents/openai.yaml`, `references/verification-contract.md`, `references/github-verification-contract.md`, `scripts/verify_candidates.py`, `tests/test_verify_candidates.py`, `tests/test_skill_contract.py`). **tz 파일은 필요 없다**(게스트에서 tz 없이 통과, 수집 entry와 다르다). 실행 때 verifier의 `REVISION_PATHS`를 **소스 텍스트(`ast`)에서** 읽어(verifier 코드는 부모에서 실행하지 않는다) 상수와 다르면 relay 전에 Blocked다. 상수가 verifier와 같은지는 시험이 고정한다. 목록에서 한 파일을 빼면 verifier가 출력 revision을 쓸 때 실패한다(게스트 사례 `drop-verifier-file`: exit 1, 출력 없음) |
+| 출력 | `OUT/run/output/`의 `discovery.json`(discover) 또는 `locus-search.json`(locus-search), `verification-manifest.json`, `transport.json`과 `OUT/run/result/`의 `manifest.json`(이 run), `relay.log`, `stderr.log`, `read-envelope.json`. envelope는 모든 파일과 **입력 파일**의 크기·sha256을 요청, child의 exit, relay의 ready sources에 묶는다. 출력은 regular·16 MiB 이하만 O_NOFOLLOW·비차단·fstat로 읽는다(링크·FIFO·디렉터리·거대 sparse 파일은 fail closed) |
+| 상태 | verifier의 exit 그대로다. 0은 `succeeded`(entry exit 0), 3은 `partial`(exit 5: 예산 소진, 익명 코드 검색 불가, 읽지 못한 원본), 그 밖은 `failed`(exit 4). 부모의 supervisor 실패가 있으면 항상 `failed`다. 모든 결과를 남기고 올리지 않는다 |
+| 회수 | `verify_pickup.py --candidate-reads --stage S --verifier-sha256 H --relay-issues-sha256 H --relay-sibling-sha256 H --wrapper-record R.json --upstream U`(S는 `discover` 또는 `locus-search`, U는 `github-rest-via-relay` 또는 `loopback-mock`). 호스트가 커밋 트리에서 계산한 sha256과 대조하고(verifier, relay가 읽는 issues·sibling), 요청 범위·예산·대상 저장소, 모든 요청의 delivery(`relayed` 또는 4xx·5xx를 받은 `upstream-error`), verifier가 소비한 요청 수, envelope 크기·sha, 출력 revision(호스트 verifier의 `compute_revision()`), 입력 sha, 후보·단서 상한, upstream 구분을 본다. mock 결과를 live로 요구하면 FAIL이다 |
+
+- 호스트 offline 시험: `tests/test_oss_research_candidate_reads.py`(실 relay와 실 adapter를 loopback mock에 붙여 만든 산출물을 한 member씩 고쳐 반례를 만든다. srt 없이 돌아 transport가 `direct`이므로 pickup 시험은 그 한 줄을 `srt-proxy`로 바꾼 member로 한다).
+- 게스트 사례: `tests/fixtures/oss_research_worker/linux/candidate_reads_cases.sh`(`--egress none`, loopback mock). 실제 api.github.com을 대상으로 한 실행은 없다. 이름 해석만으로도 DNS 질의가 나갈 수 있어서다.
+- 이 entry는 verifier가 읽는 근거만 모은다. 후보 판정(`record`)·`recheck`·`render`는 하지 않는다. 입력의 분석 산출물은 지금 synthetic fixture이고 실제 패턴은 아직 없다.
+
+## 시계 검사 (unit wrapper의 실행 전 조건)
+
+Linux 게스트(Lima/VZ)는 호스트 Mac이 잠자는 동안 **시스템 시계가 멈추고** RTC(`rtc-efi`, 호스트의 시각)는 계속 간다. 게스트에서 NTP에는 닿지 못하므로(조사·resolver uid의 송신이 막혀 있다) `systemd-timesyncd`는 동기화하지 못한다. 2026-10-02에 시스템 시계가 RTC보다 7시간 1분, 19분 46초 늦은 일이 두 번 있었다(`2026-10-02-189-isolation-acceptance-matrix.md` 9절 3, 11절). 시계가 틀리면 실제 모델 호출·TLS 인증서 검증·pin lease 판단이 어긋나므로 `executable_oss-research-linux-run`이 **모든 entry(`worker`·`collect`·`collect-issues`·`candidate-reads`·`verify`)와 모든 egress 모드**에서 실행 전에 시계를 대조한다. 새 네트워크 허용(NTP), nft·timesyncd 설정 변경은 쓰지 않는다.
+
+| | 계약 |
+|---|---|
+| 시점 | bootstrap(신뢰 검사)과 run lock 획득 뒤, **unit·pin·relay·자격보다 먼저**. lock을 쥔 채 하므로 다른 run이 중간 상태를 보지 않는다 |
+| 비교 | RTC(`/sys/class/rtc/rtc0/since_epoch`, 정수 초, 최종 경로를 따라가지 않고 열어 64 B까지 읽고 양의 정수만 받는다)와 `time.time()`의 차이(시스템 − RTC) |
+| 허용 오차 | **5초**(`CLOCK_TOLERANCE_SECONDS`). 근거: RTC가 정수 초이고 두 읽기가 원자적이지 않아 정상일 때도 최대 1.5초쯤 차이가 나고, 시계가 영향을 주는 가장 짧은 시간(pin lease 60초, relay 요청 기한 30초)보다 한 자리 작다. 안이면 아무것도 하지 않는다(`action: none`) |
+| 재설정 | 5초를 넘으면 `/usr/bin/date -u -s @<RTC>`(고정 argv, 고정 환경 `LC_ALL=C`·`PATH=/usr/bin:/bin`, 10초 timeout, shell 없음)로 시스템 시계를 RTC에서 다시 맞춘 뒤 RTC와 다시 읽어 허용 오차 안인지 확인한다(`action: resynced`). 네트워크 요청 없음 |
+| Blocked 조건 | 모두 exit 3(`EXIT_BLOCKED`)이고 **아무것도 시작하지 않는다**: `rtc-unreadable`(RTC를 읽지 못함, 값이 정수가 아님, 재설정 뒤 다시 읽기 실패), `offset-too-large`(차이가 7일 초과: RTC 자체를 의심, 재설정하지 않는다), `resync-failed`(프로그램 실패·timeout), `still-off-after-resync`(맞춘 뒤에도 허용 오차 밖). 조용히 진행하는 fallback은 없다 |
+| 신뢰 | 재설정 프로그램 `CLOCK_SET_PROGRAM`은 `nft`·`systemd-run`과 같은 `trusted_file` 검사 대상이다(절대 경로, 링크 아님, root 소유, group·other 쓰기 불가, set-id 아님, 두 철자의 상위 디렉터리 전부 닫힘). 하나라도 어긋나면 worker를 import하기 **전에** bootstrap에서 Blocked다. PATH 탐색·사용자 인자·환경 변수로 바꿀 수 없다(시계 관련 옵션·변수 없음, 시험이 고정) |
+| 증거 | wrapper record의 `clock`: `checked_at`(RTC 시각), `tolerance_seconds`, `offset_before`(시스템 − RTC, 초), `action`(`none`/`resynced`/`blocked`), `offset_after`, `reason`(Blocked일 때). Blocked일 때는 `unit: null`, `failures: ["clock-guard: <reason>"]`인 record가 stdout에 한 줄 나가고 stderr에 고정 문구가 나간다. 이 record는 이미 있는 Blocked 규칙(exit 3, 시작 전)을 따른다 |
+| 끝난 뒤 | 같은 record의 `clock.after_run`에 끝난 뒤의 차이(`offset`, `within_tolerance`, `error`)를 남긴다. **읽기만 하고 시계를 맞추지 않으며 실행 결과·`failures`·exit code를 바꾸지 않는다**: 호스트 pickup이 `failures == []`를 성공의 조건으로 쓰므로 환경 변화로 이미 끝난 실행을 실패로 뒤집으면 기존 판정 규칙이 깨진다. 허용 오차를 넘었으면 `within_tolerance: false`로 표시하고, 그 run의 시각 의존 증거는 의심해야 한다 |
+
+**한계**: ① 이 검사는 **실행이 시작될 때**의 시계만 맞춘다. 실행 도중 호스트가 잠들어 시계가 다시 멈추면 막지 못하고, `after_run`에 표시될 뿐이다(호스트가 잠들지 않게 하는 것은 호스트 쪽 일이다). ② 한 번에 최대 7일까지만 맞춘다. ③ RTC가 UTC라는 가정(`RTC in local TZ: no`)과 RTC가 호스트 시각이라는 가정에 기댄다. ④ 허용 오차 5초 안의 어긋남은 그대로 둔다. ⑤ NTP 동기화는 하지 않으므로 게스트의 `System clock synchronized`는 계속 `no`다. ⑥ 시스템 시계를 앞이든 뒤든 RTC로 바꾸므로 그 사이에 이미 있는 파일의 mtime과 순서가 어긋날 수 있다(게스트에서 실행 중인 다른 run이 없다는 run lock 아래에서만 한다).
+
+시험: `tests/test_oss_research_clock_guard.py`(주입한 시계·RTC·재설정으로 오차 안, 재설정 성공, 맞춘 뒤에도 어긋남, RTC 읽기 실패, 재설정 실패, 오차 과대, untrusted 프로그램, 모든 entry×egress에서 Blocked일 때 `launch`·unit·pin 확인이 호출되지 않음, 끝난 뒤 표시), 게스트 사례 `tests/fixtures/oss_research_worker/linux/clock_guard_cases.sh`(실제로 시계를 과거로 돌린 뒤 wrapper 실행).
+
 ## 미구현과 미증명의 구분
 
-아래 스킬·Agent 행의 구성기 구현은 PR #226(`lee-kyu-hwan/189-research-skill-runtime`, 별도 브랜치)의
-검증 결과다. 이 #82 checkout에는 그 구성기 코드가 아직 통합되지 않았고, main을 통해
-순차 통합한다. 실제 모델로는 검증하지 않았다. 승인된 오프라인 개발은 착수마다 ask하지
+아래 스킬·Agent 행의 구성기 구현은 PR #226으로 **MERGED**(main `f723ee3`)됐다. #82
+워크플로·통합 시험은 PR #225로 **MERGED**(main `08910e6`)됐다. 둘 다 이 브랜치의 기준
+(`origin/main` `08910e6`)에 들어 있다. 병합은 이슈 수락이 아니다. 실제 모델로는 검증하지 않았다. 승인된 오프라인 개발은 착수마다 ask하지
 않지만, live gate(실제 환경 구성·인증·live 실행)는 닫힌 채 유지한다.
 
 | 기능 | 코드 상태 | live 증거 | 독립 구현 계획(제안) |
 |---|---|---|---|
 | 스킬·Agent(deep-research) | **닫힌 게이트 뒤 구성기**. `read-only`는 그대로다. `corpus-extract`·`deep-research` 프로필이 도구 표면, 검토된 원본 staging(hash pin, manifest), staged 경로 `denyWrite`, 수거 때 변경 검사를 만든다(「조사 스킬 실행 구성」) | 없음. staged 변경 거부는 실제 srt 비AI probe만 | ① 도구 목록 확정(계약 문서). ② 구성기 완료(오프라인 + srt probe). ③ live에서 staged 로드·자식 경계(계약 §3.2, R1~R5)를 판정한다. ④ WebFetch 도메인과 relay 후보는 사용자·조정자 결정이다 |
 | 인증 sentinel 바인딩 | **닫힌 게이트 뒤 최소 준비**. 게이트는 메타데이터만 검사. 게이트 뒤 `load_credential`(1회 읽기)·자식 환경 전달·시작 전 argv/relay 거부·수거 노출 검사가 있고 가짜 sentinel 오프라인 시험만 있다(`test_oss_research_worker_auth.py`) | 없음(sentinel 파일만) | ① 완료(오프라인). ② 가짜 토큰으로 실제 Claude가 명시적 인증 실패를 내는지 실측한다. 모델 도메인 접속이 필요하므로 조정자 승인 후에 한다. ③ 사용자가 발급한 실제 토큰으로 1회 호출하는 것은 사용자 단계다 |
-| auto CLI 선택 | **CLI 준비만**. `--permission-mode dontAsk|auto`(기본 `dontAsk`)를 `build_command`에 넘긴다. 도구 표면은 같다 | 없음. auto로 AI를 실행하지 않아 auto 차단은 미검증 | ① 완료(오프라인). ② auto에서 위 차단 시험을 Claude 도구 경로로 반복한다. OS 경계는 srt가 맡으므로 auto에서도 같아야 하지만 실측 전에는 주장하지 않는다 |
+| auto CLI 선택 | **CLI 준비만**. `--permission-mode dontAsk|auto`(기본 `dontAsk`)를 `build_command`에 넘긴다. 도구 표면은 같다 | Linux 1회: mode 적용은 관찰했지만 모델 자동 전환으로 FAIL이다. OS 차단 증거는 없다(`2026-09-28-189-linux-model-evidence.md`) | ① 완료(오프라인). ② auto에서 위 차단 시험을 Claude 도구 경로로 반복한다. OS 경계는 srt가 맡으므로 auto에서도 같아야 하지만 실측 전에는 주장하지 않는다 |
 | Claude 바이너리 기동 | 정책에 필요한 읽기 경로 반영 | `--version`·`--help`만 | 모델 요청 경로의 추가 읽기·네트워크 요구는 인증 단계에서 측정한다 |
 
 ## 검증 상태
@@ -663,7 +837,9 @@ Linux 게스트 안의 별도 로그인(`.credentials.json`), API key·`apiKeyHe
 | 정책 부재·손상 fail closed | PASS (실측) | 알 수 없는 키는 무시되는 한계 있음 |
 | 결과 수거·타임아웃·보고서 비실행 | PASS (mock) | `CollectTests` 12건 |
 | supervisor: 한 deadline·출력 상한·ready 검증·실패 원인·두 그룹 정리 | PASS (오프라인 fake + 실제 srt 비AI probe) | `test_oss_research_worker_supervisor.py` 29건. 실제 srt 3건: relay 경유 조회 성공과 나머지 거부, 무응답 upstream에서 deadline 종료, setsid 관찰. 실제 srt 성공 manifest는 probe가 낸 result 모양 JSON이다. 모델 결과가 아니다 |
-| supervisor: setsid 탈출 자손 정리 | **FAIL(제한)** | srt 안에서 setsid 성공, 자손 생존. 실패는 기한 안에 기록됨 |
+| supervisor: setsid 탈출 자손 정리 | **FAIL(제한, macOS)** / Linux **PASS(실측)** | macOS: srt 안에서 setsid 성공, 자손 생존. 실패는 기한 안에 기록됨. Linux(Debian 게스트): PID namespace로 정리됨(`/proc` 대조 scan). cgroup 유닛 fixture도 통과 |
+| Linux 분기(정책·파일 검사·실행 preflight·닫힌 게이트) | PASS (오프라인 fake + Debian 게스트 실측) | `test_oss_research_worker_linux.py`, `RealLinuxPreflightTests`. 증거 `docs/research/2026-09-28-189-linux-isolation-evidence.md` |
+| Linux 비AI 격리(파일·환경·socket·네트워크·relay·staged·fail closed·결과 회수) | PASS (실측, Debian 게스트) | 같은 증거 문서. 모델 경로 읽기 집합, Linux `allowLocalBinding`, git 경로는 미검증 |
 | 인증 파일 형태 검사 | PASS (오프라인, sentinel) | `CredentialTests` 7건. 실제 토큰·바인딩 미검증 |
 | 닫힌 게이트의 토큰 비읽기 | PASS (오프라인) | `ClosedGateTests`(auth): `os.read`·`load_credential` 없이 Blocked, 두 모드 모두 `main` exit 3·프로세스 없음 |
 | 게이트 뒤 인증 전달·노출 검사 | PASS (오프라인, sentinel·fake 자식) | `test_oss_research_worker_auth.py` 29건. 다른 프로필 credential은 시작 전 Blocked, 목록 불가 디렉터리는 검사 미완료 실패, 자식 환경에만 전달, argv·relay 거부, stdout·JSON escape·보고서·stderr·relay log·영역 파일·이름 노출 시 실패와 결과 미저장, 검사 상한 fail closed. 인코딩된 값은 못 찾는 한계 있음. 실제 Claude 인증 미검증 |
@@ -672,11 +848,13 @@ Linux 게스트 안의 별도 로그인(`.credentials.json`), API key·`apiKeyHe
 | lock 재현 | PASS (실측, 오프라인 캐시) | 커밋한 lock으로 `npm ci` → 같은 트리. node·OS·Claude 바이너리 무결성은 미검증 |
 | Keychain | **미검증(부분 관찰)** | 파일형 fixture는 파일 deny로만 막힘. srt 0.0.77 README 키에 mach-lookup 거부가 없고, 이 머신에서 시험한 중첩 두 방향은 EPERM. 로그인·XPC 경로 미증명. 계정 분리·VM은 시험하지 않은 별도 경로 |
 | Claude 실행 파일 기동 | PASS (실측, 기동만) | `--version`·`--help` exit 0, 네트워크·인증 없음. 모델 요청 미검증 |
-| 정상 조사(모델 호출·결과 반환) | 미검증 | 모델 호출 안 함 |
+| 정상 조사(모델 호출·결과 반환) | Linux dontAsk **1회 PASS(격리 모델 gate)**. 제품 gate는 그 측정 launch 하나에 한해 열림(`2026-09-28-189-linux-model-evidence.md` 11절, 제품 경로 실제 호출은 아직 없음) / 실제 조사 미검증 | Debian 게스트, root wrapper + `--egress pin`, `claude-profile2`·`claude-opus-5-5`·medium, 고정 답 `OK`. 요청 모델과 관찰 모델이 같다. `2026-09-28-189-linux-model-evidence.md` 3절. OSS 조회와 relay는 하지 않았다 |
 | staged 프로필 인자·정책·manifest | PASS (오프라인) | `test_oss_research_worker_skills.py`: read-only argv·정책 불변, 프로필별 도구·규칙, 도메인 검사(GitHub 계열 거부), pin 불일치·누락·symlink(파일·디렉터리·root) Blocked, 설치본 Blocked, 입력의 Claude 설정 거부, 부모 비밀 비상속, 수거 때 변경 실패, `main` 모든 프로필 exit 3 |
 | staged 설정 보호 | PASS (실측, 비AI probe) | `StagedBoundaryTests` 2건. 상위 디렉터리 rename·삭제 포함 변경 거부, `output/` 쓰기 허용. denyWrite를 뺀 대조군은 실패 |
+| unit wrapper의 시계 검사 | PASS (오프라인 + 게스트 실측) | 시스템 시계를 과거로 돌리고 wrapper를 실행하면 재동기되고(record `resynced`), 재설정 프로그램을 쓸 수 없게 한 반례와 오차 과대에서는 Blocked로 아무것도 시작하지 않는다. 실행 도중의 호스트 잠자기는 막지 못한다(위 「시계 검사」). `2026-10-02-189-isolation-acceptance-matrix.md` 13절 |
+| 후보 verifier 읽기 entry(`candidate-reads`) | PASS (mock) / 실제 조회 미검증 | 호스트 offline 22건, 게스트 사례(`--egress none`, loopback mock): discover complete·partial, locus-search, 읽기 집합 항목 누락·verifier 누락·어댑터 의존 누락, 대상 route 없음, 무응답, 쓰기 메서드 거부, proxy 없는 직접 접속, 부모 EOF, 인자·입력 거부(relay 전), unit 밖 Blocked. 실제 GitHub 조회·익명 `/search/code`·모델과의 연결은 미검증. `docs/research/2026-10-02-189-isolation-acceptance-matrix.md` |
 | 스킬·서브에이전트 호환성 | 미검증 | 구성기만 있다. Claude가 staged 스킬·워크플로를 로드해 실행하는지, 자식 경계는 live 필요 |
-| auto 모드 | 미검증 | AI를 실행하지 않았다. 실행기 기본은 `dontAsk`이고 `auto`는 CLI 인자 준비만 했다 |
+| auto 모드 | **FAIL(1회 관찰) / OS gate INSUFFICIENT** | Linux 1회(관찰용 stream-json). init `permissionMode=auto`는 관찰했다. CLI가 refusal(cyber) 뒤 세션 전체를 `claude-opus-4-8`로 자동 전환했다(A-V4 FAIL). decoy 시도는 모두 Claude `--restricted` 층이 거부해 OS 증거가 없다(SKIP). 같은 문서 4절 |
 
 ## 남은 실제 시험 게이트
 
@@ -685,9 +863,15 @@ Linux 게스트 안의 별도 로그인(`.credentials.json`), API key·`apiKeyHe
 1. **Claude 모델 요청 경로**: 기동(`--version`·`--help`)은 확인했다. `--print`로
    요청을 보낼 때 추가 읽기 예외나 `localhost` 프록시 해석이 Bun에서 되는지는
    미측정이다. 가짜 인증으로 명시적 실패가 나는지 먼저 본다.
+   Linux(Debian 게스트)에서는 dontAsk 1회로 요청 경로가 동작하는 것을 관찰했다.
+   읽기 집합이 최소인지는 측정하지 않았고 `SYSTEM_READ_MEASURED["linux"]`는 그대로다.
+   가짜 토큰 401 시험은 공개 endpoint 대상이라 하지 않았다.
 2. **인증 바인딩**: 인증 방식을 먼저 고른다(「인증」). 그 방식으로 정상 모델 호출 1회. 만료·잘못된
    토큰에서 명시적 실패. 토큰이 argv·로그·결과에 남지 않는지 확인한다. 전달
-   방식과 노출 범위는 사용자 결정이다.
+   방식과 노출 범위는 사용자 결정이다. Linux에서는 사용자가 승인한 전용 파일을
+   run 전용 tmpfs로 넘겨 정상 호출 1회를 했다. 로그와 결과에서 토큰은 0회
+   나왔다(`2026-09-28-189-linux-model-evidence.md`). 만료·잘못된 토큰의 실패 시험은
+   하지 않았다.
 3. **Keychain**: srt 0.0.77 README 키에는 mach-lookup 거부 키가 없고, 이 머신에서
    시험한 별도 Seatbelt deny 프로파일의 중첩 두 방향은 `sandbox_apply` EPERM이었다.
    그 범위에서는 srt 설정만으로 막지 못했다(다른 방식의 불가능 증명은 아니다).
@@ -704,8 +888,11 @@ Linux 게스트 안의 별도 로그인(`.credentials.json`), API key·`apiKeyHe
    남은 것: setsid 탈출 자손의 정리(「제한: setsid 탈출」).
 5. **스킬·Agent 호환성**: deep-research가 요구하는 도구 표면을 격리 안에서 실제로
    수행한다. 도구를 꺼서 성공 판정하지 않는다.
-6. **auto**: `--permission-mode auto` 인자는 준비됐다. 위 차단 시험을 auto
-   모드에서 반복한다. 미지원·폴백 동작도 기록한다.
+6. **auto**: `--permission-mode auto` 인자는 준비됐다. Linux 1회 실행에서 폴백을
+   관찰했다. CLI가 refusal 뒤 `claude-opus-4-8`로 세션 전체를 전환했다. 이 전환을
+   막을 방법이 정해지기 전에는 auto를 쓰지 않는다. decoy 시도는 Claude `--restricted`
+   층에서 먼저 거부됐다. OS 경계는 기존 비AI 증거로 판단한다
+   (`2026-09-28-189-linux-model-evidence.md`).
 7. **알 수 없는 정책 키**: srt가 무시하므로 실행기가 만든 정책의 키 집합을
    문서화된 키로 고정한다(오프라인 계약 시험). 상위 버전으로 올릴 때 재실측한다.
 

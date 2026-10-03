@@ -1,4 +1,4 @@
-"""Observe the OSS worker's srt policy with the real sandbox runtime on macOS.
+"""Observe the OSS worker's srt policy with the real sandbox runtime (macOS, Linux).
 
 Run explicitly against the pinned local install (never a global one):
 
@@ -16,6 +16,12 @@ here is the runner's build_policy plus the read paths the fixture's own
 interpreter and git need (FIXTURE_READ). A test named ..._not_blocked records a
 gap the runtime leaves open; it passes when the gap is observed as documented.
 Without the variable every test is skipped, which is not evidence of anything.
+
+On Linux (bubblewrap) the expectations were measured on the Debian 13 guest
+(2026-09-28, docs/research/2026-09-28-189-linux-isolation-evidence.md). A denial is accepted by
+errno only beside a host-side control that the same path or port is reachable
+outside the sandbox, and the macOS-only cases (Keychain, ICU crash, local
+binding) are skipped there.
 """
 
 import hashlib
@@ -45,8 +51,30 @@ LOADER.exec_module(worker)
 
 PREFIX = os.environ.get("OSS_RESEARCH_SRT_PREFIX")
 PYTHON = str(Path(sys.executable).resolve())
-GIT = shutil.which("git", path="/opt/homebrew/bin")
-FIXTURE_READ = [str(Path(sys.base_prefix).resolve()), "/opt/homebrew"]
+LINUX = sys.platform == "linux"
+BASE_PREFIX = str(Path(sys.base_prefix).resolve())
+if LINUX:
+    SHORT_TMP = "/tmp"
+    GIT = shutil.which("git", path="/usr/bin")
+    # The system python's library is under /usr/lib (SYSTEM_READ_LINUX); a
+    # python elsewhere brings its prefix. Unmeasured.
+    FIXTURE_READ = [PYTHON] + ([] if BASE_PREFIX.startswith("/usr") else [BASE_PREFIX])
+    OPENSSL_CONFIG = "/etc/ssl/openssl.cnf"
+else:
+    SHORT_TMP = "/private/tmp"
+    GIT = shutil.which("git", path="/opt/homebrew/bin")
+    FIXTURE_READ = [BASE_PREFIX, "/opt/homebrew"]
+    OPENSSL_CONFIG = "/private/etc/ssl/openssl.cnf"
+# /bin/echo is not in the Linux read set; bash (which is) prints instead.
+ECHO = ["/usr/bin/bash", "-c", "echo RAN"] if LINUX else ["/bin/echo", "RAN"]
+# Linux denial errnos (measured on the Debian guest): bubblewrap refuses with a read-only mount,
+# a pinned directory, seccomp's EPERM or a tmpfs that hides the path. ENOENT
+# counts only when the host shows the path (or a write's parent) exists.
+# EACCES is never counted: plain file permissions give it outside srt too.
+LINUX_DENIED = {"Operation not permitted", "Read-only file system", "Device or resource busy",
+                # A rename across srt's bind mounts (measured on the Debian guest).
+                "Invalid cross-device link"}
+LINUX_HIDDEN = "No such file or directory"
 SECURITY = "/usr/bin/security"
 # /usr/bin/security links system frameworks the runner's policy keeps closed.
 SECURITY_READ = [SECURITY, "/System/Library/Frameworks", "/System/Library/PrivateFrameworks"]
@@ -65,8 +93,16 @@ SRT_VARIABLES = {
     "CLOUDSDK_PROXY_TYPE", "CLOUDSDK_PROXY_USERNAME", "GIT_CONFIG_PARAMETERS",
     "GIT_SSH_COMMAND", "JAVA_TOOL_OPTIONS", "SANDBOX_RUNTIME",
 }
+if LINUX:
+    # wrapCommandWithSandboxLinux's own --setenv names (srt 0.0.77).
+    SRT_VARIABLES |= {"CLAUDE_CODE_HOST_HTTP_PROXY_PORT", "CLAUDE_CODE_HOST_SOCKS_PROXY_PORT",
+                      "SRT_OBSERVE_SOCK", "SRT_ENCODED_CMD"}
 # Added by the shell/OS on every process start.
 PROCESS_VARIABLES = {"PWD", "SHLVL", "_", "__CF_USER_TEXT_ENCODING"}
+if LINUX:
+    # Python's C-locale coercion (PEP 538) sets it when LANG's locale is not
+    # installed, as on the Debian guest; the parent environment has none.
+    PROCESS_VARIABLES |= {"LC_CTYPE"}
 
 
 def sha256(path):
@@ -109,8 +145,14 @@ def serve():
     return server
 
 
-@unittest.skipUnless(PREFIX and sys.platform == "darwin",
-                     "set OSS_RESEARCH_SRT_PREFIX to the pinned srt install (macOS)")
+def host_shows(path):
+    """The control for a Linux ENOENT: the path, or a write's parent, exists here."""
+    path = Path(path)
+    return path.exists() or path.parent.is_dir()
+
+
+@unittest.skipUnless(PREFIX and sys.platform in ("darwin", "linux"),
+                     "set OSS_RESEARCH_SRT_PREFIX to the pinned srt install (macOS, Linux)")
 class RuntimeFixture(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -118,7 +160,7 @@ class RuntimeFixture(unittest.TestCase):
 
     def setUp(self):
         # Unix socket paths must stay under 104 bytes, so not the scratchpad.
-        self.root = Path(tempfile.mkdtemp(prefix="osrw-", dir="/private/tmp")).resolve()
+        self.root = Path(tempfile.mkdtemp(prefix="osrw-", dir=SHORT_TMP)).resolve()
         self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
         self.sentinel = f"oss-runtime-sentinel-{uuid.uuid4().hex}"
         self.tag = uuid.uuid4().hex
@@ -136,7 +178,8 @@ class RuntimeFixture(unittest.TestCase):
         self.run_dir = self.root / "run"
 
     def policy(self, allowed=(), local_binding=False, extra_read=()):
-        policy = worker.build_policy(self.input, self.run_dir, self.root / "claude")
+        policy = worker.build_policy(self.input, self.run_dir, self.root / "claude",
+                                     runtime=self.runtime)
         policy["filesystem"]["allowRead"] += FIXTURE_READ + list(extra_read)
         policy["network"]["allowedDomains"] += list(allowed)
         policy["network"]["allowLocalBinding"] = local_binding
@@ -160,9 +203,28 @@ class RuntimeFixture(unittest.TestCase):
         self.assertEqual(exit_code, 0, stderr)
         return {item["name"]: item for item in json.loads(stdout)}
 
-    def assertDenied(self, result):
+    def assertDenied(self, result, path=None):
         self.assertFalse(result["ok"], result)
-        self.assertEqual(result.get("errno"), "Operation not permitted", result)
+        if not LINUX:
+            self.assertEqual(result.get("errno"), "Operation not permitted", result)
+            return
+        if result.get("errno") == LINUX_HIDDEN:
+            self.assertIsNotNone(path, f"ENOENT without a host control: {result}")
+            self.assertTrue(host_shows(path), f"ENOENT but the host lacks {path} too")
+        else:
+            self.assertIn(result.get("errno"), LINUX_DENIED, result)
+
+    def assertNetworkDenied(self, result, port):
+        """Direct TCP: EPERM on macOS; on Linux the empty network namespace
+        refuses, which counts only because the same port answers from here."""
+        self.assertFalse(result["ok"], result)
+        if not LINUX:
+            self.assertEqual(result.get("errno"), "Operation not permitted", result)
+            return
+        with socket.create_connection(("127.0.0.1", port), timeout=5):
+            pass
+        self.assertIn(result.get("errno"), {"Connection refused", "Network is unreachable",
+                                            "Operation not permitted"}, result)
 
 
 class FileBoundaryTests(RuntimeFixture):
@@ -194,29 +256,49 @@ class FileBoundaryTests(RuntimeFixture):
             {"op": "rename", "name": "move output root", "path": str(self.run_dir / "output"),
              "target": str(self.run_dir / "output-moved")},
             {"op": "write", "name": "shared tmp write",
-             "path": f"/private/tmp/osrw-probe-{self.tag}"},
+             "path": f"{SHORT_TMP}/osrw-probe-{self.tag}"},
             {"op": "write", "name": "srt default tmp write",
              "path": f"/tmp/claude/osrw-probe-{self.tag}"},
             {"op": "read", "name": "hosts read", "path": "/etc/hosts"},
             {"op": "read", "name": "etc passwd", "path": "/etc/passwd"},
-            {"op": "read", "name": "private etc ssh", "path": "/private/etc/ssh/ssh_config"},
+            {"op": "read", "name": "private etc ssh",
+             "path": "/etc/ssh/ssh_config" if LINUX else "/private/etc/ssh/ssh_config"},
             {"op": "listdir", "name": "usr local", "path": "/usr/local"},
+            # Linux: /usr/bin lists as srt's own tmpfs holding only the read-set
+            # binaries, so a binary outside the set is read instead (rg exists).
+            {"op": "read", "name": "usr bin", "path": "/usr/bin/rg"} if LINUX else
             {"op": "listdir", "name": "usr bin", "path": "/usr/bin"},
-            {"op": "listdir", "name": "library preferences", "path": "/Library/Preferences"},
+            {"op": "listdir", "name": "library preferences",
+             "path": "/var/log" if LINUX else "/Library/Preferences"},
             {"op": "read", "name": "zoneinfo default",
-             "path": "/usr/share/zoneinfo.default/UTC"},
+             "path": "/usr/share/zoneinfo/UTC" if LINUX
+             else "/usr/share/zoneinfo.default/UTC"},
         ]
 
     def tearDown(self):
         for leftover in (Path.home() / f".osrw-probe-{self.tag}",
                          REPO / f".osrw-probe-{self.tag}",
-                         Path(f"/private/tmp/osrw-probe-{self.tag}"),
+                         Path(f"{SHORT_TMP}/osrw-probe-{self.tag}"),
                          Path(f"/tmp/claude/osrw-probe-{self.tag}")):
             if leftover.exists():
                 leftover.unlink()
                 self.fail(f"sandboxed probe created {leftover}")
 
-    def check(self, results):
+    def check(self, results, plan):
+        paths = {step["name"]: step["path"] for step in plan if "path" in step}
+        contained = set()
+        shared = results["shared tmp write"]
+        if LINUX and (shared["ok"] or shared.get("errno") == "File exists"):
+            # Linux: /tmp is srt's private tmpfs, so the write succeeds there
+            # (the child then finds the parent's copy) but must not reach the
+            # host (tearDown also fails on a host copy).
+            self.assertFalse(Path(paths["shared tmp write"]).exists())
+            contained.add("shared tmp write")
+        if LINUX and not host_shows(paths["srt default tmp write"]):
+            # srt's TMPDIR (/tmp/claude) exists neither on the host nor inside:
+            # nothing to deny, so no claim is made for it on Linux.
+            self.assertFalse(results["srt default tmp write"]["ok"])
+            contained.add("srt default tmp write")
         for allowed in ("input read", "output write", "tmp write", "home write", "hosts read"):
             self.assertTrue(results[allowed]["ok"], results[allowed])
         for denied in ("input tamper", "input new file", "parent home secret",
@@ -226,7 +308,8 @@ class FileBoundaryTests(RuntimeFixture):
                        "shared tmp write", "srt default tmp write", "etc passwd",
                        "private etc ssh", "usr local", "usr bin", "library preferences",
                        "zoneinfo default"):
-            self.assertDenied(results[denied])
+            if denied not in contained:
+                self.assertDenied(results[denied], paths[denied])
 
     def test_process_and_child_share_the_file_boundary(self):
         corpus = sha256(self.input / "corpus.txt")
@@ -235,10 +318,10 @@ class FileBoundaryTests(RuntimeFixture):
             dict(step, path=step["path"].replace("notes.md", "child.md")
                  .replace("scratch", "child-scratch").replace("state", "child-state"))
             for step in plan]}])
-        self.check(results)
+        self.check(results, plan)
         child = results["child"]
         self.assertTrue(child["ok"], child)
-        self.check({item["name"]: item for item in child["results"]})
+        self.check({item["name"]: item for item in child["results"]}, plan)
         self.assertEqual(sha256(self.input / "corpus.txt"), corpus)
         self.assertEqual(sorted(p.name for p in self.input.iterdir()
                                 if not p.name.startswith("plan-")),
@@ -304,10 +387,35 @@ class UnixSocketTests(RuntimeFixture):
         server.accept()[0].close()
         step = {"op": "unix", "name": "orca socket", "path": str(path)}
         results = self.sandbox([step, {"op": "child", "name": "child", "plan": [step]}])
-        self.assertDenied(results["orca socket"])
-        self.assertDenied(results["child"]["results"][0])
+        self.assertDenied(results["orca socket"], path)
+        self.assertDenied(results["child"]["results"][0], path)
         with self.assertRaises(TimeoutError):
             server.accept()
+
+
+@unittest.skipUnless(LINUX, "Linux guest services")
+class GuestServiceTests(RuntimeFixture):
+    """Guest daemons that would query or act for a caller (systemd-resolved over
+    varlink or D-Bus): reachable by the research user outside srt (the
+    control), refused inside it. DNS over 127.0.0.53 is not claimed here: the
+    guest's nft rule already refuses it outside srt, so it has no control."""
+
+    SOCKETS = ("/run/systemd/resolve/io.systemd.Resolve", "/run/dbus/system_bus_socket")
+
+    def test_resolver_and_bus_sockets_are_refused_inside_srt(self):
+        present = [path for path in self.SOCKETS if Path(path).exists()]
+        if not present:
+            self.skipTest("no resolver or bus socket on this guest")
+        for path in present:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as control:
+                control.settimeout(5)
+                control.connect(path)
+        steps = [{"op": "unix", "name": path, "path": path} for path in present]
+        results = self.sandbox(steps + [{"op": "child", "name": "child", "plan": steps}])
+        child = {item["name"]: item for item in results["child"]["results"]}
+        for path in present:
+            self.assertDenied(results[path], path)
+            self.assertDenied(child[path], path)
 
 
 class NetworkTests(RuntimeFixture):
@@ -341,13 +449,14 @@ class NetworkTests(RuntimeFixture):
                  "url": self.url(self.b, "/child")}]},
         ], policy=self.policy(allowed=[f"127.0.0.1:{self.a}"]))
         self.assertEqual(results["proxied read"]["status"], 200, results)
-        for direct in ("direct read", "direct tcp allowed port", "direct tcp other port"):
-            self.assertDenied(results[direct])
+        self.assertNetworkDenied(results["direct read"], self.a)
+        self.assertNetworkDenied(results["direct tcp allowed port"], self.a)
+        self.assertNetworkDenied(results["direct tcp other port"], self.b)
         for refused in ("proxied other port", "proxied unlisted host"):
             self.assertEqual(results[refused]["status"], 403, results[refused])
             self.assertEqual(results[refused]["proxy_error"], "blocked-by-allowlist")
         child = {item["name"]: item for item in results["child"]["results"]}
-        self.assertDenied(child["child direct"])
+        self.assertNetworkDenied(child["child direct"], self.a)
         self.assertEqual(child["child proxied other"]["status"], 403)
         self.assertEqual(self.allowed.requests, [("GET", "/repos/o/r", "")])
         self.assertEqual(self.other_host.requests, [])
@@ -358,9 +467,10 @@ class NetworkTests(RuntimeFixture):
             {"op": "tcp", "name": "direct", "host": "127.0.0.1", "port": self.a},
         ])
         self.assertEqual(results["proxied"].get("status"), 403, results)
-        self.assertDenied(results["direct"])
+        self.assertNetworkDenied(results["direct"], self.a)
         self.assertEqual(self.allowed.requests, [])
 
+    @unittest.skipUnless(GIT, "git is not installed (the Debian guest has none)")
     def test_write_requests_to_an_allowed_destination_are_not_blocked(self):
         """srt filters by destination only: REST writes, mutations and pushes pass."""
         clone = self.run_dir / "tmp/clone"
@@ -382,7 +492,7 @@ class NetworkTests(RuntimeFixture):
             {"op": "run", "name": "file push", "argv": git + ["push", "origin", "HEAD:main"]},
         ], policy=self.policy(allowed=[f"127.0.0.1:{self.a}"],
                               # git's HTTP helper aborts without it; the runner never opens it.
-                              extra_read=["/private/etc/ssl/openssl.cnf"]))
+                              extra_read=[OPENSSL_CONFIG]))
         self.assertEqual(results["rest write"]["status"], 201)
         self.assertEqual(results["graphql mutation"]["status"], 200)
         self.assertTrue(results["commit"]["ok"], results["commit"])
@@ -399,6 +509,8 @@ class NetworkTests(RuntimeFixture):
                               capture_output=True, text=True, check=True).stdout
         self.assertEqual(refs, "")
 
+    @unittest.skipIf(LINUX, "macOS measurement; Linux keeps its own network namespace, "
+                     "not measured")
     def test_local_binding_opens_every_loopback_port_directly(self):
         """allowLocalBinding: true would be a direct bypass; the runner keeps false."""
         results = self.sandbox([
@@ -409,6 +521,7 @@ class NetworkTests(RuntimeFixture):
                       ["network"]["allowLocalBinding"], False)
 
 
+@unittest.skipUnless(sys.platform == "darwin", "macOS Keychain only")
 class KeychainTests(RuntimeFixture):
     """Disposable file keychain with a fake item. The login keychain is never read."""
 
@@ -474,7 +587,7 @@ class ClaudeStartupTests(RuntimeFixture):
     """Binary start only. No model request, credential, skill or auto mode."""
 
     def start(self, argument, drop_read=()):
-        policy = worker.build_policy(self.input, self.run_dir, Path(CLAUDE))
+        policy = worker.build_policy(self.input, self.run_dir, Path(CLAUDE), runtime=self.runtime)
         policy["network"]["allowedDomains"] = []
         policy["filesystem"]["allowRead"] = [
             path for path in policy["filesystem"]["allowRead"] if path not in drop_read]
@@ -497,6 +610,83 @@ class ClaudeStartupTests(RuntimeFixture):
         self.assertNotIn(self.sentinel, stdout + stderr)
         self.assertEqual(worker.parent_path_problems(self.run_dir), [])
 
+    # bash, run inside srt: connect to srt's own proxy by the name "localhost"
+    # (what srt puts in HTTPS_PROXY), the lookup a model request makes first.
+    LOCALHOST_PROBE = ('p=${HTTPS_PROXY##*:}; p=${p%%/*}; case "$HTTPS_PROXY" in *localhost*) ;; '
+                       '*) echo "PROXY-NOT-LOCALHOST"; exit 3;; esac; '
+                       'exec 3<>"/dev/tcp/localhost/$p" && echo CONNECTED')
+
+    def run_in_policy(self, argv, drop_read=()):
+        policy = worker.build_policy(self.input, self.run_dir, Path(CLAUDE), runtime=self.runtime)
+        policy["filesystem"]["allowRead"] = [
+            path for path in policy["filesystem"]["allowRead"] if path not in drop_read]
+        if self.run_dir.exists():
+            shutil.rmtree(self.run_dir)
+        policy_file = worker.prepare_run(self.run_dir, policy)
+        environment = worker.build_environment(self.parent_environment(), self.run_dir)
+        return worker.launch(worker.sandboxed(self.runtime, policy_file, argv),
+                             environment, self.input, 60)
+
+    @unittest.skipUnless(LINUX, "Linux read set (SYSTEM_READ_LINUX) measurement")
+    def test_each_linux_system_read_entry_is_needed(self):
+        """Necessity of every system entry under the product policy (network kept,
+        no model request): dropping one must break the start or the localhost
+        lookup to srt's proxy. Paths outside the set stay hidden. Non-AI."""
+        version = subprocess.run([CLAUDE, "--version"], capture_output=True, text=True,
+                                 env={"PATH": "/usr/bin:/bin", "HOME": str(self.run_dir)},
+                                 timeout=60).stdout
+        policy = worker.build_policy(self.input, self.run_dir, Path(CLAUDE), runtime=self.runtime)
+        read = policy["filesystem"]["allowRead"]
+        system = list(worker.system_read("linux"))
+        entries = [*system, *worker.linux_link_targets(system),
+                   *[path for path in read if path.endswith("/apply-seccomp")]]
+        self.assertTrue(all(entry in read for entry in entries), (entries, read))
+
+        def probes(drop=()):
+            start = self.run_in_policy([CLAUDE, "--version"], drop)
+            lookup = self.run_in_policy(["/usr/bin/bash", "-c", self.LOCALHOST_PROBE], drop)
+            return {"start": start[0] == 0 and start[1] == version,
+                    "localhost": lookup[0] == 0 and lookup[1].strip() == "CONNECTED"}
+
+        matrix = {"full": probes()}
+        for entry in entries:
+            matrix[entry] = probes((entry,))
+        # Absent, or an empty directory (a mount point bwrap creates): nothing to read.
+        hidden = self.run_in_policy(["/usr/bin/bash", "-c", "shopt -s nullglob dotglob; "
+                                     "for p in /etc/ssl/certs /etc/resolv.conf /etc/passwd "
+                                     "/etc/nsswitch.conf /usr/share /home /root /var /srv; do "
+                                     "if [ -d $p ]; then a=($p/*); [ ${#a[@]} -gt 0 ] && "
+                                     "echo SEEN $p ${#a[@]} ${a[*]:0:3}; "
+                                     "elif [ -e $p ]; then echo SEEN $p file; fi; done; echo DONE"])
+        # /opt holds the pinned runtime: only the way to an allowed path may show.
+        opt = self.run_in_policy(["/usr/bin/bash", "-c", "shopt -s nullglob dotglob; "
+                                  "for d in /opt /opt/*; do for e in $d/*; do echo $e; done; done"])
+        shown = opt[1].split()
+        on_the_way = [path for path in shown
+                      if not any(allowed == path or allowed.startswith(path + "/")
+                                 for allowed in read)]
+        # A symlink entry is kept to find its target (build_policy); its target is
+        # what bwrap needs, so necessity is judged on the target.
+        links = {entry: os.path.realpath(entry) for entry in system if os.path.islink(entry)}
+        evidence = os.environ.get("OSS_RESEARCH_READSET_EVIDENCE")
+        if evidence:
+            Path(evidence).write_text(json.dumps({"entries": entries, "matrix": matrix,
+                                                  "links_kept_for_their_target": links,
+                                                  "hidden_probe": hidden[1].split("\n"),
+                                                  "opt_shown": shown, "opt_not_on_the_way": on_the_way},
+                                                 indent=1))
+        self.assertEqual(matrix["full"], {"start": True, "localhost": True}, matrix)
+        for entry in entries:
+            if entry in links:
+                self.assertIn(links[entry], entries)
+                continue
+            with self.subTest(entry=entry):
+                self.assertFalse(all(matrix[entry].values()),
+                                 f"{entry} is not needed by either probe: {matrix[entry]}")
+        self.assertEqual(hidden[1].split(), ["DONE"], hidden)
+        self.assertEqual(on_the_way, [], shown)
+
+    @unittest.skipIf(LINUX, "macOS measurement (ICU data); Linux started with /usr/lib")
     def test_help_crashes_without_icu_data(self):
         exit_code, stdout, stderr = self.start("--help", drop_read=("/usr/share/icu",))
         self.assertNotEqual(exit_code, 0)
@@ -509,13 +699,14 @@ class FailClosedTests(RuntimeFixture):
         if settings is not None:
             policy.write_text(settings)
         completed = subprocess.run(
-            worker.sandboxed(self.runtime, policy, ["/bin/echo", "RAN"]),
+            worker.sandboxed(self.runtime, policy, ECHO),
             env={"PATH": os.environ["PATH"], "HOME": str(self.root)},
             capture_output=True, text=True, timeout=60)
         return completed
 
     def test_missing_empty_corrupt_or_old_policy_never_runs_the_command(self):
-        old = worker.build_policy(self.input, self.run_dir, self.root / "claude")
+        old = worker.build_policy(self.input, self.run_dir, self.root / "claude",
+                                  runtime=self.runtime)
         del old["network"]["deniedDomains"]
         cases = {"missing": None, "empty": "", "corrupt": '{"filesystem": ',
                  "without deniedDomains": json.dumps(old)}
@@ -561,7 +752,13 @@ class LaunchGateRuntimeTests(RuntimeFixture):
         result = self.launch(PREFIX)
         self.assertEqual(result.returncode, worker.EXIT_BLOCKED, result.stderr)
         self.assertIn(f"srt {worker.SRT_VERSION} verified", result.stderr)
-        self.assertIn("no credential binding for claude-profile1", result.stderr)
+        if LINUX:
+            # Closed earlier on Linux: a host problem or the unmeasured read set.
+            self.assertTrue("cannot run it isolated" in result.stderr
+                            or "system read set is not measured yet" in result.stderr,
+                            result.stderr)
+        else:
+            self.assertIn("no credential binding for claude-profile1", result.stderr)
         self.assertFalse(self.run_dir.exists())
 
     def test_tampered_or_absent_runtime_is_blocked(self):

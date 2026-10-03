@@ -1,0 +1,260 @@
+#!/usr/bin/env python3
+"""Run the candidate verifier's read steps with the loopback relay as its transport.
+
+    executable_oss-research-relay-verify discover --relay-url http://127.0.0.1:PORT \\
+        --skills-dir DIR --transport-record T.json --timeout-seconds S --max-response-bytes N \\
+        --deadline-seconds D [--require-proxy] --analysis A.json --repo OWNER/NAME \\
+        --output D.json --manifest M.json [--pattern PAT-001] [--max-candidates-per-repo N] \\
+        [--max-candidates-total N] [--request-budget N] [--max-clues-per-pattern N]
+    executable_oss-research-relay-verify locus-search ... --discovery D.json \\
+        --assessment A.json --output L.json --manifest M.json [--clue C] [--request-budget N] \\
+        [--max-clues-per-locus N]
+
+This is the non-AI candidate-verification step inside a research sandbox. It
+verifies nothing itself: it loads the existing
+``verifying-open-source-contribution-candidates/scripts/verify_candidates.py``
+by path and calls its own ``main`` with two injections, the way its tests do:
+
+- ``opener``: the relay-collect adapter's ``RelayOpener`` (reused, not copied),
+  with ``fixed_per_page=False`` because the verifier sends no per_page. Each
+  checked GET goes to ``http://127.0.0.1:<port>/v1/rest/<path>``; the
+  ``https://api.github.com/...`` URL the verifier built is the *logical*
+  request, never evidence of a direct TLS connection.
+- ``sleeper``: the verifier's retry wait, bounded by ``--deadline-seconds``; a
+  wait past it stops the run (the verifier's ``HttpRequestRefused``).
+
+No credential: the step refuses to start when GH_TOKEN or GITHUB_TOKEN is set
+(the verifier would read it), the adapter refuses an Authorization header, and
+the relay itself never has one. No clone (``--allow-clone`` is not accepted),
+no record/recheck/render: only discover and locus-search, which read.
+
+Relay answers keep the verifier's own classification: a relayed response keeps
+GitHub's status and payload; an upstream error keeps its status and message
+(a 401 from code search, a 403 or 404 from a policy source stay what they
+are); the relay's budget stop is the verifier's ``BudgetExhausted``; a relay
+timeout or transport failure is a transport error the verifier may retry. A
+relay refusal or a malformed relay answer is never a GitHub answer: it stops
+the run (``HttpRequestRefused``), so a route this path does not cover can
+never be recorded as an absent file or an empty search.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import importlib.machinery
+import importlib.util
+import json
+import os
+from pathlib import Path
+import sys
+import time
+import types
+from typing import Any, Optional
+
+
+VERIFIER_SCRIPT = Path("verifying-open-source-contribution-candidates/scripts/verify_candidates.py")
+ADAPTER = "executable_oss-research-relay-collect"
+TOKEN_VARIABLES = ("GH_TOKEN", "GITHUB_TOKEN")
+MAX_DEADLINE_SECONDS = 1800.0
+TRANSPORT_NOTE = (
+    "logical_url is the verifier's api.github.com request. The adapter sent it to the loopback "
+    "relay over plain HTTP; it did not connect to api.github.com and this record is not TLS evidence."
+)
+
+
+def _sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def load_relay_collect(here: Path = Path(__file__)) -> Any:
+    """The relay-collect adapter beside this file, loaded by path (its RelayOpener is reused)."""
+    path = Path(os.path.realpath(here)).with_name(ADAPTER)
+    loader = importlib.machinery.SourceFileLoader("_oss_research_relay_collect_for_verify", str(path))
+    module = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
+    sys.modules[loader.name] = module
+    loader.exec_module(module)
+    return module
+
+
+def load_verifier(skills_dir: Path) -> tuple[Any, dict[str, str]]:
+    """Load the verifier from ``skills_dir`` only, hashing it before and after."""
+    path = (skills_dir / VERIFIER_SCRIPT).resolve(strict=True)
+    before = _sha256(path)
+    spec = importlib.util.spec_from_file_location("_oss_research_relay_verifier", path)
+    if spec is None or spec.loader is None:
+        raise ImportError("could not load verifying-open-source-contribution-candidates")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    if Path(module.__file__).resolve() != path or _sha256(path) != before:
+        raise ImportError("verifier source changed or came from another directory while loading")
+    return module, {"path": str(path), "sha256": before}
+
+
+class VerifierRelayOpener:
+    """The verifier's opener callable over the reused RelayOpener."""
+
+    def __init__(self, verifier: Any, relay_opener: Any) -> None:
+        self._verifier = verifier
+        self.relay = relay_opener
+
+    def __call__(self, request, timeout):
+        try:
+            return self.relay.open(request, timeout)
+        except ValueError as error:
+            # A relay refusal or a malformed answer is not a GitHub answer: stop.
+            raise self._verifier.HttpRequestRefused("relay path refused the request: %s" % error) from None
+
+
+def bounded_sleeper(verifier: Any, deadline_seconds: float, clock=time.monotonic, sleep=time.sleep):
+    """The verifier's retry wait, refused when it would pass the step's deadline."""
+    deadline = clock() + deadline_seconds
+
+    def sleeper(seconds: float) -> None:
+        if clock() + seconds >= deadline:
+            raise verifier.HttpRequestRefused("a retry wait of %gs would pass the step deadline" % seconds)
+        sleep(seconds)
+
+    return sleeper
+
+
+def build_opener(verifier: Any, relay_collect: Any, relay_url: str, *, timeout_seconds: float,
+                 max_response_bytes: int, proxy) -> VerifierRelayOpener:
+    # RelayOpener reads API_VERSION (the header it accepts) and BudgetExhausted
+    # (what a relay budget stop raises) from the client module it serves.
+    client = types.SimpleNamespace(API_VERSION=verifier.DEFAULT_API_VERSION,
+                                   BudgetExhausted=verifier.BudgetExhausted)
+    return VerifierRelayOpener(verifier, relay_collect.RelayOpener(
+        client, relay_url, timeout_seconds=timeout_seconds, max_response_bytes=max_response_bytes,
+        proxy=proxy, fixed_per_page=False))
+
+
+def transport_record(opener: VerifierRelayOpener, verifier_source: dict[str, str], stage: str,
+                     exit_code: Optional[int]) -> dict[str, object]:
+    relay = opener.relay
+    return {
+        "schema_version": "1.0.0",
+        "stage": stage,
+        "relay_base_url": relay.base_url,
+        "transport": "srt-proxy" if relay.proxy is not None else "direct",
+        "no_proxy_ignored": relay.no_proxy_ignored,
+        "verifier": verifier_source,
+        "note": TRANSPORT_NOTE,
+        "credential": "none: no GH_TOKEN or GITHUB_TOKEN, no Authorization header",
+        "exit_code": exit_code,
+        "requests": relay.records,
+    }
+
+
+def _deadline(value: str) -> float:
+    try:
+        seconds = float(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("must be a number of seconds") from error
+    if not 0 < seconds <= MAX_DEADLINE_SECONDS:
+        raise argparse.ArgumentTypeError("must be above 0 and at most %g" % MAX_DEADLINE_SECONDS)
+    return seconds
+
+
+def build_parser(relay_collect: Any) -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="oss-research-relay-verify",
+                                     description="Candidate verifier discover/locus-search through the relay.")
+    commands = parser.add_subparsers(dest="stage", required=True)
+    for name in ("discover", "locus-search"):
+        sub = commands.add_parser(name)
+        sub.add_argument("--relay-url", required=True)
+        sub.add_argument("--skills-dir", required=True, type=relay_collect._absolute_directory)
+        sub.add_argument("--transport-record", required=True)
+        sub.add_argument("--timeout-seconds", required=True, type=relay_collect._timeout)
+        sub.add_argument("--max-response-bytes", required=True,
+                         type=relay_collect._positive_int(relay_collect.MAX_RESPONSE_BYTES))
+        sub.add_argument("--deadline-seconds", required=True, type=_deadline)
+        sub.add_argument("--require-proxy", action="store_true")
+        sub.add_argument("--output", required=True)
+        sub.add_argument("--manifest", required=True)
+        sub.add_argument("--request-budget", required=True, type=int)
+    discover = commands.choices["discover"]
+    discover.add_argument("--analysis", required=True)
+    discover.add_argument("--repo", required=True)
+    discover.add_argument("--pattern", action="append", default=[])
+    discover.add_argument("--max-candidates-per-repo", type=int, default=5)
+    discover.add_argument("--max-candidates-total", type=int, default=5)
+    discover.add_argument("--max-clues-per-pattern", type=int, default=5)
+    locus = commands.choices["locus-search"]
+    locus.add_argument("--discovery", required=True)
+    locus.add_argument("--assessment", required=True)
+    locus.add_argument("--clue", action="append", default=[])
+    locus.add_argument("--max-clues-per-locus", type=int, default=5)
+    return parser
+
+
+def verifier_argv(args: argparse.Namespace) -> list[str]:
+    """The verifier's own argv for this stage: no clone, no fixture, one repository."""
+    argv = [args.stage, "--output", args.output, "--manifest", args.manifest,
+            "--request-budget", str(args.request_budget)]
+    if args.stage == "discover":
+        argv += ["--analysis", args.analysis, "--repo", args.repo,
+                 "--max-candidates-per-repo", str(args.max_candidates_per_repo),
+                 "--max-candidates-total", str(args.max_candidates_total),
+                 "--max-clues-per-pattern", str(args.max_clues_per_pattern)]
+        for pattern in args.pattern:
+            argv += ["--pattern", pattern]
+    else:
+        argv += ["--discovery", args.discovery, "--assessment", args.assessment,
+                 "--max-clues-per-locus", str(args.max_clues_per_locus)]
+        for clue in args.clue:
+            argv += ["--clue", clue]
+    return argv
+
+
+def main(argv: Optional[list[str]] = None, *, environ: Optional[dict[str, str]] = None,
+         clock=None, sleep=time.sleep) -> int:
+    """clock (the verifier's observation clock) and sleep are for tests only."""
+    environ = dict(os.environ) if environ is None else environ
+    relay_collect = load_relay_collect()
+    parser = build_parser(relay_collect)
+    args = parser.parse_args(argv)
+    if any(name in environ for name in TOKEN_VARIABLES):
+        print("error: a GitHub token variable is set; this step runs without any credential", file=sys.stderr)
+        return 2
+    if any(os.path.lexists(path) for path in (args.output, args.manifest, args.transport_record)):
+        print("error: outputs must not exist yet", file=sys.stderr)
+        return 2
+    try:
+        verifier, source = load_verifier(args.skills_dir)
+    except (OSError, ImportError) as error:
+        print("error: could not load the verifier: {0}".format(type(error).__name__), file=sys.stderr)
+        return 2
+    try:
+        proxy = relay_collect.srt_proxy(environ)
+    except ValueError as error:
+        print("error: {0}".format(error), file=sys.stderr)
+        return 2
+    if proxy is None and args.require_proxy:
+        print("error: --require-proxy: no HTTP_PROXY or http_proxy is set", file=sys.stderr)
+        return 2
+    try:
+        opener = build_opener(verifier, relay_collect, args.relay_url, timeout_seconds=args.timeout_seconds,
+                              max_response_bytes=args.max_response_bytes, proxy=proxy)
+    except ValueError as error:
+        print("error: {0}".format(error), file=sys.stderr)
+        return 2
+    opener.relay.no_proxy_ignored = proxy is not None and any(
+        name in environ for name in relay_collect.NO_PROXY_VARIABLES)
+    extra = {} if clock is None else {"clock": clock}
+    code = verifier.main(verifier_argv(args), sleeper=bounded_sleeper(verifier, args.deadline_seconds, sleep=sleep),
+                         opener=opener, **extra)
+    _write_json_new(args.transport_record, transport_record(opener, source, args.stage, code))
+    return code
+
+
+def _write_json_new(path: str, document: dict[str, object]) -> None:
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o644)
+    with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+        json.dump(document, handle, indent=1)
+        handle.write("\n")
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

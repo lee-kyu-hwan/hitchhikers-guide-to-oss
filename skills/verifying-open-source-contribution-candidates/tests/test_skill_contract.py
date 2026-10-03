@@ -119,6 +119,7 @@ class SkillContractTests(unittest.TestCase):
             "A request-failed policy observation cannot support issue-ready or pr-ready.",
             "A policy result recorded as unreviewed cannot support a ready status.",
             "A ready status requires a locus and a completed search repeated at that locus.",
+            "A reproduced status requires a static or executed reproduction, a reproduction evidence link, and a confirmed reproduction_evidence check.",
             "A failed recheck makes an actionable candidate unverified with status_reason insufficient-evidence.",
             "record and render preserve partial, failed, and unknown run states instead of defaulting them to complete.",
         )

@@ -1,0 +1,520 @@
+#!/usr/bin/env python3
+"""Run the recent-closed-PR collector with the loopback relay as its transport.
+
+This is the non-AI collection step inside a research sandbox. It does not
+collect anything itself: it loads the existing ``collect_recent_closed_prs.py``
+by path and injects two things into its ``GhApiClient``:
+
+- ``opener``: a ``RelayOpener`` that sends each checked GET to
+  ``http://127.0.0.1:<port>/v1/rest/<path>`` instead of api.github.com;
+- ``token_provider``: always ``None``. No GH_TOKEN, GITHUB_TOKEN, or
+  ``gh auth token`` lookup happens, and no credential header is sent.
+
+The collector still builds and checks ``https://api.github.com/...`` requests.
+That URL is the *logical* request. The adapter never opens a TLS connection
+to api.github.com; the transport record says so for every request, and it is
+not evidence of a direct connection. See docs/research/oss-research-relay.md.
+
+Only new collections are supported: an existing corpus, manifest, or Markdown
+output is refused, because the relay refuses If-None-Match and a resume would
+need conditional requests.
+
+Transport: inside srt on Linux the process has its own network namespace, so
+a direct connect to 127.0.0.1:<port> is refused (measured); the relay is
+reached only through the loopback HTTP proxy srt injects (``HTTP_PROXY``,
+``http_proxy``). When either variable is set it must name exactly
+``http://[user:password@]localhost:<port>`` or the same with ``127.0.0.1``
+(both spellings the same value) and every request goes through it in
+absolute form to the exact relay URL; anything else fails closed and never
+falls back to a direct connect. srt's own proxy carries a per-session
+user:password (measured on srt 0.0.77); it is sent only to that proxy, as
+``Proxy-Authorization: Basic``, and never recorded. A proxy that answers 407,
+a redirect or anything but a relay envelope fails the request. ``NO_PROXY`` is ignored: it would send loopback past the proxy.
+Without a proxy variable the connect is direct (tests outside srt), unless
+``--require-proxy`` is given, as the isolated collection step does. The proxy
+value is never written to the transport record or to an error message.
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import hashlib
+import http.client
+import importlib.util
+import json
+import os
+from pathlib import Path
+import re
+import sys
+from typing import Any, Optional
+import urllib.parse
+import urllib.request
+
+
+RELAY_HOST = "127.0.0.1"
+LOGICAL_ORIGIN = "https://api.github.com"
+COLLECTOR_SCRIPT = Path("collecting-recent-closed-prs/scripts/collect_recent_closed_prs.py")
+# The collector's fixed page size; the relay adds it again on its side.
+FIXED_PER_PAGE = "100"
+# Headers the collector sets on every GET. Anything else is refused, not dropped.
+PASSED_HEADERS = frozenset({"accept", "user-agent", "x-github-api-version"})
+REFUSED_HEADERS = {
+    "authorization": "a credential header",
+    "if-none-match": "a conditional request (only new collections are supported)",
+}
+MAX_RESPONSE_BYTES = 64 * 1024 * 1024
+MAX_TIMEOUT_SECONDS = 330.0
+# The relay re-encodes the upstream JSON inside a small envelope.
+ENVELOPE_SLACK_BYTES = 64 * 1024
+CLIENT_VERSION_SUFFIX = "+oss-research-relay"
+TRANSPORT_NOTE = (
+    "logical_url is the collector's api.github.com request. The adapter sent it to the loopback "
+    "relay over plain HTTP; it did not connect to api.github.com and this record is not TLS evidence."
+)
+BUDGET_ERRORS = frozenset({"budget_exhausted", "byte_budget_exhausted"})
+TIMEOUT_ERRORS = frozenset({"upstream_timeout", "relay_busy_timeout"})
+# The proxy variables srt sets for plain HTTP; HTTPS_PROXY does not apply to
+# the relay's http:// URL. NO_PROXY is read only to record that it was ignored.
+PROXY_VARIABLES = ("HTTP_PROXY", "http_proxy")
+NO_PROXY_VARIABLES = ("NO_PROXY", "no_proxy")
+PROXY_HOSTS = ("localhost", "127.0.0.1")
+# The rate-limit headers the relay may keep from a received answer whose retry
+# wait passed its deadline (the relay's RATE_LIMIT_HEADERS). They are handed to
+# the collector as that answer's headers, so its own rate-limit rule (wait for
+# Retry-After or the reset, never sooner) still decides; anything else fails.
+RATE_LIMIT_HEADERS = frozenset({"retry-after", "x-ratelimit-limit", "x-ratelimit-remaining",
+                                "x-ratelimit-reset", "x-ratelimit-used"})
+RATE_LIMIT_RESOURCE_HEADER = "x-ratelimit-resource"
+
+
+def _sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def load_collector(skills_dir: Path) -> tuple[Any, dict[str, str]]:
+    """Load the collector from ``skills_dir`` only, hashing it before and after."""
+    path = (skills_dir / COLLECTOR_SCRIPT).resolve(strict=True)
+    before = _sha256(path)
+    spec = importlib.util.spec_from_file_location("_oss_research_relay_collector", path)
+    if spec is None or spec.loader is None:
+        raise ImportError("could not load collecting-recent-closed-prs")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    if Path(module.__file__).resolve() != path or _sha256(path) != before:
+        raise ImportError("collector source changed or came from another directory while loading")
+    return module, {"path": str(path), "sha256": before}
+
+
+def parse_relay_url(value: str) -> tuple[str, int]:
+    """Accept exactly ``http://127.0.0.1:<port>`` with nothing after it."""
+    parts = urllib.parse.urlsplit(value)
+    try:
+        port = parts.port
+    except ValueError as error:
+        raise ValueError("relay URL port is invalid") from error
+    if (
+        parts.scheme != "http" or parts.hostname != RELAY_HOST or port is None or port == 0
+        or parts.netloc != "{0}:{1}".format(RELAY_HOST, port)
+        or parts.path not in ("", "/") or parts.query or parts.fragment or "?" in value or "#" in value
+    ):
+        raise ValueError("relay URL must be exactly http://127.0.0.1:<port>")
+    return RELAY_HOST, port
+
+
+def srt_proxy(environ: dict[str, str]) -> Optional[tuple[str, int, Optional[str]]]:
+    """(host, port, Proxy-Authorization or None) of the loopback proxy srt injected,
+    or None when no proxy variable is set.
+
+    Raises ValueError (without the value) for anything but exactly
+    ``http://[user:password@]localhost:<port>`` or the same with 127.0.0.1, or
+    when the two spellings disagree.
+    """
+    values = {name: environ[name] for name in PROXY_VARIABLES if name in environ}
+    if not values:
+        return None
+    if len(set(values.values())) != 1:
+        raise ValueError("HTTP_PROXY and http_proxy are both set and differ")
+    value = next(iter(values.values()))
+    fixed = "proxy must be exactly http://localhost:<port> or http://127.0.0.1:<port>"
+    # Every parse step can raise with the raw netloc in its message (urlsplit's
+    # NFKC check, .port, unquote); only this fixed text leaves this function.
+    try:
+        parts = urllib.parse.urlsplit(value)
+        port = parts.port
+        host = parts.hostname
+        userinfo, at, _ = parts.netloc.rpartition("@")
+        username, password = parts.username, parts.password
+        well_formed = (
+            parts.scheme == "http" and host in PROXY_HOSTS and port is not None and port != 0
+            and parts.netloc == "{0}{1}{2}:{3}".format(userinfo, at, host, port)
+            and not (at and (username is None or password is None or not userinfo))
+            and parts.path in ("", "/") and not parts.query and not parts.fragment
+            and "?" not in value and "#" not in value
+        )
+        authorization = None
+        if well_formed and at:
+            pair = "{0}:{1}".format(urllib.parse.unquote(username, errors="strict"),
+                                    urllib.parse.unquote(password, errors="strict"))
+            authorization = "Basic " + base64.b64encode(pair.encode("utf-8")).decode("ascii")
+    except (ValueError, UnicodeError):
+        well_formed = False
+    if not well_formed:
+        raise ValueError(fixed) from None
+    return host, port, authorization
+
+
+def _unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    document = dict(pairs)
+    if len(document) != len(pairs):
+        raise ValueError("duplicate JSON key")
+    return document
+
+
+def _refuse_constant(name: str) -> object:
+    raise ValueError("non-standard JSON constant " + name)
+
+
+def _checked_rate_limit(value: object) -> bool:
+    """The relay's kept rate-limit headers: known names, short plain values only."""
+    if not isinstance(value, dict):
+        return False
+    for name, item in value.items():
+        if not isinstance(item, str):
+            return False
+        if name in RATE_LIMIT_HEADERS and re.fullmatch(r"[0-9]{1,12}", item):
+            continue
+        if name == RATE_LIMIT_RESOURCE_HEADER and re.fullmatch(r"[a-z_]{1,32}", item):
+            continue
+        return False
+    return True
+
+
+class RelayedResponse:
+    """What ``_open_api_request`` reads: the logical URL, status, headers, and body."""
+
+    def __init__(self, logical_url: str, status: int, headers: dict[str, str], body: bytes) -> None:
+        self._logical_url = logical_url
+        self.status = status
+        self.headers = headers
+        self._body = body
+
+    def geturl(self) -> str:
+        return self._logical_url
+
+    def read(self, amt: Optional[int] = None) -> bytes:
+        # The candidate verifier reads with a size bound (read(limit + 1)).
+        return self._body if amt is None or amt < 0 else self._body[:amt]
+
+    def close(self) -> None:
+        return None
+
+
+class RelayOpener:
+    """An opener for ``GhApiClient`` that reaches GitHub only through the relay.
+
+    Relay answers map back to the collector's own paths:
+
+    - a relayed response keeps GitHub's status, forwarded headers, and payload;
+    - ``upstream_failed`` with an upstream status keeps that status and message;
+      without one it is a transport failure (``OSError``), as a direct call would be;
+    - a relay timeout is a transport timeout (``TimeoutError``);
+    - ``budget_exhausted`` and ``byte_budget_exhausted`` (HTTP 429 from the relay)
+      raise the collector's ``BudgetExhausted``, which stops retries; the 429 and
+      its code stay in the message and the transport record;
+    - every other relay refusal raises ``ValueError``, which the collector records
+      as a failed request without retrying.
+    """
+
+    def __init__(self, collector: Any, relay_url: str, *, timeout_seconds: float,
+                 max_response_bytes: int, proxy: Optional[tuple[str, int, Optional[str]]] = None,
+                 fixed_per_page: bool = True) -> None:
+        self._collector = collector
+        # True for the collector, which always sends per_page=100. False for a
+        # client that sends none (the candidate verifier): per_page is then refused.
+        self.fixed_per_page = fixed_per_page
+        self.host, self.port = parse_relay_url(relay_url)
+        self.base_url = "http://{0}:{1}".format(self.host, self.port)
+        self.proxy = proxy
+        # Set by main: whether a NO_PROXY variable was present (and ignored).
+        self.no_proxy_ignored = False
+        self.timeout_seconds = timeout_seconds
+        self.max_envelope_bytes = 2 * max_response_bytes + ENVELOPE_SLACK_BYTES
+        self.records: list[dict[str, object]] = []
+
+    def relay_target(self, request: object) -> tuple[str, str]:
+        """Return (logical URL, relay target) for one allowed collector request, or raise."""
+        if not isinstance(request, urllib.request.Request):
+            raise ValueError("relay adapter accepts only urllib requests")
+        if request.get_method() != "GET" or request.data is not None:
+            raise ValueError("relay adapter sends only GET requests without a body")
+        logical_url = request.full_url
+        parts = urllib.parse.urlsplit(logical_url)
+        if parts.scheme != "https" or parts.netloc != "api.github.com" or parts.fragment \
+                or "#" in logical_url or "@" in parts.netloc:
+            raise ValueError("relay adapter accepts only https://api.github.com requests")
+        for name, _value in request.header_items():
+            lowered = name.lower()
+            if lowered in REFUSED_HEADERS:
+                raise ValueError("relay adapter refuses " + REFUSED_HEADERS[lowered])
+            if lowered not in PASSED_HEADERS:
+                raise ValueError("relay adapter refuses an unexpected header")
+        # The relay's own client sends the collector's API_VERSION; any other
+        # requested version would be recorded but never sent.
+        if request.get_header("X-github-api-version") != self._collector.API_VERSION:
+            raise ValueError("relay adapter supports only the collector's API_VERSION")
+        try:
+            pairs = urllib.parse.parse_qsl(parts.query, keep_blank_values=True, strict_parsing=True)
+        except ValueError as error:
+            raise ValueError("relay adapter refuses a malformed query") from error
+        names = [name for name, _value in pairs]
+        if len(set(names)) != len(names):
+            raise ValueError("relay adapter refuses a repeated query parameter")
+        if self.fixed_per_page and dict(pairs).get("per_page") != FIXED_PER_PAGE:
+            raise ValueError("relay adapter expects the collector's fixed per_page=100")
+        if not self.fixed_per_page and "per_page" in names:
+            raise ValueError("relay adapter refuses per_page from this client; the relay fixes it")
+        remaining = [(name, value) for name, value in pairs if name != "per_page"]
+        target = "/v1/rest" + parts.path
+        if remaining:
+            target += "?" + urllib.parse.urlencode(remaining)
+        return logical_url, target
+
+    def open(self, request: urllib.request.Request, timeout: Optional[float] = None) -> RelayedResponse:
+        logical_url, target = self.relay_target(request)
+        record: dict[str, object] = {"logical_url": logical_url, "relay_target": target}
+        self.records.append(record)
+        status, document = self._exchange(target, record)
+        record["relay_status"] = status
+        if document.get("ok") is True and status == 200:
+            upstream_status = document.get("status")
+            headers = document.get("headers")
+            if not isinstance(upstream_status, int) or isinstance(upstream_status, bool) \
+                    or not isinstance(headers, dict) or "payload" not in document \
+                    or not all(isinstance(key, str) and isinstance(value, str) for key, value in headers.items()):
+                record["outcome"] = "malformed_envelope"
+                raise ValueError("relay envelope is malformed")
+            record.update(outcome="relayed", upstream_status=upstream_status)
+            body = json.dumps(document["payload"]).encode("utf-8")
+            return RelayedResponse(logical_url, upstream_status, dict(headers), body)
+        code = document.get("error")
+        message = document.get("message")
+        if document.get("ok") is not False or not isinstance(code, str) or not isinstance(message, str):
+            record["outcome"] = "malformed_envelope"
+            raise ValueError("relay error envelope is malformed")
+        record["relay_error"] = code
+        if status == 429 and code in BUDGET_ERRORS:
+            record["outcome"] = "relay-budget-exhausted"
+            raise self._collector.BudgetExhausted(
+                "relay-budget-exhausted: relay answered 429 {0}".format(code))
+        if status in (502, 504) and code in TIMEOUT_ERRORS:
+            record["outcome"] = "relay-timeout"
+            raise TimeoutError("relay answered {0} {1}".format(status, code))
+        if status == 502 and code == "upstream_failed":
+            upstream_status = document.get("upstream_status")
+            if upstream_status is None:
+                record["outcome"] = "upstream-transport-failed"
+                raise OSError("relay upstream transport failed")
+            if not isinstance(upstream_status, int) or isinstance(upstream_status, bool) \
+                    or not 400 <= upstream_status <= 599:
+                record["outcome"] = "malformed_envelope"
+                raise ValueError("relay upstream_status is malformed")
+            rate_limit = document.get("upstream_rate_limit", {})
+            if not _checked_rate_limit(rate_limit):
+                record["outcome"] = "malformed_envelope"
+                raise ValueError("relay upstream_rate_limit is malformed")
+            record.update(outcome="upstream-error", upstream_status=upstream_status)
+            if rate_limit:
+                record["upstream_rate_limit"] = dict(rate_limit)
+            if "upstream_retry_wait_seconds" in document:
+                record["upstream_retry_wait_seconds"] = document["upstream_retry_wait_seconds"]
+            body = json.dumps({"message": message}).encode("utf-8")
+            return RelayedResponse(logical_url, upstream_status, dict(rate_limit), body)
+        record["outcome"] = "relay-refused"
+        raise ValueError("relay refused the request: {0} {1}".format(status, code))
+
+    def _exchange(self, target: str, record: dict[str, object]) -> tuple[int, dict[str, object]]:
+        """One loopback HTTP exchange, direct or through srt's proxy; no redirect, bounded body."""
+        headers = {"Accept": "application/json"}
+        if self.proxy is None:
+            connection = http.client.HTTPConnection(self.host, self.port, timeout=self.timeout_seconds)
+            url = target
+        else:
+            # Absolute form to the exact relay URL; the proxy only forwards it.
+            proxy_host, proxy_port, authorization = self.proxy
+            connection = http.client.HTTPConnection(proxy_host, proxy_port, timeout=self.timeout_seconds)
+            url = self.base_url + target
+            if authorization is not None:
+                headers["Proxy-Authorization"] = authorization
+        try:
+            connection.request("GET", url, headers=headers)
+            response = connection.getresponse()
+            length = response.getheader("Content-Length")
+            if length is None or re.fullmatch(r"[0-9]{1,12}", length) is None:
+                record["outcome"] = "malformed_envelope"
+                raise ValueError("relay response has no valid Content-Length")
+            if int(length) > self.max_envelope_bytes:
+                record["outcome"] = "envelope_too_large"
+                raise ValueError("relay response exceeds the adapter size limit")
+            body = response.read(int(length) + 1)
+            status = response.status
+        finally:
+            connection.close()
+        if len(body) != int(length):
+            record["outcome"] = "malformed_envelope"
+            raise ValueError("relay response length does not match Content-Length")
+        try:
+            document = json.loads(body.decode("utf-8"), object_pairs_hook=_unique_object,
+                                  parse_constant=_refuse_constant)
+        except (UnicodeDecodeError, ValueError) as error:
+            record["outcome"] = "malformed_envelope"
+            raise ValueError("relay response is not one JSON object") from error
+        if not isinstance(document, dict):
+            record["outcome"] = "malformed_envelope"
+            raise ValueError("relay response is not one JSON object")
+        if isinstance(document.get("budget"), dict):
+            record["relay_budget"] = document["budget"]
+        return status, document
+
+
+def relay_client_class(collector: Any) -> type:
+    """A ``GhApiClient`` whose recorded client version names the relay transport.
+
+    Only ``_gh_version`` changes; requests, retries, and budgets stay the collector's.
+    """
+
+    class RelayGhApiClient(collector.GhApiClient):
+        def _gh_version(self) -> str:
+            return super()._gh_version() + CLIENT_VERSION_SUFFIX
+
+    return RelayGhApiClient
+
+
+def build_client(collector: Any, opener: RelayOpener, *, api_version: str, request_budget: int,
+                 **overrides: Any) -> Any:
+    return relay_client_class(collector)(
+        api_version=api_version, budget=collector.RequestBudget(request_budget),
+        opener=opener, token_provider=lambda: None, **overrides,
+    )
+
+
+def transport_record(opener: RelayOpener, collector_source: dict[str, str], run: Any) -> dict[str, object]:
+    return {
+        "schema_version": "1.0.0",
+        "relay_base_url": opener.base_url,
+        "transport": "srt-proxy" if opener.proxy is not None else "direct",
+        "no_proxy_ignored": opener.no_proxy_ignored,
+        "collector": collector_source,
+        "note": TRANSPORT_NOTE,
+        "credential": "none: token_provider returned None and no Authorization header was sent",
+        "exit_code": getattr(run, "exit_code", None),
+        "requests": opener.records,
+    }
+
+
+def _positive_int(limit: int) -> Any:
+    def parse(value: str) -> int:
+        if re.fullmatch(r"[1-9][0-9]{0,11}", value) is None or int(value) > limit:
+            raise argparse.ArgumentTypeError("must be an integer from 1 to {0}".format(limit))
+        return int(value)
+    return parse
+
+
+def _timeout(value: str) -> float:
+    try:
+        seconds = float(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("must be a number of seconds") from error
+    if not 0 < seconds <= MAX_TIMEOUT_SECONDS:
+        raise argparse.ArgumentTypeError("must be above 0 and at most {0}".format(MAX_TIMEOUT_SECONDS))
+    return seconds
+
+
+def _absolute_directory(value: str) -> Path:
+    path = Path(value)
+    if not path.is_absolute() or not path.is_dir():
+        raise argparse.ArgumentTypeError("must be an existing absolute directory")
+    return path
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="oss-research-relay-collect",
+        description="Collect recently closed PRs through the loopback relay (new collections only).",
+    )
+    parser.add_argument("--relay-url", required=True, help="exactly http://127.0.0.1:<port>")
+    parser.add_argument("--skills-dir", required=True, type=_absolute_directory,
+                        help="absolute directory holding collecting-recent-closed-prs")
+    parser.add_argument("--transport-record", required=True, help="JSON file for the per-request relay record")
+    parser.add_argument("--timeout-seconds", required=True, type=_timeout,
+                        help="socket timeout for one relay exchange; keep it above the relay's own deadline")
+    parser.add_argument("--max-response-bytes", required=True, type=_positive_int(MAX_RESPONSE_BYTES),
+                        help="the relay's --max-response-bytes; the envelope cap is twice this plus 64 KiB")
+    # The collector's own `collect` options, without --resume-run-id.
+    parser.add_argument("--repo", action="append", required=True)
+    parser.add_argument("--output", required=True)
+    parser.add_argument("--manifest", required=True)
+    parser.add_argument("--markdown-output")
+    parser.add_argument("--max-per-repo", type=int, default=25)
+    parser.add_argument("--request-budget", type=int, default=1000)
+    parser.add_argument("--api-version")
+    parser.add_argument("--timezone", default="UTC")
+    parser.add_argument("--recent-days", type=int)
+    parser.add_argument("--as-of")
+    parser.add_argument("--start-date")
+    parser.add_argument("--end-date")
+    parser.add_argument("--start-at")
+    parser.add_argument("--end-at")
+    parser.add_argument("--outcome", choices=("all", "merged", "closed-unmerged"), default="all")
+    parser.add_argument("--require-proxy", action="store_true",
+                        help="refuse to run without srt's loopback HTTP proxy (the isolated step)")
+    return parser
+
+
+def main(argv: Optional[list[str]] = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    outputs = [args.output, args.manifest, args.markdown_output, args.transport_record]
+    if any(path is not None and os.path.lexists(path) for path in outputs):
+        parser.error("outputs must not exist yet; only new collections are supported")
+    try:
+        collector, source = load_collector(args.skills_dir)
+    except (OSError, ImportError) as error:
+        print("error: could not load collecting-recent-closed-prs: {0}".format(type(error).__name__),
+              file=sys.stderr)
+        return 2
+    api_version = args.api_version or collector.API_VERSION
+    if api_version != collector.API_VERSION:
+        parser.error("--api-version must be the collector's API_VERSION, which the relay sends")
+    try:
+        proxy = srt_proxy(dict(os.environ))
+    except ValueError as error:
+        print("error: {0}".format(error), file=sys.stderr)
+        return 2
+    if proxy is None and args.require_proxy:
+        print("error: --require-proxy: no HTTP_PROXY or http_proxy is set", file=sys.stderr)
+        return 2
+    try:
+        opener = RelayOpener(collector, args.relay_url, timeout_seconds=args.timeout_seconds,
+                             max_response_bytes=args.max_response_bytes, proxy=proxy)
+        opener.no_proxy_ignored = proxy is not None and any(name in os.environ for name in NO_PROXY_VARIABLES)
+        interval = collector.resolve_interval(
+            start_at=args.start_at, end_at=args.end_at, start_date=args.start_date, end_date=args.end_date,
+            recent_days=args.recent_days, timezone_name=args.timezone, as_of=args.as_of,
+        )
+        client = build_client(collector, opener, api_version=api_version, request_budget=args.request_budget)
+        run = collector.collect(
+            client, args.repo, interval, outcome=args.outcome, max_per_repository=args.max_per_repo,
+            request_budget=args.request_budget, output=args.output, manifest_output=args.manifest,
+            markdown_output=args.markdown_output, api_version=api_version,
+        )
+    except ValueError as error:
+        print("error: {0}".format(error), file=sys.stderr)
+        return 2
+    collector.atomic_write_json(args.transport_record, transport_record(opener, source, run))
+    return run.exit_code
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

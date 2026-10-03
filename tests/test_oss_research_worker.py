@@ -16,6 +16,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 
 SCRIPT = Path(__file__).resolve().parents[1] / "dot_local/bin/executable_oss-research-worker"
@@ -193,11 +194,13 @@ class LaunchGateTests(Fixture):
                          [str(self.bin / "node"),
                           str(prefix.resolve() / "node_modules" / worker.SRT_PACKAGE
                               / "dist/cli.js")])
+        # The macOS gate order; the Linux one is in test_oss_research_worker_linux.
         with self.assertRaisesRegex(worker.Blocked, "no credential binding for claude-profile1"):
-            worker.require_runtime("claude-profile1", prefix, str(self.bin))
+            worker.require_runtime("claude-profile1", prefix, str(self.bin), platform="darwin")
         credential = write_credential(self.root)
         with self.assertRaises(worker.Blocked) as caught:
-            worker.require_runtime("claude-profile1", prefix, str(self.bin), credential)
+            worker.require_runtime("claude-profile1", prefix, str(self.bin), credential,
+                                   platform="darwin")
         self.assertIn("no real launch has been measured", str(caught.exception))
         self.assertNotIn(FAKE_TOKEN, str(caught.exception))
 
@@ -291,7 +294,8 @@ class ContractTests(Fixture):
 
     def test_policy_denies_by_default_with_documented_keys(self):
         claude = self.bin / "claude"
-        policy = worker.build_policy(self.input, self.run_dir, claude)
+        # The measured macOS policy; the Linux one is in test_oss_research_worker_linux.
+        policy = worker.build_policy(self.input, self.run_dir, claude, platform="darwin")
         self.assertEqual(set(policy), set(DOCUMENTED_KEYS))
         for section, keys in DOCUMENTED_KEYS.items():
             self.assertEqual(set(policy[section]), keys)
@@ -313,6 +317,43 @@ class ContractTests(Fixture):
         self.assertEqual(network["allowUnixSockets"], [])
         self.assertIs(network["allowAllUnixSockets"], False)
         self.assertIs(network["allowLocalBinding"], False)
+
+    def test_selection_is_passed_through_only_when_given(self):
+        policy = self.run_dir / "policy/srt-settings.json"
+        runtime = ["/opt/node", "/opt/cli.js"]
+        plain = worker.build_command(runtime, policy, "/opt/claude", "prompt")
+        self.assertNotIn("--model", plain)
+        self.assertNotIn("--effort", plain)
+        chosen = worker.build_command(runtime, policy, "/opt/claude", "prompt",
+                                      selection=worker.Selection("user-model", "xhigh"))
+        at = chosen.index("--model")
+        self.assertEqual(chosen[at:at + 4], ["--model", "user-model", "--effort", "xhigh"])
+        self.assertLess(at, chosen.index("--permission-mode"))
+        self.assertEqual([a for a in chosen if a not in ("--model", "user-model", "--effort",
+                                                         "xhigh")], plain)
+        for staged in (worker.StagedRun("deep-research", self.root),
+                       worker.StagedRun("corpus-extract", self.root)):
+            with self.subTest(staged.profile):
+                argv = worker.build_staged_command(
+                    runtime, policy, "/opt/claude", "prompt", self.run_dir, staged,
+                    selection=worker.Selection("user-model", "low"))
+                at = argv.index("--model")
+                self.assertEqual(argv[at:at + 4], ["--model", "user-model", "--effort", "low"])
+                self.assertLess(at, argv.index("--permission-mode"))
+                self.assertEqual(argv[-2:], ["--", "prompt"])
+
+    def test_selection_values_are_checked(self):
+        self.assertEqual(worker.EFFORT_LEVELS, ("low", "medium", "high", "xhigh", "max"))
+        for model in ("opus", "claude-opus-5-5", "claude-opus-5-5[1m]", "claude-sonnet-5",
+                      "vendor.model:v1", "fable", "x" * 128):
+            worker.Selection(model, "high").check()
+        for model in ("", "-p", "--model", "a b", "x\ny", "x\ty", "x\0y", "x\x7f",
+                      "x" * 129, "모델", None):
+            with self.subTest(model=model), self.assertRaises(ValueError):
+                worker.Selection(model, "high").check()
+        for effort in ("", "HIGH", "auto", "ultra", None):
+            with self.subTest(effort=effort), self.assertRaises(ValueError):
+                worker.Selection("opus", effort).check()
 
     def test_command_wraps_claude_in_runtime_with_read_tools(self):
         policy = self.run_dir / "policy/srt-settings.json"
@@ -353,6 +394,88 @@ class ContractTests(Fixture):
         self.assertEqual(result.returncode, worker.EXIT_BLOCKED, result.stderr)
         self.assertFalse(self.capture.exists())
         self.assertFalse(self.run_dir.exists())
+
+
+class SelectionGateTests(Fixture):
+    """The CLI takes both values or neither and stays behind the closed gate."""
+
+    def test_both_or_neither_and_checked_values(self):
+        for extra, code in ((("--model", "opus"), worker.EXIT_BAD_INPUT),
+                            (("--effort", "high"), worker.EXIT_BAD_INPUT),
+                            (("--model", "-p", "--effort", "high"), worker.EXIT_BAD_INPUT),
+                            (("--model", "opus", "--effort", "ultra"), 2),
+                            (("--model", "opus", "--effort", "high"), worker.EXIT_BLOCKED)):
+            with self.subTest(extra):
+                result = self.launch(self.bin, extra=extra)
+                self.assertEqual(result.returncode, code, result.stderr)
+                self.assertFalse(self.capture.exists())
+                self.assertFalse(self.run_dir.exists())
+
+    def test_open_gate_without_selection_starts_nothing(self):
+        # If the gate were opened, main still refuses to start a model run
+        # without both values: nothing starts and no default model is used.
+        prompt = self.input / "task.txt"
+        argv = ["worker", "--profile", "claude-profile1", "--input-dir", str(self.input),
+                "--prompt-file", str(self.prompt), "--run-dir", str(self.run_dir),
+                "--relay-repo", "octo/demo"]
+        opened = (["/opt/node", "/opt/cli.js"], str(self.bin / "claude"), None)
+        with mock.patch.object(worker, "require_runtime", return_value=opened), \
+                mock.patch.object(worker, "relay_launch") as relay, \
+                mock.patch.object(worker, "run_research") as research, \
+                mock.patch.object(worker.subprocess, "Popen") as popen, \
+                mock.patch.object(worker.sys, "argv", argv), mock.patch("sys.stderr"):
+            self.assertEqual(worker.main(), worker.EXIT_BLOCKED)
+        for never in (relay, research, popen):
+            never.assert_not_called()
+        self.assertFalse(self.run_dir.exists())
+
+    def test_blocked_from_the_run_itself_is_exit_3(self):
+        argv = ["worker", "--profile", "claude-profile1", "--input-dir", str(self.input),
+                "--prompt-file", str(self.prompt), "--run-dir", str(self.run_dir),
+                "--model", "claude-opus-5-5[1m]", "--effort", "xhigh"]
+        opened = (["/opt/node", "/opt/cli.js"], str(self.bin / "claude"), None)
+        with mock.patch.object(worker, "require_runtime", return_value=opened), \
+                mock.patch.object(worker, "run_research",
+                                  side_effect=worker.Blocked("refused inside")) as research, \
+                mock.patch.object(worker.sys, "argv", argv), mock.patch("sys.stderr"):
+            self.assertEqual(worker.main(), worker.EXIT_BLOCKED)
+        selection = research.call_args.args[-1]
+        self.assertEqual(selection, worker.Selection("claude-opus-5-5[1m]", "xhigh"))
+
+    def test_live_run_without_selection_is_blocked_before_anything(self):
+        credential = worker.load_credential("claude-profile1", write_credential(self.root),
+                                            self.input, self.run_dir)
+        with mock.patch.object(worker, "run_supervised") as supervised:
+            with self.assertRaisesRegex(worker.Blocked, "explicit --model and --effort"):
+                worker.run_research(["/opt/node", "/opt/cli.js"], str(self.bin / "claude"),
+                                    "prompt", self.input, self.run_dir, "claude-profile1", 20,
+                                    None, {"PATH": "/usr/bin"}, credential=credential)
+        supervised.assert_not_called()
+        self.assertFalse(self.run_dir.exists())
+
+    def test_manifest_keeps_requested_and_observed_apart(self):
+        worker.prepare_run(self.run_dir, worker.build_policy(self.input, self.run_dir,
+                                                             self.bin / "claude"))
+        result = json.dumps({"type": "result", "subtype": "success", "is_error": False,
+                             "permission_denials": [], "result": "# ok\n",
+                             "modelUsage": {"reported-model-a": {}, "reported-model-b": {}}})
+        self.assertTrue(worker.collect(self.run_dir, "claude-profile1", 0, result, "",
+                                       selection=worker.Selection("user-model", "max")))
+        manifest = json.loads((self.run_dir / "result/manifest.json").read_text())
+        self.assertEqual((manifest["requested_model"], manifest["requested_effort"]),
+                         ("user-model", "max"))
+        self.assertEqual(manifest["observed_models"], ["reported-model-a", "reported-model-b"])
+
+    def test_no_observed_models_without_a_report(self):
+        worker.prepare_run(self.run_dir, worker.build_policy(self.input, self.run_dir,
+                                                             self.bin / "claude"))
+        result = json.dumps({"type": "result", "subtype": "success", "is_error": False,
+                             "permission_denials": [], "result": "# ok\n"})
+        worker.collect(self.run_dir, "claude-profile1", 0, result, "",
+                       selection=worker.Selection("user-model", "max"))
+        manifest = json.loads((self.run_dir / "result/manifest.json").read_text())
+        self.assertNotIn("observed_models", manifest)
+        self.assertEqual(manifest["requested_model"], "user-model")
 
 
 class CollectTests(Fixture):

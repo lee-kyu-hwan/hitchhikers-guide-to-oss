@@ -9,6 +9,7 @@ import argparse
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta, timezone
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -389,7 +390,8 @@ class GhApiClient:
                 endpoint=endpoint,
                 diagnostics=diagnostics,
             )
-            if not _is_retryable(status, headers, message) or attempt == MAX_RETRIES:
+            if (not _is_retryable(status, headers, message) or attempt == MAX_RETRIES
+                    or _no_graphql_quota(endpoint, status, headers)):
                 raise failure
             event["retry_delay"] = _retry_delay(status, headers, attempt, self._clock)
             self._sleeper(event["retry_delay"])
@@ -2252,6 +2254,20 @@ def _is_retryable(status: int, headers: dict[str, str], message: str) -> bool:
     )
 
 
+def _no_graphql_quota(endpoint: str, status: int, headers: dict[str, str]) -> bool:
+    """A GraphQL 403 whose answer grants no quota (limit 0, nothing left).
+
+    Policy: when the answer in hand says the quota is 0, this run does not retry
+    it and returns the failure at once (observed for an anonymous GraphQL query
+    on 2026-09-28, where waiting for the reset ran into the caller's timeout;
+    what a later reset grants was not measured). Any other rate limit keeps its
+    wait."""
+    return (endpoint == "/graphql" and status == 403
+            and headers.get("x-ratelimit-resource") == "graphql"
+            and headers.get("x-ratelimit-limit") == "0"
+            and headers.get("x-ratelimit-remaining") == "0")
+
+
 def _retry_delay(
     status: int,
     headers: dict[str, str],
@@ -2259,12 +2275,15 @@ def _retry_delay(
     now: Callable[[], float],
 ) -> float:
     if status in {403, 429}:
+        # The server's own wait is kept as sent: retrying sooner would ask again
+        # before it allows. A long wait is ended by the caller's timeout, not
+        # cut short here. Only the headerless fallback is capped.
         retry_after = _positive_number(headers.get("retry-after"))
         if retry_after is not None:
-            return min(retry_after, MAX_RATE_LIMIT_WAIT_SECONDS)
+            return retry_after
         reset_at = _positive_number(headers.get("x-ratelimit-reset"))
         if reset_at is not None:
-            return min(max(0.0, reset_at - now()), MAX_RATE_LIMIT_WAIT_SECONDS)
+            return max(0.0, reset_at - now())
         return min(60 * (2**attempt), MAX_RATE_LIMIT_WAIT_SECONDS)
     return _transport_backoff(attempt)
 
@@ -2280,7 +2299,7 @@ def _positive_number(value: Optional[str]) -> Optional[float]:
         parsed = float(value)
     except (TypeError, ValueError):
         return None
-    return parsed if parsed >= 0 else None
+    return parsed if math.isfinite(parsed) and parsed >= 0 else None
 
 
 def _response_message(body: str) -> str:

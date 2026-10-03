@@ -33,6 +33,12 @@ A request is one JSON object with exactly these keys. Unknown keys are rejected.
 
 - `source` is where historical PRs come from. `target` is where candidates are
   checked. The two lists are independent.
+- `target` may be `null` when the caller names no target. That run collects and
+  analyzes only: there are no candidate caps, discover/locus budgets, or clone
+  flag to state, `discovery`, `locus-search`, and `record` report `skipped`
+  with the reason, and `adopt-discovery`, `adopt-locus-search`, and `record`
+  are refused as `target-unspecified`. A source repository is never used as a
+  stand-in target. An object `target` keeps every rule below.
 - There is no live mode. `offline-reuse` adopts real outputs that were produced
   earlier. `offline-fixture` is for tests and is the only mode that accepts
   `synthetic-fixture` origins.
@@ -41,8 +47,9 @@ A request is one JSON object with exactly these keys. Unknown keys are rejected.
 - `provenance` is what the session says about its own model and effort. Use
   `"unknown"` when the session does not say. Nothing is fixed or guessed.
 - `source.kind` of `issues` is accepted as a request, but the run stays
-  `pending-unsupported`: the Issue corpus is not a pull request corpus. A run
-  takes exactly one source kind; a list or a mix is rejected.
+  `pending-unsupported`: the Issue corpus is not a pull request corpus. An
+  isolated Issue collection entry exists; its output is not connected to this
+  workflow. A run takes exactly one source kind; a list or a mix is rejected.
 - `source.kind` of `curated-tracker` replaces the recent-closed keys with
   exactly these (no `interval` or `outcome`):
 
@@ -153,26 +160,52 @@ itself always sends zero external requests.
 | `failed` | Producer reported failure; downstream stops |
 | `blocked` | Budget exceeded or unverifiable; downstream stops |
 | `no-patterns` / `no-candidates` | Normal insufficient result |
+| `skipped` | Candidate stage not run because `target` is `null` (status only; never a generation) |
 
 The run outcome is one of `candidates`, `no-candidates` (decisive
-non-actionable verdicts only), `insufficient`, `failed`, `blocked`,
-`awaiting-input`, or `pending-unsupported`. Its completeness is `complete` or
+non-actionable verdicts only), `insufficient`, `analysis-only` (patterns were
+adopted but `target` is `null`, so nothing was verified), `failed`, `blocked`,
+`awaiting-input`, or `pending-unsupported`. A null-target run with no pattern
+stays `insufficient`. Its completeness is `complete` or
 `partial`.
 
 ## Division of work
 
 | Step | Kind | Owner |
 | --- | --- | --- |
-| collect (recent-closed or curated tracker), discover, locus-search | network research | verified isolated research process only; printed as plan data |
-| pattern extraction, synthesis, assessment (Agent, agy, sub-agents, deep-research) | AI research | verified isolated research process only, following the sibling contracts |
+| collect (recent-closed) | network research | isolated research launcher only, through its non-AI collection entry; printed here as plan data |
+| collect (curated tracker), discover, locus-search | network research | isolated research launcher only, and it has no entry verified against real data for these yet; printed here as plan data |
+| pattern extraction, synthesis | AI research | isolated research launcher only, in its one measured read-only launch, following the sibling contracts |
+| assessment, and anything that needs Agent, agy, sub-agents, or deep-research | AI research | isolated research launcher only, and no such path is open or verified yet |
 | corpus validation, digest, prompts, output gate, record, validate, report | mechanical, offline | this workflow calling the sibling scripts in the development session |
 
-While the isolated process's gate is unverified (the #189 launcher's `main`
-is fail-closed; its supervisor, which starts the #192 relay and the research
-process under one deadline, has only been exercised with a non-AI probe under
-the real srt; setsid escape, Keychain, auth, and Agent/auto remain open), new
-research of either kind is blocked. Only offline adoption
-of existing outputs and synthetic fixture tests may proceed.
+## Isolation gate
+
+This workflow never evaluates or bypasses the research launcher's gate. It
+adopts outputs that already exist and runs synthetic fixture tests; it opens
+no network connection and starts no process. The `argv` it prints is plan
+data with `executed: false`: it shows the scope of a step, not the isolated
+command. Direct research from the host session, GitHub writes, and lookups
+outside the recorded budget stay forbidden.
+
+New research of either kind runs only through the launcher's unit-wrapper
+entries inside the Linux VM, with the user's approval and the coordinator's
+instruction.
+
+| Launcher path | State |
+| --- | --- |
+| non-AI collection of pull requests and of Issues | has run through its entry up to real reads; the Issue reads came back partial, and the Issue output is not connected to this workflow |
+| model run, one measured launch: Debian 13 arm64 guest, read-only, `dontAsk`, no relay, the one measured combination of profile, model, and effort | open; every other model launch exits 3 |
+| `auto` | closed; no OS-level evidence that the boundaries hold under it |
+| staged runs (deep-research, Agent, search) | closed; never run with a model |
+| model run with a relay | closed |
+| macOS, every launch | closed; a setsid-escaped descendant survives cleanup and Keychain isolation is unverified |
+| candidate reads (discover, locus-search) | no isolated entry verified against real data |
+| curated tracker collection | no isolated entry |
+| assessment from an isolated model | no path |
+
+A row that is closed or unverified is never reported as available, and a
+fake success manifest from a probe is not a model result.
 
 `origin` is a caller claim. It does not prove that a model ran or that
 independent verification took place. The analyzer ledger string is not proof

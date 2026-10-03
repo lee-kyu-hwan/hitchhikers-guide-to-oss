@@ -264,6 +264,23 @@ class BuildPromptsTests(ExtractionTestCase):
         self.assertIn('"observations"', text)
         self.assertIn("다이제스트는 그 전체다.", text)
 
+    def test_extract_prompt_names_the_exact_lens_id_for_the_answer(self):
+        # The answer's "lens" must be the machine id (verifiers compare it exactly);
+        # the schema used to show a placeholder beside the lens description.
+        self.assertEqual(self.build_digest().returncode, 0)
+        run = self.directory / "extract"
+        result = run_script("build_prompts.py", "extract", "--digest-dir", self.digest_dir, "--out", run)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        lenses = ("blind", "correctness", "maintenance", "review", "structure")
+        for lens in lenses:
+            with self.subTest(lens):
+                text = (run / "prompts" / ("extract-" + lens + ".md")).read_text(encoding="utf-8")
+                self.assertIn('  "lens": "' + lens + '",', text)
+                self.assertIn('출력의 "lens" 값은 정확히 "' + lens + '" 이다', text)
+                self.assertNotIn("<LENS_ID>", text)
+                self.assertNotIn("<이번 관점 이름>", text)
+                self.assertFalse(any('"lens": "' + other + '"' in text for other in lenses if other != lens))
+
     def test_extract_on_shards_writes_one_prompt_per_shard_and_lens(self):
         self.assertEqual(self.build_digest("--max-bytes", "1100").returncode, 0)
         shards = json.loads((self.digest_dir / "keymap.json").read_text(encoding="utf-8"))["shards"]

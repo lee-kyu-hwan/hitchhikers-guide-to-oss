@@ -2842,6 +2842,29 @@ def _policy_absence_violations(
     return sorted(violations)
 
 
+def _reproduced_evidence_violations(
+    status: object, reproduction: object, readiness: object
+) -> List[str]:
+    """What a ``reproduced`` status lacks. It is actionable, so it needs a reproduction.
+
+    The same rule gates an assessment in ``record`` and a stored candidate in
+    ``validate``. Every other status is left to its own rules.
+    """
+    if status != "reproduced":
+        return []
+    violations = []
+    reproduction = reproduction if isinstance(reproduction, dict) else {}
+    if reproduction.get("method") not in ("static", "executed"):
+        violations.append("reproduction.method: reproduced requires static or executed")
+    links = reproduction.get("evidence_links")
+    if not _is_string_list(links) or not any(link.strip() for link in links):
+        violations.append("reproduction.evidence_links: reproduced requires a link")
+    check = readiness.get("reproduction_evidence") if isinstance(readiness, dict) else None
+    if not isinstance(check, dict) or check.get("result") != "confirmed":
+        violations.append("readiness_checks.reproduction_evidence: reproduced requires confirmed")
+    return violations
+
+
 def _assessment_gate_violations(
     assessment: Dict[str, object],
     discovery_record: Dict[str, object],
@@ -2934,6 +2957,9 @@ def _assessment_gate_violations(
         violations.append("disclosure_required")
     if discovery_record.get("evidence_status") == "none" and status in ("reproduced", "issue-ready", "pr-ready"):
         violations.append("evidence_status")
+    violations.extend(
+        _reproduced_evidence_violations(status, assessment.get("reproduction"), readiness)
+    )
     verdict = assessment.get("duplicate_verdict")
     if not isinstance(verdict, dict) or set(verdict) != {"matched_items", "judgment"} or not _is_string_list(verdict.get("matched_items")) or not isinstance(verdict.get("judgment"), str):
         violations.append("duplicate_verdict")
@@ -3215,6 +3241,10 @@ def validate_candidates_document(
         status = record.get("status")
         if status not in STATUS_REASON_TABLE or record.get("status_reason") not in STATUS_REASON_TABLE.get(status, ()):
             violations.append(location + ".status_reason")
+        for violation in _reproduced_evidence_violations(
+            status, record.get("reproduction"), record.get("readiness_checks")
+        ):
+            violations.append(location + "." + violation)
         if not _is_rfc3339_utc(record.get("verified_at")):
             violations.append(location + ".verified_at")
         base_sha = record.get("verified_base_sha")

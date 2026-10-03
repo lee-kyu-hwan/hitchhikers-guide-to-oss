@@ -27,16 +27,28 @@ reports. It never opens a network connection or starts a process.
   `record`, `status`, `report`), validates and collects results, and reports
   its own Orca Dispatch. Only the development worker sends its `worker_done`.
   The research process never gets the Orca socket or Dispatch capability.
-- **Gate closed now.** The #189 launcher is fail-closed: its `main` still
-  exits 3 before any process starts. Behind that gate its supervisor starts
-  the #192 relay and the research process under one deadline, exercised only
-  with a non-AI probe under the real srt. A setsid-escaped descendant survives
-  cleanup, and Keychain isolation, model auth, and Agent/search/auto behavior
-  are not verified. A fake success manifest from a probe is not a model result. Until they are, new
-  research is `blocked`. The only allowed paths are offline adoption of
-  outputs that already exist and synthetic fixture tests. This workflow
-  neither evaluates nor bypasses the gate. Its printed `argv` values are plan
-  data with `executed: false`.
+- **Offline only, here.** This workflow and the development session do two
+  things: offline adoption of outputs that already exist, and synthetic
+  fixture tests. They open no network connection and start no process. This
+  workflow neither evaluates nor bypasses the research launcher's gate. Its
+  printed `argv` values are plan data with `executed: false`: they show the
+  scope of a step, not the isolated command.
+- **Where new research runs.** New research runs only through the research
+  launcher's unit-wrapper entries inside the Linux VM, and only with the
+  user's approval and the coordinator's instruction. Non-AI collection of
+  pull requests and of Issues has run through those entries up to real
+  reads; the Issue reads came back partial. A model run opens for one
+  measured launch only: a Debian 13 arm64 guest, read-only, `dontAsk`, no
+  relay, and the one measured combination of profile, model, and effort.
+  Every other model launch exits 3.
+- **Closed or unverified.** `auto` (no OS-level evidence that the boundaries
+  hold under it), staged runs (deep-research, Agent, search), a model run
+  with a relay, and the whole macOS path (a setsid-escaped descendant
+  survives cleanup, and Keychain isolation is unverified). No isolated entry
+  has made the candidate reads (discovery, locus-search) against real data,
+  the curated collector has no isolated entry, and no path returns an
+  assessment from an isolated model. Never treat these as available. A fake
+  success manifest from a probe is not a model result.
 - **No writes or side lookups.** Make no GitHub writes. Make no ad hoc HTTP
   lookups outside the stage scripts: such a lookup is not part of the recorded
   budget and is not allowed.
@@ -67,10 +79,14 @@ reports. It never opens a network connection or starts a process.
 5. Adopt discovery and locus-search outputs from the isolated process with
    `adopt-discovery` and `adopt-locus-search`. Adopt its assessment through
    `record --assessment X --origin ai [--policy-evidence P]`. `record` runs
-   the verifier's own gate offline.
+   the verifier's own gate offline. When the caller names no target, write
+   `"target": null`: the run collects and analyzes only, the three candidate
+   stages are `skipped`, and their commands are refused. Never borrow a source
+   repository as a placeholder target.
 6. Run `report --run-dir RUN`. It writes `RUN/report.md` for nvim. State the
    outcome word exactly: `candidates`, `no-candidates`, `insufficient`,
-   `failed`, `blocked`, `awaiting-input`, or `pending-unsupported`. Also state
+   `analysis-only`, `failed`, `blocked`, `awaiting-input`, or
+   `pending-unsupported`. Also state
    its completeness. Keep synthetic fixtures, PR cases, evidence SHA and time,
    and remaining judgment separate, as the report does.
 
@@ -88,7 +104,9 @@ disk, downstream checkpoints become invalid, and the budget ledger is never
 reset. A modified output, a symlinked generation, or a revision drift blocks
 the stage until you re-adopt it.
 
-General Issue sources (`issues`) are `pending-unsupported`: the Issue corpus
-is not a pull request corpus and its skill forbids the analyzer handoff. One
-run takes one source kind. Report that boundary instead of claiming the stage
-ran.
+General Issue sources (`issues`) are `pending-unsupported`. An isolated Issue
+collection entry exists, but its output is not connected to this workflow:
+the Issue corpus is not a pull request corpus and its skill forbids the
+analyzer handoff. `init` accepts the request; `adopt-collection` and every
+later stage refuse it. One run takes one source kind. Report that boundary instead of claiming
+the stage ran.

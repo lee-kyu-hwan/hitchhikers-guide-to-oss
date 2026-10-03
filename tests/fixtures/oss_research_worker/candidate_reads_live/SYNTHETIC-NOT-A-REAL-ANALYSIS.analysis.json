@@ -1,0 +1,59 @@
+{
+ "schema_version": "1.0.0",
+ "generated_by": {
+  "name": "collecting-recent-closed-prs",
+  "revision": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+ },
+ "analysis_generated_by": {
+  "name": "analyzing-open-source-pr-patterns",
+  "revision": "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+ },
+ "records": [],
+ "patterns": [
+  {
+   "pattern_id": "PAT-001",
+   "description": "Keep validation decisions at an explicit boundary.",
+   "search_clues": [
+    "validation boundary",
+    "invalid input",
+    "validation error"
+   ],
+   "applicability": [
+    "Input reaches a public boundary."
+   ],
+   "counterconditions": [
+    "The boundary already rejects malformed input."
+   ],
+   "expected_tests": [
+    "Malformed input is rejected before side effects."
+   ],
+   "maintainer_judgment_required": [
+    "Confirm the preferred error surface."
+   ],
+   "provenance_mode": "independent-reimplementation",
+   "source_licenses": [
+    {
+     "pr_id": "PR-001",
+     "spdx_id": "NOASSERTION"
+    }
+   ],
+   "confidence": {
+    "level": "medium",
+    "evidence": [
+     "PR-001"
+    ],
+    "limitations": []
+   },
+   "superseded_by": null,
+   "pattern_history": [
+    {
+     "revision": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    }
+   ]
+  }
+ ],
+ "limitations": [
+  "SYNTHETIC - NOT A REAL ANALYSIS RESULT. Copied by hand from the verifier skill's own offline fixture and cut to one pattern (PAT-001). It carries no evidence about eslint-markdown/eslint-markdown or any real pull request; any candidate a read produces from it is not a contribution candidate.",
+  "Fixture evidence is synthetic and offline."
+ ]
+}

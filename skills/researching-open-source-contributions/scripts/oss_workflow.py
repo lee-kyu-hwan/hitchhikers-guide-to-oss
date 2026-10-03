@@ -61,6 +61,9 @@ CURATED_METHOD = "tracker-issue-comments"
 CURATED_GENERATOR = "collecting-curated-contribution-prs"
 ORIGINS = ("ai", "synthetic-fixture")
 STAGES = ("collect", "digest", "analysis", "discovery", "locus-search", "record")
+CANDIDATE_STAGES = ("discovery", "locus-search", "record")
+TARGET_UNSPECIFIED = ("no target repository was specified (request target is null); candidate verification "
+                      "(discovery, locus-search, record) is skipped")
 DOWNSTREAM = {
     "collect": ("digest", "analysis", "discovery", "locus-search", "record"),
     "digest": (),
@@ -349,7 +352,9 @@ def validate_request(request: object) -> List[str]:
     target = request["target"]
     target_keys = {"repositories", "max_candidates_per_repo", "max_candidates_total",
                    "discover_request_budget", "locus_request_budget", "allow_clone"}
-    if not isinstance(target, dict) or set(target) != target_keys:
+    if target is None:
+        pass  # collection and analysis only; candidate verification is skipped, so no target caps or budgets exist
+    elif not isinstance(target, dict) or set(target) != target_keys:
         errors.append("target keys must be exactly %s" % sorted(target_keys))
     else:
         _repositories(target["repositories"], "target.repositories", errors)
@@ -686,6 +691,13 @@ def cmd_init(args, siblings: Siblings) -> dict:
 def _require_supported(request: dict) -> None:
     if request["source"]["kind"] not in SUPPORTED_SOURCE_KINDS:
         raise WorkflowError("pending-unsupported: source.kind %s is not connected" % request["source"]["kind"])
+
+
+def _require_target(request: dict, command: str) -> dict:
+    """Candidate verification needs a caller-specified target; a null target never borrows a source repository."""
+    if request["target"] is None:
+        raise WorkflowError("target-unspecified: %s refused: %s" % (command, TARGET_UNSPECIFIED))
+    return request["target"]
 
 
 def _same_int(value: object, expected: int) -> bool:
@@ -1063,11 +1075,11 @@ def _manifest_run(manifest: dict, command: str, match) -> Optional[dict]:
 
 
 def cmd_adopt_discovery(args, siblings: Siblings, request: dict, state: dict, run: Run) -> dict:
+    target = _require_target(request, "adopt-discovery")
     analysis, reason = usable(run, state, "analysis")
     if analysis is None:
         raise WorkflowError("discovery needs a usable analysis: " + reason)
     revisions = siblings.revisions()
-    target = request["target"]
     incoming = run.incoming("discovery", state)
     try:
         data, discovery_sha = copy_input(args.discovery, incoming / "discovery.json", "discovery")
@@ -1157,6 +1169,7 @@ def cmd_adopt_discovery(args, siblings: Siblings, request: dict, state: dict, ru
 
 
 def cmd_adopt_locus(args, siblings: Siblings, request: dict, state: dict, run: Run) -> dict:
+    _require_target(request, "adopt-locus-search")
     discovery, reason = usable(run, state, "discovery")
     if discovery is None:
         raise WorkflowError("locus-search needs a usable discovery: " + reason)
@@ -1257,6 +1270,7 @@ def _refuse_http(request, timeout):
 
 
 def cmd_record(args, siblings: Siblings, request: dict, state: dict, run: Run) -> dict:
+    _require_target(request, "record")
     _check_origin(request, args.origin)
     discovery, reason = usable(run, state, "discovery")
     if discovery is None:
@@ -1316,8 +1330,11 @@ def cmd_record(args, siblings: Siblings, request: dict, state: dict, run: Run) -
 
 def next_steps(run: Run, request: dict, state: dict) -> List[dict]:
     """Plan data only; nothing here is executed or implies a passed launcher gate."""
-    plan_note = ("plan data; executed=false. Run only inside a verified isolated research process; "
-                 "the #189 launcher gate is not evaluated by this workflow.")
+    plan_note = ("plan data; executed=false. The argv shows the scope of the step, not the isolated command. "
+                 "New research runs only through the research launcher's Linux VM entries, with the user's "
+                 "approval and the coordinator's instruction; that launcher's gate is not evaluated by this workflow.")
+    # Recent-closed collection is the only network step with an isolated entry that has made real reads.
+    unverified_note = plan_note + " No isolated entry has run this step against real data yet."
     if request["source"]["kind"] not in SUPPORTED_SOURCE_KINDS:
         return [{"stage": "collect", "kind": "pending-unsupported", "executed": False,
                  "detail": "source.kind %s has no connected route" % request["source"]["kind"]}]
@@ -1337,7 +1354,7 @@ def next_steps(run: Run, request: dict, state: dict) -> List[dict]:
                 "--issue", str(source["tracker"]["issue_number"]), "--max-prs", str(source["max_prs"]),
                 "--request-budget", str(source["request_budget"]),
                 "--output", "<ISOLATED_OUTPUT>/corpus.json", "--manifest", "<ISOLATED_OUTPUT>/manifest.json"]
-        return [{"stage": "collect", "kind": "external-network-step", "executed": False, "argv": argv, "note": plan_note,
+        return [{"stage": "collect", "kind": "external-network-step", "executed": False, "argv": argv, "note": unverified_note,
                  "then": "adopt-collection --corpus ... --manifest ... (pull requests outside source.repositories "
                          "are rejected, not added)"}]
     if active(state, "collect") is None:
@@ -1357,11 +1374,15 @@ def next_steps(run: Run, request: dict, state: dict) -> List[dict]:
     if analysis is None:
         digest = active(state, "digest")
         return [{"stage": "analysis", "kind": "awaiting-ai", "executed": False,
-                 "detail": "AI extraction and synthesis (analyzer steps 3-10 on stages/digest/gen-%03d) run only "
-                           "inside the verified isolated research process; blocked while its gate is unverified. "
+                 "detail": "AI extraction and synthesis (analyzer steps 3-10 on stages/digest/gen-%03d) never run in "
+                           "this session. An isolated model run opens only for the research launcher's one measured "
+                           "read-only launch, with the user's approval; every other model launch is closed. "
                            "Adopting an existing AI output offline is allowed. The script never writes PAT-*."
                            % digest["generation"],
                  "then": "adopt-analysis --analysis ... --origin ai"}]
+    if target is None:
+        return [{"stage": stage, "kind": "skipped", "executed": False, "detail": TARGET_UNSPECIFIED}
+                for stage in CANDIDATE_STAGES]
     if analysis["status"] == "no-patterns":
         return []
     if active(state, "discovery") is None:
@@ -1372,16 +1393,17 @@ def next_steps(run: Run, request: dict, state: dict) -> List[dict]:
                  "--max-candidates-total", str(target["max_candidates_total"]),
                  "--request-budget", str(target["discover_request_budget"]),
                  "--output", "<ISOLATED_OUTPUT>/discovery.json", "--manifest", "<ISOLATED_OUTPUT>/manifest.json"]
-        return [{"stage": "discovery", "kind": "external-network-step", "executed": False, "argv": argv, "note": plan_note,
+        return [{"stage": "discovery", "kind": "external-network-step", "executed": False, "argv": argv, "note": unverified_note,
                  "then": "adopt-discovery --discovery ... --manifest ..."}]
     discovery = active(state, "discovery")
     if discovery["status"] == "no-candidates":
         return []
     if active(state, "locus-search") is None:
         return [{"stage": "assessment", "kind": "awaiting-ai", "executed": False,
-                 "detail": "the assessment of stages/discovery/gen-%03d is AI research: only inside the verified "
-                           "isolated research process; blocked while its gate is unverified" % discovery["generation"]},
-                {"stage": "locus-search", "kind": "external-network-step", "executed": False, "note": plan_note,
+                 "detail": "the assessment of stages/discovery/gen-%03d is AI research and never runs in this "
+                           "session. No isolated path returns an assessment yet; only an assessment that already "
+                           "exists can be recorded" % discovery["generation"]},
+                {"stage": "locus-search", "kind": "external-network-step", "executed": False, "note": unverified_note,
                  "argv": ["verify_candidates.py", "locus-search", "--discovery", "stages/discovery/gen-%03d/discovery.json" % discovery["generation"],
                           "--assessment", "<assessment.json>", "--output", "<ISOLATED_OUTPUT>/locus-search.json",
                           "--manifest", "<copy of stages/discovery/gen-%03d/manifest.json>" % discovery["generation"],
@@ -1412,6 +1434,9 @@ def overall(run: Run, request: dict, state: dict) -> Tuple[str, str]:
     analysis, discovery, record = active(state, "analysis"), active(state, "discovery"), active(state, "record")
     if analysis is not None and analysis["status"] == "no-patterns":
         return "insufficient", completeness
+    if analysis is not None and request["target"] is None:
+        # Patterns exist but nothing was checked against a target: never a candidate verdict.
+        return "analysis-only", completeness
     if discovery is not None and discovery["status"] == "no-candidates":
         return "insufficient", completeness
     if record is None:
@@ -1430,10 +1455,11 @@ def status_document(run: Run, request: dict, state: dict) -> dict:
     for stage in STAGES:
         generation = active(state, stage)
         history = state["stages"][stage]["generations"]
+        skipped = generation is None and stage in CANDIDATE_STAGES and request["target"] is None
         stages[stage] = {
             "active": None if generation is None else "gen-%03d" % generation["generation"],
-            "status": "not-run" if generation is None else generation["status"],
-            "reasons": [] if generation is None else generation["reasons"],
+            "status": "skipped" if skipped else "not-run" if generation is None else generation["status"],
+            "reasons": [TARGET_UNSPECIFIED] if skipped else [] if generation is None else generation["reasons"],
             "generations": len(history),
             "invalidated": [g["invalidated"] for g in history if g.get("invalidated")],
         }
@@ -1478,10 +1504,15 @@ def render_report(run: Run, request: dict, state: dict) -> str:
         lines += ["| Interval (UTC) | %s → %s |" % (source["interval"]["start_at"], source["interval"]["end_at"]),
                   "| Outcome / cap per repository | %s / %d |" % (source["outcome"], source["max_per_repository"]),
                   "| Reference repositories | %s |" % (", ".join(source["reference_repositories"]) or "none")]
-    lines += ["| Target repositories | %s |" % ", ".join("`%s`" % r for r in target["repositories"]),
-              "| Candidate caps | %d per repository, %d total |" % (target["max_candidates_per_repo"], target["max_candidates_total"]),
-              "| Static only / clone | %s / %s |" % (request["static_only"], target["allow_clone"]),
-              "| Session model / effort | %s / %s |" % (request["provenance"]["model"], request["provenance"]["effort"]), ""]
+    if target is None:
+        lines += ["| Target repositories | unspecified (candidate verification skipped) |",
+                  "| Candidate caps | not applicable (no target) |",
+                  "| Static only / clone | %s / not applicable (no target) |" % request["static_only"]]
+    else:
+        lines += ["| Target repositories | %s |" % ", ".join("`%s`" % r for r in target["repositories"]),
+                  "| Candidate caps | %d per repository, %d total |" % (target["max_candidates_per_repo"], target["max_candidates_total"]),
+                  "| Static only / clone | %s / %s |" % (request["static_only"], target["allow_clone"])]
+    lines += ["| Session model / effort | %s / %s |" % (request["provenance"]["model"], request["provenance"]["effort"]), ""]
     lines += ["## Stages", "", "| Stage | Status | Checkpoint | Inputs (sha256) | Reasons |", "| --- | --- | --- | --- | --- |"]
     for stage in STAGES:
         generation = active(state, stage)
@@ -1514,7 +1545,7 @@ def render_report(run: Run, request: dict, state: dict) -> str:
     if status["integrity_failures"]:
         lines += ["", "## Candidates", "", "Not rendered: blocked checkpoints are not read. Re-adopt them first.", ""]
     else:
-        lines += [""] + _candidate_sections(run, state) + _case_section(run, state)
+        lines += [""] + _candidate_sections(run, state, request) + _case_section(run, state)
     lines += ["## Remaining judgment and next steps", ""]
     for step in status["next"]:
         lines.append("- `%s` (%s, executed=%s): %s" % (step["stage"], step["kind"], step["executed"],
@@ -1525,9 +1556,13 @@ def render_report(run: Run, request: dict, state: dict) -> str:
         lines.append("- Last rejected command: `%s` — %s" % (status["last_rejection"]["command"], status["last_rejection"]["detail"]))
     lines += ["", "## Limits", "",
               "- Offline checkpoint validation only. No OS isolation, credential, or launcher gate is proven here.",
+              "- This workflow only adopts outputs that already exist and runs synthetic fixtures. New research "
+              "belongs to the research launcher's Linux VM entries, with the user's approval. Candidate reads "
+              "(discovery, locus-search) and assessments have no isolated path verified against real data yet.",
               "- `complete` search means every query returned; it never means no duplicate exists.",
-              "- General Issue sources (`issues`) are not connected (pending-unsupported): the Issue corpus is not a "
-              "pull request corpus, and one run takes one source kind.", ""]
+              "- General Issue sources (`issues`) are not connected (pending-unsupported): an isolated Issue "
+              "collection entry exists, but the Issue corpus is not a pull request corpus, and one run takes one "
+              "source kind.", ""]
     if source["kind"] == "curated-tracker":
         lines[-1:-1] = ["- Curated tracker: submissions come from the collector's narrow label heuristic over tracker "
                         "comments; tracker association is not upstream role evidence, and unresolved pull requests keep "
@@ -1535,8 +1570,10 @@ def render_report(run: Run, request: dict, state: dict) -> str:
     return "\n".join(lines)
 
 
-def _candidate_sections(run: Run, state: dict) -> List[str]:
+def _candidate_sections(run: Run, state: dict, request: dict) -> List[str]:
     record = active(state, "record")
+    if record is None and request["target"] is None:
+        return ["## Candidates", "", "Not verified: " + TARGET_UNSPECIFIED + ". No candidate exists; this is not a verdict.", ""]
     if record is None:
         return ["## Candidates", "", "No candidate record yet.", ""]
     synthetic = record["provenance"]["origin"] == "synthetic-fixture" or (

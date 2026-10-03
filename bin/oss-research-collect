@@ -1,0 +1,349 @@
+#!/usr/bin/env python3
+"""The non-AI collection entry: recent closed PRs through the relay, inside srt.
+
+Linux guest only, as the research user inside the unit wrapper
+(executable_oss-research-linux-run --entry collect):
+
+    executable_oss-research-collect --out-dir OUT --repo OWNER/NAME \\
+        --start-at 2026-09-01T00:00:00Z --end-at 2026-09-08T00:00:00Z \\
+        [--outcome all] [--max-per-repo 3] [--request-budget 60] [--timeout 300]
+
+It is not the research worker and opens no model path. There is no model,
+credential, profile, prompt or permission mode here; the child's policy is
+the worker's build_policy(model=False): no model endpoint, only the relay's
+loopback port once its ready line checked out. The worker's main and its
+gates (require_runtime, SYSTEM_READ_MEASURED) are untouched and cannot be
+reached through this file.
+
+What runs (the worker's own pieces, reused, not copied):
+- the worker's relay (relay_launch: unauthenticated GET allowlist, the given
+  repositories only, request budget, response caps), started by the worker's
+  Supervisor under one deadline with both groups ended on every exit;
+- the child, inside srt: the pinned python running
+  executable_oss-research-relay-collect --require-proxy, which loads the
+  reviewed collector from the worker's skills directory and reaches the relay
+  only through srt's own loopback proxy (a direct connect is refused there).
+
+The child reads only the worker's Linux system set plus the collection's own
+set: the pinned python, the reviewed collector skill's revision files (the
+collector hashes exactly these into its manifest; measured: without SKILL.md
+it stops), and the UTC tz file (measured: without it the collector stops with
+"invalid timezone: UTC"). That set is the collection's, separate from the
+model read set.
+
+Limits are fixed here: at most MAX_PER_REPO PRs per repository, a request
+budget of at most MAX_REQUEST_BUDGET (the relay gets the same budget), an
+explicit UTC interval of at most MAX_INTERVAL_DAYS days. No upstream, base URL
+or proxy can be passed: the relay talks to api.github.com only.
+
+Output, in OUT/run: output/{corpus.json, collection-manifest.json,
+inventory.md, transport.json} from the child, and in result/ (not writable
+inside srt) manifest.json (this run), relay.log, stderr.log and
+collection-envelope.json, which binds every file's size and sha256 to the
+request, the child's exit code and the relay's ready sources. The host checks
+it with tests/fixtures/oss_research_worker/linux/verify_pickup.py --collect.
+"""
+
+from __future__ import annotations
+
+import argparse
+from datetime import datetime, timedelta, timezone
+import hashlib
+import importlib.machinery
+import importlib.util
+import json
+import os
+from pathlib import Path
+import errno
+import re
+import stat
+import sys
+from typing import NamedTuple
+
+MAX_PER_REPO = 3
+MAX_REQUEST_BUDGET = 60
+MAX_INTERVAL_DAYS = 31
+MAX_TIMEOUT_SECONDS = 1800.0
+RELAY_MAX_RESPONSE_BYTES = 4 * 1024 * 1024
+RELAY_RESPONSE_BYTE_BUDGET = 64 * 1024 * 1024
+RELAY_TIMEOUT_SECONDS = 30.0
+ADAPTER_TIMEOUT_SECONDS = "30"
+ADAPTER = "executable_oss-research-relay-collect"
+OUTCOMES = ("all", "merged", "closed-unmerged")
+INSTANT = re.compile(r"\A\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ\Z")
+# The tz file the collector's ZoneInfo("UTC") opens, and its target (Debian).
+TZ_READ = ("/usr/share/zoneinfo/UTC", os.path.realpath("/usr/share/zoneinfo/UTC"))
+# The collector's own SKILL_REVISION_PATHS (collect_recent_closed_prs.py): the
+# files it reads to compute its skill revision. A test keeps the two equal.
+COLLECTOR_REVISION_FILES = ("SKILL.md", "agents/openai.yaml", "references/collection-contract.md",
+                            "references/github-rest-contract.md",
+                            "scripts/collect_recent_closed_prs.py",
+                            "tests/test_collect_recent_closed_prs.py")
+# Per output file, the same cap as the host pickup (verify_pickup MAX_MEMBER_BYTES).
+MAX_OUTPUT_BYTES = 16 * 1024 * 1024
+OUTPUTS = ("corpus.json", "collection-manifest.json", "inventory.md", "transport.json")
+ENVELOPE_SCHEMA = "oss-research-collection-envelope/1"
+# What this entry states about where the relay went. The relay has no other
+# upstream; this is a statement, never evidence of a request.
+UPSTREAM = "github-rest-via-relay"
+ENTRY = "dot_local/bin/executable_oss-research-collect"
+
+EXIT_OK = 0
+EXIT_BAD_INPUT = 2
+EXIT_BLOCKED = 3
+EXIT_FAILED = 4
+
+
+class Collection(NamedTuple):
+    repositories: tuple[str, ...]
+    start_at: str
+    end_at: str
+    outcome: str
+    max_per_repo: int
+    request_budget: int
+
+    def as_request(self) -> dict:
+        return {"repositories": list(self.repositories), "start_at": self.start_at,
+                "end_at": self.end_at, "outcome": self.outcome,
+                "max_per_repo": self.max_per_repo, "request_budget": self.request_budget}
+
+
+def load_worker(here: Path = Path(__file__)):
+    path = Path(os.path.realpath(here)).with_name("executable_oss-research-worker")
+    loader = importlib.machinery.SourceFileLoader("oss_research_worker", str(path))
+    module = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
+    loader.exec_module(module)
+    return module
+
+
+def checked_collection(worker, repositories: list[str], start_at: str, end_at: str,
+                       outcome: str, max_per_repo: int, request_budget: int) -> Collection:
+    """Raise ValueError unless the request is inside this entry's fixed limits."""
+    worker.checked_relay_request(repositories, request_budget, RELAY_MAX_RESPONSE_BYTES,
+                                 RELAY_RESPONSE_BYTE_BUDGET, RELAY_TIMEOUT_SECONDS)
+    for label, value, limit in (("max per repo", max_per_repo, MAX_PER_REPO),
+                                ("request budget", request_budget, MAX_REQUEST_BUDGET)):
+        if type(value) is not int or not 1 <= value <= limit:
+            raise ValueError(f"{label} must be an integer from 1 to {limit}")
+    if outcome not in OUTCOMES:
+        raise ValueError("outcome must be one of " + ", ".join(OUTCOMES))
+    instants = []
+    for label, value in (("start", start_at), ("end", end_at)):
+        if INSTANT.match(value or "") is None:
+            raise ValueError(f"--{label}-at must be an explicit UTC instant YYYY-MM-DDTHH:MM:SSZ")
+        instants.append(datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc))
+    if not instants[0] < instants[1] or instants[1] - instants[0] > timedelta(days=MAX_INTERVAL_DAYS):
+        raise ValueError(f"the interval must be forward and at most {MAX_INTERVAL_DAYS} days")
+    return Collection(tuple(repositories), start_at, end_at, outcome, max_per_repo, request_budget)
+
+
+def collector_file(worker) -> Path:
+    """The reviewed collector the relay also hashes (its "sibling" source)."""
+    _, skills = worker.trusted_relay(Path(worker.__file__))
+    relative = dict(worker.RELAY_SOURCES)["sibling"]
+    return (skills / relative).resolve(strict=True)
+
+
+def adapter_file(worker) -> Path:
+    return Path(os.path.realpath(worker.__file__)).with_name(ADAPTER)
+
+
+def collection_read(worker, python: str) -> list[str]:
+    skill = collector_file(worker).parents[1]
+    return [python, *[str(skill / relative) for relative in COLLECTOR_REVISION_FILES], *TZ_READ]
+
+
+def adapter_arguments(worker, collection: Collection, port: int, run_dir: Path) -> list[str]:
+    _, skills = worker.trusted_relay(Path(worker.__file__))
+    output = run_dir / "output"
+    argv = ["--relay-url", f"http://127.0.0.1:{port}", "--skills-dir", str(skills),
+            "--transport-record", str(output / "transport.json"),
+            "--timeout-seconds", ADAPTER_TIMEOUT_SECONDS,
+            "--max-response-bytes", str(RELAY_MAX_RESPONSE_BYTES)]
+    for repository in collection.repositories:
+        argv += ["--repo", repository]
+    return argv + ["--output", str(output / "corpus.json"),
+                   "--manifest", str(output / "collection-manifest.json"),
+                   "--markdown-output", str(output / "inventory.md"),
+                   "--max-per-repo", str(collection.max_per_repo),
+                   "--request-budget", str(collection.request_budget),
+                   "--start-at", collection.start_at, "--end-at", collection.end_at,
+                   "--outcome", collection.outcome, "--require-proxy"]
+
+
+def file_entry(path: Path) -> tuple[dict | None, str | None]:
+    """(size and sha256, None) of a regular file of at most MAX_OUTPUT_BYTES, or
+    (None, why). The child wrote these files: a link, FIFO, device or giant
+    file is refused before it is read (no follow, no blocking open, fstat,
+    then a bounded streamed hash)."""
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except FileNotFoundError:
+        return None, "missing"
+    except OSError as error:
+        return None, f"not openable as a plain file ({errno_name(error)})"
+    try:
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode):
+            return None, "not a regular file"
+        if info.st_size > MAX_OUTPUT_BYTES:
+            return None, f"larger than {MAX_OUTPUT_BYTES} bytes"
+        digest, total = hashlib.sha256(), 0
+        while True:
+            chunk = os.read(descriptor, 1 << 16)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > MAX_OUTPUT_BYTES:
+                return None, f"larger than {MAX_OUTPUT_BYTES} bytes"
+            digest.update(chunk)
+        return {"bytes": total, "sha256": digest.hexdigest()}, None
+    finally:
+        os.close(descriptor)
+
+
+def errno_name(error: OSError) -> str:
+    return errno.errorcode.get(error.errno, str(error.errno))
+
+
+def recorder(worker, collection: Collection, upstream: str, unit: str | None):
+    """The record function run_supervised calls instead of the model collect()."""
+
+    def record(run_dir: Path, exit_code, stdout: str, stderr: str, failures: list[str],
+               relay: dict | None) -> bool:
+        moved = worker.parent_path_problems(run_dir)
+        if moved:
+            print("OSS collection not recorded: " + "; ".join(moved), file=sys.stderr)
+            return False
+        result = run_dir / "result"
+        relay = dict(relay or {})
+        (result / "relay.log").write_text(relay.pop("stderr", ""), encoding="utf-8")
+        (result / "stderr.log").write_text(stderr, encoding="utf-8")
+        problems = list(failures)
+        if exit_code is None:
+            problems.append("no exit code: the supervisor stopped the child")
+        elif exit_code != 0:
+            problems.append(f"collection exit code {exit_code}")
+        files = {}
+        for name in OUTPUTS:
+            entry, why = file_entry(run_dir / "output" / name)
+            if entry is None:
+                problems.append(f"output {name}: {why}")
+            else:
+                files[name] = entry
+        problems += worker.area_problems(run_dir)
+        manifest = {"kind": "collection", "status": "failed" if problems else "succeeded",
+                    "exit_code": exit_code, "failures": list(failures), "problems": problems,
+                    "policy_sha256": hashlib.sha256(
+                        (run_dir / "policy/srt-settings.json").read_bytes()).hexdigest(),
+                    "request": collection.as_request(), "relay": relay}
+        (result / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+        for name in ("relay.log", "manifest.json"):
+            files["run-manifest.json" if name == "manifest.json" else name] = file_entry(result / name)[0]
+        envelope = {"schema": ENVELOPE_SCHEMA, "entry": ENTRY, "upstream": upstream, "unit": unit,
+                    "request": collection.as_request(), "adapter_exit": exit_code,
+                    "relay": {key: relay.get(key) for key in ("sources", "relay_sha256", "port")},
+                    "files": files}
+        (result / "collection-envelope.json").write_text(json.dumps(envelope, indent=1),
+                                                        encoding="utf-8")
+        return not problems
+
+    return record
+
+
+def run_collection(worker, runtime: list[str], out: Path, collection: Collection, seconds: float,
+                   launch, upstream: str = UPSTREAM, drop_read: tuple[str, ...] = ()) -> bool:
+    """One supervised collection in OUT/input (empty) and OUT/run.
+
+    launch is the worker's relay_launch for this request. Tests hand the same
+    launch with local fixture infrastructure beside it (never through a
+    command-line option); drop_read is for the read-set counterexamples only.
+    """
+    inputs = out / "input"
+    inputs.mkdir(mode=0o700)
+    run_dir = worker.checked_run_dir(out / "run", inputs.resolve())
+    python = os.path.realpath(sys.executable)
+    adapter = adapter_file(worker)
+    ports = {}
+
+    def policy_for(port):
+        ports["relay"] = port
+        policy = worker.build_policy(inputs.resolve(), run_dir, adapter, port, model=False,
+                                     runtime=runtime)
+        policy["filesystem"]["allowRead"] += collection_read(worker, python)
+        policy["filesystem"]["allowRead"] = [path for path in policy["filesystem"]["allowRead"]
+                                             if path not in drop_read]
+        return policy
+
+    def command_for(policy_file):
+        if ports.get("relay") is None:
+            # The relay failed (the supervisor recorded why); no child is started,
+            # so this argv only keeps run_supervised on its recording path.
+            return ["/nonexistent/no-relay-port"]
+        return worker.sandboxed(runtime, policy_file, [python, "-B", str(adapter),
+                                                       *adapter_arguments(worker, collection,
+                                                                          ports["relay"], run_dir)])
+
+    environment = worker.build_environment({name: os.environ[name] for name in ("PATH", "LANG")
+                                            if name in os.environ}, run_dir)
+    return worker.run_supervised(
+        inputs.resolve(), run_dir, worker.PROFILES[0], seconds, launch, policy_for, command_for,
+        environment, record=recorder(worker, collection, upstream,
+                                     os.environ.get(worker.UNIT_ENV_MARKER)))
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--out-dir", required=True, type=Path)
+    parser.add_argument("--repo", action="append", required=True)
+    parser.add_argument("--start-at", required=True)
+    parser.add_argument("--end-at", required=True)
+    parser.add_argument("--outcome", default="all")
+    parser.add_argument("--max-per-repo", type=int, default=MAX_PER_REPO)
+    parser.add_argument("--request-budget", type=int, default=MAX_REQUEST_BUDGET)
+    parser.add_argument("--timeout", type=float, default=300.0)
+    options = parser.parse_args(argv)
+    worker = load_worker()
+    try:
+        collection = checked_collection(worker, options.repo, options.start_at, options.end_at,
+                                        options.outcome, options.max_per_repo,
+                                        options.request_budget)
+        if not 0 < options.timeout <= MAX_TIMEOUT_SECONDS:
+            raise ValueError(f"timeout must be above 0 and at most {MAX_TIMEOUT_SECONDS:g}")
+        out = options.out_dir
+        if out.is_symlink() or not out.is_dir() or any(out.iterdir()):
+            raise ValueError("--out-dir must be an existing empty directory")
+    except ValueError as error:
+        print(f"OSS collection did not start: {error}", file=sys.stderr)
+        return EXIT_BAD_INPUT
+    try:
+        if sys.platform != "linux":
+            raise worker.Blocked("the collection entry runs on the Linux guest only")
+        if not worker.parent_eof_guard(dict(os.environ)):
+            raise worker.Blocked("the collection entry runs only inside the unit wrapper")
+        runtime = worker.verify_runtime(Path(os.environ.get("OSS_RESEARCH_SRT_PREFIX", "")),
+                                        os.environ.get("PATH", ""))
+        problems = worker.platform_problems(Path(runtime[1]).parents[4], sys.platform)
+        if problems:
+            raise worker.Blocked("this host cannot run srt isolated: " + "; ".join(problems))
+        request = worker.checked_relay_request(list(collection.repositories), collection.request_budget,
+                                               RELAY_MAX_RESPONSE_BYTES, RELAY_RESPONSE_BYTE_BUDGET,
+                                               RELAY_TIMEOUT_SECONDS)
+        launch = worker.relay_launch(request, dict(os.environ))
+        succeeded = run_collection(worker, runtime, out.resolve(), collection, options.timeout, launch)
+    except worker.Blocked as error:
+        print(f"OSS collection blocked: {error}", file=sys.stderr)
+        return EXIT_BLOCKED
+    try:
+        manifest = json.loads((out / "run/result/manifest.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        manifest = {}
+    print(json.dumps({"mode": "collect", "entry": ENTRY, "succeeded": succeeded,
+                      "manifest": {key: manifest.get(key) for key in ("status", "exit_code",
+                                                                      "failures", "problems")}}))
+    return EXIT_OK if succeeded else EXIT_FAILED
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

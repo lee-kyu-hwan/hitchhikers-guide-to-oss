@@ -90,11 +90,18 @@ upstream을 호출하지 않는다. `{"ok":true,"budget":{...}}`를 돌려준다
 | `/repos/O/N/issues/K/{comments,timeline}` | `page` | 배열 |
 | `/repos/O/N/pulls/K/{files,commits,reviews,comments}` | `page` | 배열 |
 | `/repos/O/N/commits/<SHA>` | 없음 | `sha` 일치, `url`이 요청 저장소 아래 |
-| `/repos/O/N/contents/<path>` | `ref=<SHA>` 필수 | 각 항목 `url`이 요청 저장소 아래, 파일이면 `path` 일치 |
+| `/repos/O/N/contents/<path>` | `ref=<SHA>` 또는 이 relay가 관측한 default branch(아래 「후보 verifier 전용 읽기」) 필수 | 각 항목 `url`이 요청 저장소 아래, 파일이면 `path` 일치 |
+| `/repos/O/N/commits/<branch>` | 없음 | `sha`가 40·64자리 hex, `url`이 요청 저장소 아래. branch는 관측한 default branch와 정확히 같을 때만 |
+| `/repos/O/N/community/profile` | 없음 | `files` 객체 |
+| `/repos/O/N/private-vulnerability-reporting` | 없음 | bool `enabled` |
 | `/search/issues` | `q`, `page` | 모든 `items[].repository_url`이 요청 저장소 |
+| `/search/code` | `q` | 모든 `items[].repository.full_name`이 요청 저장소. 질의는 아래 verifier 형태만 |
+| `/versions` | 없음 | 비어 있지 않은 문자열 배열 |
 
 - `K`는 1–10자리 양의 정수다. `SHA`는 소문자 40자리 또는 64자리 hex다.
-  branch 이름 ref는 받지 않는다.
+  branch 이름은 이 relay가 같은 저장소의 `/repos/O/N` 응답에서 직접 본
+  `default_branch`와 정확히 같을 때만 받는다(`commits/<branch>`, `contents` `ref`).
+  관측 전이거나 다른 branch면 `403 ref_not_observed`(commits) 또는 `400 bad_query`(contents)다.
 - contents 경로는 `/`로 나뉜 1–20개 세그먼트다. 세그먼트는
   `[A-Za-z0-9_.-]`이고 `.`, `..`는 안 된다. `.github` 같은 점 시작 이름은
   허용한다.
@@ -106,9 +113,29 @@ upstream을 호출하지 않는다. `{"ok":true,"budget":{...}}`를 돌려준다
   토큰은 범위를 넓힐 수 있으므로 거부한다. 큰따옴표와 작은따옴표는 모두
   거부한다. 인용 phrase 안의 `repo:`는 GitHub에서 범위가 아니라 텍스트이기
   때문이다(예: `"foo repo:a/b bar"`). 그래서 공백이 든 label 같은 인용 검색은
-  지원하지 않는다.
+  지원하지 않는다. 예외는 아래 후보 verifier의 정확한 형태 하나뿐이다.
+- `/versions`는 저장소가 아닌 유일한 읽기로, collector의 API 버전 사전 확인용이다.
+  정확한 경로의 GET만 받는다. query가 있으면 400 `query_not_allowed`다(끝의
+  빈 `?`는 빈 query로 본다). 요청 예산·응답 크기·timeout은 다른 endpoint와 같다.
 - path에 `%`, `\`, `;`, `#`, 제어문자, `//`, 빈 세그먼트, dot 세그먼트가 있으면
   거부한다. 퍼센트 인코딩된 path는 디코딩하지 않고 그대로 거부한다.
+
+### 후보 verifier 전용 읽기 (`oss-research-relay-verify`용)
+
+`oss-research-relay-verify`는 `verifying-open-source-contribution-candidates`의
+`verify_candidates.main`에 이 relay를 transport로 주입한다(discover·locus-search만).
+그 verifier가 보내는 GET만 relay가 받도록 위 표의 `commits/<branch>`,
+`community/profile`, `private-vulnerability-reporting`, `/search/code`와 branch ref를 더했다.
+쓰기·POST·redirect·예산·크기·timeout·allowlist 규칙은 그대로다.
+
+- 검색 질의는 verifier의 정확한 형태만 받는다. 인용된 clue 하나(`[^"\]` 1–200자)와 인용 밖
+  `repo:O/N` 하나다. 이슈 검색은 `repo:O/N "clue" is:issue|pr is:open|closed`, 코드 검색은
+  `repo:O/N "clue"`다. 이 형태가 아닌 코드 검색은 `403 search_grammar_not_allowed`다.
+- 응답 범위 검사: `commits/<branch>`는 `sha`와 `url`, 코드 검색은 모든 항목의 저장소, community는
+  `files`, 취약점 보고는 `enabled`를 본다. 어긋나면 `502 upstream_out_of_scope`다.
+- 익명 코드 검색은 GitHub가 401로 답하는 것으로 가정하고 그 응답을 그대로 전달한다. 실제 익명 응답은
+  이 문서의 어떤 실행으로도 측정하지 않았다(fixture mock만).
+- 이 경로는 mock으로만 검증했다. 오프라인 시험은 `tests/test_oss_research_relay_verify.py`, 격리 안(srt·unit) 실행은 비AI entry `executable_oss-research-candidate-reads`(`linux-run --entry candidate-reads`)가 한다. entry는 relay를 `--repo <대상>`과 `--repo <소유자>/.github` 두 저장소로만 띄우고 요청 예산을 60 이하로 고정하며, 호스트 회수는 `verify_pickup.py --candidate-reads`가 한다(`oss-research-worker.md` 「후보 verifier 읽기 entry」). relay의 허용 route·메서드·예산 규칙은 entry를 만들면서 넓히지 않았다. 실제 GitHub 조회와 익명 코드 검색 응답은 측정하지 않았다.
 
 ### `POST /v1/graphql`
 
@@ -145,6 +172,40 @@ query string은 붙일 수 없다.
 실패 응답은 `{"ok":false,"error":<code>,"message":...,"budget":{...}}`다.
 upstream 실패에는 `endpoint`와 `upstream_status`가 붙을 수 있다.
 
+**재시도 대기가 기한을 넘는 수신 응답** (2026-09-28 추가)
+
+직전 시도가 실제 4xx/5xx 응답을 받았고, 그 재시도 대기가 요청 기한을 넘을 수 있다. 예: 403 rate limit, 429 `Retry-After`. relay는 이 경우 기다리지도 다시 요청하지도 않는다. 대신 그 응답을 `502 upstream_failed`로 돌려준다.
+
+- `upstream_status`: 실제로 받은 status
+- `message`: upstream의 원래 `message`. 출력 가능 문자만, 500자 이하
+- `upstream_rate_limit`: 받은 헤더 중 `retry-after`, `x-ratelimit-limit|remaining|reset|used`(1~12자리 정수)와 `x-ratelimit-resource`(`[a-z_]` 32자 이하)만. 그 밖은 버린다.
+- `upstream_retry_wait_seconds`
+- `relay_reason`: `"the retry wait passes the relay request deadline"`
+
+stderr에는 JSON 한 줄(`upstream_retry_wait_passes_deadline`)을 남긴다.
+
+adapter(`oss-research-relay-collect`와 이를 재사용하는 `oss-research-relay-issues`)는 이 헤더를 같은 규칙으로 검사하고, 어긋나면 `malformed_envelope`로 거부한다. 통과하면 그 응답의 헤더로 collector에 넘긴다.
+
+collector(`collect_recent_closed_prs._retry_delay`)는 서버가 명시한 대기를 그대로 지킨다.
+
+- 유한한 `Retry-After`, 또는 reset까지의 시간을 상한으로 줄이지 않는다.
+- 헤더가 없을 때의 지수 fallback만 300초 상한이다.
+- `inf`, `nan`, 음수, 형식 오류 값은 fallback으로 처리한다.
+- 긴 대기는 supervisor의 기존 timeout이 끝낸다.
+
+응답을 받지 못한 전송 실패, 본문 읽기 중 기한, 대기열 기한은 여전히 `504 upstream_timeout`·`relay_busy_timeout`이다.
+
+**할당량이 전혀 없는 GraphQL 403** (2026-09-28 추가, 실측: 익명 GraphQL)
+
+조건은 endpoint `/graphql`, HTTP 403, `x-ratelimit-resource: graphql`, `x-ratelimit-limit: 0`, `x-ratelimit-remaining: 0`이 모두 맞을 때다.
+
+- 이때는 공유 client(`_no_graphql_quota`)가 이 실행에서 재시도하지 않고 원래 실패를 돌려준다. 손에 든 응답이 할당량 0을 말하기 때문이다(정책).
+  - 관측: 2026-09-28 익명 GraphQL 호출 1회에서, reset까지 기다리는 동안 entry timeout에 걸렸다.
+  - reset 이후 할당량이 생기는지는 측정하지 않았다. 모든 익명 호출에 영구히 해당한다는 뜻도 아니다.
+- relay는 이 실패를 `502 upstream_failed` + `upstream_status 403` + 그 응답의 안전 `upstream_rate_limit`으로 돌려준다. 수신한 응답에서 온 모든 `upstream_failed`에 이 헤더를 같은 규칙으로 붙인다.
+- 그러면 adapter 쪽 collector도 같은 판정을 한다. 이슈당 upstream 요청은 1회, 대기는 0이다. GraphQL 범주만 partial이 되고, REST 사실은 보존된다.
+- 그 밖의 경우는 기존대로 기다린다: 양의 할당량이나 남은 할당량, 다른 resource, 헤더 누락·형식 오류, 429, REST endpoint.
+
 | HTTP | code | 원인 | upstream 호출 |
 | --- | --- | --- | --- |
 | 400 | `bad_host`, `bad_target`, `header_not_allowed`, `bad_path`, `bad_query`, `query_not_allowed`, `bad_json`, `bad_graphql`, `bad_variables`, `unexpected_body` | 형식·헤더·경로·query 거부 | 없음 |
@@ -156,7 +217,7 @@ upstream 실패에는 `endpoint`와 `upstream_status`가 붙을 수 있다.
 | 502 | `upstream_failed` | 비 2xx(redirect 포함), 잘못된 JSON, 전송 실패 | 있음 |
 | 502 | `upstream_too_large` | 응답 크기 상한 초과 | 있음 |
 | 502 | `upstream_out_of_scope` | 성공 응답이 요청 범위 밖 | 있음 |
-| 504 | `upstream_timeout`, `relay_busy_timeout` | 기한 초과 | 있을 수 있음 |
+| 504 | `upstream_timeout`, `relay_busy_timeout` | 기한 초과(응답을 받지 못한 경우. 받은 응답의 긴 재시도 대기는 위 502) | 있을 수 있음 |
 
 ## 보안 제약
 
@@ -207,8 +268,8 @@ upstream 실패에는 `endpoint`와 `upstream_status`가 붙을 수 있다.
 
 - 인증 토큰, 모델 auth broker, 사용자 credential 전달
 - clone, `git-upload-pack`, archive(`tarball`/`zipball`)
-- `/search/code`, `/user`, `/versions`, 조직·사용자 endpoint
-- branch 이름 ref(`commits/main`, `contents?ref=main`). 먼저 SHA로 해석해야 한다
+- `/user`, `/versions/...` 같은 하위 경로, 조직·사용자 endpoint
+- 관측한 default branch가 아닌 branch 이름 ref. 코드 검색도 verifier의 정확한 질의 형태만 받는다
 - 조건부 요청(`If-None-Match`)과 캐시
 - 목록 endpoint의 `state`, `sort`, `since` 같은 추가 query
 - `IssueEvidence` 외 GraphQL operation

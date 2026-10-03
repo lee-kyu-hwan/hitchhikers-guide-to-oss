@@ -1,0 +1,38 @@
+{
+  "schema_version": "1.0.0",
+  "mode": "offline-reuse",
+  "source": {
+    "kind": "recent-closed-prs",
+    "repositories": [
+      "eslint-markdown/eslint-markdown",
+      "eslint/markdown"
+    ],
+    "interval": {
+      "start_at": "<RUN_START_UTC minus 30 days, YYYY-MM-DDTHH:MM:SSZ>",
+      "end_at": "<RUN_START_UTC, YYYY-MM-DDTHH:MM:SSZ>"
+    },
+    "outcome": "all",
+    "max_per_repository": 3,
+    "request_budget": 60,
+    "reference_repositories": []
+  },
+  "target": {
+    "repositories": [
+      "eslint-markdown/eslint-markdown"
+    ],
+    "max_candidates_per_repo": 5,
+    "max_candidates_total": 5,
+    "discover_request_budget": 100,
+    "locus_request_budget": 40,
+    "allow_clone": false
+  },
+  "budget": {
+    "total_api_requests": 200,
+    "max_elapsed_seconds": null
+  },
+  "static_only": true,
+  "provenance": {
+    "model": "claude-opus-5-5",
+    "effort": "medium"
+  }
+}

@@ -2776,6 +2776,140 @@ class VerifyCandidatesTests(unittest.TestCase):
             actual = json.loads(output.read_text(encoding="utf-8"))["records"][0]["verification_history"][-1]["evidence"]["duplicate_verdict"]
             self.assertEqual(expected, actual)
 
+    def ungrounded_reproduced_cases(self):
+        """Each case removes one of the three things a reproduced status needs."""
+        unconfirmed = confirmed_readiness()
+        unconfirmed["reproduction_evidence"] = {
+            "result": "not-confirmed", "evidence_links": [], "note": "not reproduced",
+        }
+        link = ["https://docs.github.com/evidence"]
+        return {
+            "reproduction.method": {
+                "reproduction": {"method": "none", "evidence_links": link, "public_steps": None},
+            },
+            "reproduction.evidence_links": {
+                "reproduction": {"method": "static", "evidence_links": [], "public_steps": ["Inspect the fixture locus."]},
+            },
+            "readiness_checks.reproduction_evidence": {"readiness_checks": unconfirmed},
+        }
+
+    def assert_reproduced_assessment_rejected(self, label, **changes):
+        record = discovery_record()
+        changes = changes or self.ungrounded_reproduced_cases()[label]
+        assessment = assessment_for(record, status="reproduced", status_reason="none", **changes)
+        with tempfile.TemporaryDirectory() as temporary:
+            result, _, _, output, manifest = self.run_record(temporary, [record], [assessment])
+            self.assertEqual(2, result[0], result[2])
+            self.assertIn("assessments[0]." + label, result[2])
+            self.assertFalse(output.exists())
+            self.assertFalse(manifest.exists())
+
+    def test_reproduced_requires_a_static_or_executed_reproduction(self):
+        self.assert_reproduced_assessment_rejected("reproduction.method")
+
+    def test_reproduced_requires_a_reproduction_evidence_link(self):
+        self.assert_reproduced_assessment_rejected("reproduction.evidence_links")
+        self.assert_reproduced_assessment_rejected(
+            "reproduction.evidence_links",
+            reproduction={"method": "static", "evidence_links": ["  "], "public_steps": None},
+        )
+
+    def test_reproduced_requires_confirmed_reproduction_evidence(self):
+        self.assert_reproduced_assessment_rejected("readiness_checks.reproduction_evidence")
+
+    def test_reproduced_with_reproduction_evidence_is_recorded_and_other_statuses_keep_their_rules(self):
+        record = discovery_record()
+        link = ["https://docs.github.com/evidence"]
+        approved = {
+            "approval": {"granted_by": "user", "granted_at": FIXTURE_TIME, "scope": "Run fixture-command."},
+            "command": "fixture-command", "isolation": "sandbox", "runtime": "python",
+            "network_policy": "none", "exit_code": 0, "output_location": "private", "output_excerpt": "ok",
+        }
+        executed = {"method": "executed", "evidence_links": link, "public_steps": []}
+        # Only reproduction_evidence is required of reproduced; the public ready states need all twelve.
+        only_reproduction = {
+            key: {"result": "not-confirmed", "evidence_links": [], "note": "not assessed"}
+            for key in verify_candidates.READINESS_KEYS
+        }
+        only_reproduction["reproduction_evidence"] = {"result": "confirmed", "evidence_links": link, "note": "read at the locus"}
+        nothing = {
+            "reproduction": {"method": "none", "evidence_links": [], "public_steps": None},
+            "readiness_checks": {
+                key: {"result": "not-confirmed", "evidence_links": [], "note": "not assessed"}
+                for key in verify_candidates.READINESS_KEYS
+            },
+        }
+        cases = (
+            ("static", dict(status="reproduced", status_reason="none")),
+            ("executed", dict(status="reproduced", status_reason="none", reproduction=executed, execution_evidence=approved)),
+            ("only-reproduction", dict(status="reproduced", status_reason="none", readiness_checks=only_reproduction)),
+            # The rule belongs to reproduced alone: these statuses still need no reproduction.
+            ("unverified", dict(status="unverified", status_reason="insufficient-evidence", **nothing)),
+            ("not-applicable", dict(status="not-applicable", status_reason="reproduction-failed", **nothing)),
+            ("duplicate", dict(status="duplicate", status_reason="duplicate-open", **nothing)),
+            ("policy-review", dict(status="policy-review", status_reason="policy-unknown", **nothing)),
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            for name, changes in cases:
+                with self.subTest(name):
+                    result, _, _, output, _ = self.run_record(Path(temporary) / name, [record], [assessment_for(record, **changes)])
+                    self.assertEqual(0, result[0], result[2])
+                    self.assertEqual(changes["status"], json.loads(output.read_text(encoding="utf-8"))["records"][0]["status"])
+                    self.assertEqual(0, self.run_main(["validate", "--candidates", str(output)])[0])
+
+    def test_candidates_holding_an_ungrounded_reproduced_record_are_rejected(self):
+        record = discovery_record()
+        grounded_assessment = assessment_for(record, status="reproduced", status_reason="none")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            result, _, _, output, manifest = self.run_record(root / "record", [record], [grounded_assessment])
+            self.assertEqual(0, result[0], result[2])
+            self.assertEqual(0, self.run_main(["validate", "--candidates", str(output)])[0])
+            grounded = json.loads(output.read_text(encoding="utf-8"))
+            fixture = root / "recheck-fixture"
+            write_fixture(fixture, make_recheck_responses(record))
+            for index, (label, changes) in enumerate(self.ungrounded_reproduced_cases().items()):
+                with self.subTest(label):
+                    document = copy.deepcopy(grounded)
+                    document["records"][0].update(copy.deepcopy(changes))
+                    path = root / ("ungrounded-%d.json" % index)
+                    path.write_text(json.dumps(document, indent=2) + "\n", encoding="utf-8")
+                    code, _, stderr, _ = self.run_main(["validate", "--candidates", str(path)])
+                    self.assertEqual(1, code)
+                    self.assertIn("$.records[0]." + label, stderr)
+                    # render, recheck, and record --candidates read the file through the same validator.
+                    rendered = root / ("rendered-%d.md" % index)
+                    code, _, stderr, _ = self.run_main(["render", "--candidates", str(path), "--output", str(rendered)])
+                    self.assertEqual(2, code)
+                    self.assertIn(label, stderr)
+                    self.assertFalse(rendered.exists())
+                    rechecked = root / ("rechecked-%d.json" % index)
+                    code, _, stderr, _ = self.run_main([
+                        "recheck", "--candidates", str(path), "--output", str(rechecked),
+                        "--manifest", str(manifest), "--fixture-dir", str(fixture),
+                    ], runner=lambda *args, **kwargs: self.fail("fixture recheck must not call a child"), clock=lambda: 100.0)
+                    self.assertEqual(2, code)
+                    self.assertIn(label, stderr)
+                    self.assertFalse(rechecked.exists())
+                    again = self.run_record(root / ("again-%d" % index), [record], [grounded_assessment], extra=["--candidates", str(path)])
+                    self.assertEqual(2, again[0][0], again[0][2])
+                    self.assertIn(label, again[0][2])
+                    self.assertFalse(again[3].exists())
+            # The grounded file keeps its reproduced status through recheck, with the evidence inherited.
+            rechecked = root / "rechecked-grounded.json"
+            code, _, stderr, _ = self.run_main([
+                "recheck", "--candidates", str(output), "--output", str(rechecked),
+                "--manifest", str(manifest), "--fixture-dir", str(fixture),
+            ], runner=lambda *args, **kwargs: self.fail("fixture recheck must not call a child"), clock=lambda: 100.0)
+            self.assertEqual(0, code, stderr)
+            after = json.loads(rechecked.read_text(encoding="utf-8"))["records"][0]
+            self.assertEqual(("reproduced", "none"), (after["status"], after["status_reason"]))
+            snapshot = after["verification_history"][-1]
+            self.assertEqual("recheck", snapshot["inputs"]["kind"])
+            self.assertEqual(grounded_assessment["reproduction"], snapshot["evidence"]["reproduction"])
+            self.assertEqual("confirmed", snapshot["evidence"]["readiness_checks"]["reproduction_evidence"]["result"])
+            self.assertEqual(0, self.run_main(["validate", "--candidates", str(rechecked), "--existing", str(output)])[0])
+
     def test_execution_evidence_requires_user_approval(self):
         record = discovery_record()
         approved = {

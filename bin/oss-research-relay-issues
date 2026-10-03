@@ -1,0 +1,321 @@
+#!/usr/bin/env python3
+"""Run the general Issue collector with the loopback relay as its transport.
+
+    executable_oss-research-relay-issues --relay-url http://127.0.0.1:PORT --skills-dir DIR \\
+        --transport-record T.json --timeout-seconds S --max-response-bytes N [--require-proxy] \\
+        --repo OWNER/NAME --date-field created|updated|closed --state open|closed|all \\
+        --start-at YYYY-MM-DDTHH:MM:SSZ --end-at YYYY-MM-DDTHH:MM:SSZ \\
+        --max-per-repo N --request-budget N --output corpus.json --manifest manifest.json
+
+This is the non-AI Issue-collection step inside a research sandbox. It collects
+nothing itself: it loads the existing
+``collecting-open-source-issues/scripts/collect_open_source_issues.py`` by
+path, checks its arguments with the collector's own parser and
+``_prepare_request``, and calls the collector's own ``collect`` with two
+clients built the way ``build_clients`` builds them, plus two injections the
+shared ``GhApiClient`` already takes:
+
+- ``opener``: ``IssueRelayOpener``, the relay-collect adapter's ``RelayOpener``
+  (reused for every REST GET, per_page=100 as the sibling sends it) with one
+  addition: the fixed ``IssueEvidence`` GraphQL POST. Only a body whose query
+  is exactly the collector's ``ISSUE_EVIDENCE_QUERY`` and whose variables are
+  exactly owner, name and number is sent, as the relay's fixed operation
+  ``{"operation": "IssueEvidence", "variables": {...}}`` to ``/v1/graphql``.
+  Any other query, a mutation, extra variables or another URL is refused
+  before a byte leaves.
+- ``token_provider``: always ``None``. No GH_TOKEN, GITHUB_TOKEN or ``gh auth
+  token`` lookup; the step refuses to start when a token variable is set, and
+  an Authorization header is refused.
+
+The ``https://api.github.com/...`` URL the collector built is the *logical*
+request; the adapter never opens a TLS connection to GitHub, and the transport
+record says so. Relay answers keep the collector's own paths (see
+relay-collect's RelayOpener): GitHub's status and payload, an upstream error's
+status (an anonymous GraphQL 401 or a 403 stays what it is and the collector
+records a partial category), the relay's budget stop as the collector's
+``BudgetExhausted``, and a relay refusal as a failed request, never as an
+absent Issue.
+
+Only new collections: an existing corpus, manifest or transport record is
+refused (no resume). Labels are refused: the collector quotes them
+(``label:"x"``) and the relay refuses quoted search text. The collector writes
+no Markdown inventory.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import importlib.machinery
+import importlib.util
+import json
+import os
+from pathlib import Path
+import sys
+from typing import Any, Optional
+import urllib.parse
+import urllib.request
+
+
+COLLECTOR_SCRIPT = Path("collecting-open-source-issues/scripts/collect_open_source_issues.py")
+ADAPTER = "executable_oss-research-relay-collect"
+TOKEN_VARIABLES = ("GH_TOKEN", "GITHUB_TOKEN")
+GRAPHQL_URL = "https://api.github.com/graphql"
+GRAPHQL_TARGET = "/v1/graphql"
+GRAPHQL_OPERATION = "IssueEvidence"
+GRAPHQL_HEADERS = frozenset({"accept", "content-type", "user-agent", "x-github-api-version"})
+MAX_GRAPHQL_BODY = 8 * 1024
+TRANSPORT_NOTE = (
+    "logical_url is the collector's api.github.com request. The adapter sent it to the loopback "
+    "relay over plain HTTP; it did not connect to api.github.com and this record is not TLS evidence."
+)
+
+
+def _sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def load_relay_collect(here: Path = Path(__file__)) -> Any:
+    """The relay-collect adapter beside this file, loaded by path (its RelayOpener is reused)."""
+    path = Path(os.path.realpath(here)).with_name(ADAPTER)
+    loader = importlib.machinery.SourceFileLoader("_oss_research_relay_collect_for_issues", str(path))
+    module = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
+    sys.modules[loader.name] = module
+    loader.exec_module(module)
+    return module
+
+
+def load_issue_collector(skills_dir: Path) -> tuple[Any, dict[str, object]]:
+    """Load the Issue collector (and, through it, its sibling) from ``skills_dir`` only."""
+    path = (skills_dir / COLLECTOR_SCRIPT).resolve(strict=True)
+    before = _sha256(path)
+    spec = importlib.util.spec_from_file_location("_oss_research_relay_issue_collector", path)
+    if spec is None or spec.loader is None:
+        raise ImportError("could not load collecting-open-source-issues")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    sibling = Path(module._sibling.__file__).resolve()
+    if Path(module.__file__).resolve() != path or _sha256(path) != before \
+            or not sibling.is_relative_to(skills_dir.resolve()):
+        raise ImportError("collector sources changed or came from another directory while loading")
+    source = {"issues": {"path": str(path), "sha256": before},
+              "sibling": {"path": str(sibling), "sha256": _sha256(sibling)},
+              "issue_evidence_query_sha256": hashlib.sha256(module.ISSUE_EVIDENCE_QUERY.encode("utf-8")).hexdigest()}
+    return module, source
+
+
+def issue_relay_opener_class(relay_collect: Any) -> type:
+    """``RelayOpener`` plus the one fixed GraphQL operation; REST stays the parent's."""
+
+    class IssueRelayOpener(relay_collect.RelayOpener):
+        def __init__(self, collector: Any, *args: Any, **kwargs: Any) -> None:
+            super().__init__(collector._sibling, *args, **kwargs)
+            self._issue_query = collector.ISSUE_EVIDENCE_QUERY
+            self._post_body: Optional[bytes] = None
+
+        def relay_target(self, request: object) -> tuple[str, str]:
+            self._post_body = None
+            if isinstance(request, urllib.request.Request) and request.get_method() == "POST":
+                logical_url, body = self._graphql_body(request)
+                self._post_body = body
+                return logical_url, GRAPHQL_TARGET
+            return super().relay_target(request)
+
+        def _graphql_body(self, request: urllib.request.Request) -> tuple[str, bytes]:
+            if request.full_url != GRAPHQL_URL:
+                raise ValueError("relay adapter posts only to https://api.github.com/graphql")
+            for name, _value in request.header_items():
+                lowered = name.lower()
+                if lowered == "authorization":
+                    raise ValueError("relay adapter refuses a credential header")
+                if lowered not in GRAPHQL_HEADERS:
+                    raise ValueError("relay adapter refuses an unexpected header")
+            if request.get_header("X-github-api-version") != self._collector.API_VERSION:
+                raise ValueError("relay adapter supports only the collector's API_VERSION")
+            data = request.data
+            if not isinstance(data, bytes) or len(data) > MAX_GRAPHQL_BODY:
+                raise ValueError("relay adapter needs a bounded GraphQL body")
+            try:
+                document = json.loads(data.decode("utf-8"), object_pairs_hook=relay_collect._unique_object,
+                                      parse_constant=relay_collect._refuse_constant)
+            except (UnicodeDecodeError, ValueError) as error:
+                raise ValueError("relay adapter refuses a malformed GraphQL body") from error
+            if not isinstance(document, dict) or set(document) != {"query", "variables"} \
+                    or document["query"] != self._issue_query:
+                raise ValueError("relay adapter sends only the collector's fixed IssueEvidence query")
+            variables = document["variables"]
+            if not isinstance(variables, dict) or set(variables) != {"owner", "name", "number"} \
+                    or not isinstance(variables["owner"], str) or not isinstance(variables["name"], str) \
+                    or not isinstance(variables["number"], int) or isinstance(variables["number"], bool):
+                raise ValueError("relay adapter sends only owner, name and number variables")
+            body = json.dumps({"operation": GRAPHQL_OPERATION, "variables": variables},
+                              separators=(",", ":")).encode("utf-8")
+            return request.full_url, body
+
+        def _exchange(self, target: str, record: dict[str, object]) -> tuple[int, dict[str, object]]:
+            if self._post_body is None:
+                return super()._exchange(target, record)
+            record["method"] = "POST"
+            record["operation"] = GRAPHQL_OPERATION
+            return self._post_exchange(target, self._post_body, record)
+
+        def _post_exchange(self, target: str, body: bytes, record: dict[str, object]) -> tuple[int, dict[str, object]]:
+            """The parent's bounded loopback exchange, as one POST of the fixed operation."""
+            import http.client
+            import re
+            headers = {"Accept": "application/json", "Content-Type": "application/json",
+                       "Content-Length": str(len(body))}
+            if self.proxy is None:
+                connection = http.client.HTTPConnection(self.host, self.port, timeout=self.timeout_seconds)
+                url = target
+            else:
+                proxy_host, proxy_port, authorization = self.proxy
+                connection = http.client.HTTPConnection(proxy_host, proxy_port, timeout=self.timeout_seconds)
+                url = self.base_url + target
+                if authorization is not None:
+                    headers["Proxy-Authorization"] = authorization
+            try:
+                connection.request("POST", url, body=body, headers=headers)
+                response = connection.getresponse()
+                length = response.getheader("Content-Length")
+                if length is None or re.fullmatch(r"[0-9]{1,12}", length) is None:
+                    record["outcome"] = "malformed_envelope"
+                    raise ValueError("relay response has no valid Content-Length")
+                if int(length) > self.max_envelope_bytes:
+                    record["outcome"] = "envelope_too_large"
+                    raise ValueError("relay response exceeds the adapter size limit")
+                data = response.read(int(length) + 1)
+                status = response.status
+            finally:
+                connection.close()
+            if len(data) != int(length):
+                record["outcome"] = "malformed_envelope"
+                raise ValueError("relay response length does not match Content-Length")
+            try:
+                document = json.loads(data.decode("utf-8"), object_pairs_hook=relay_collect._unique_object,
+                                      parse_constant=relay_collect._refuse_constant)
+            except (UnicodeDecodeError, ValueError) as error:
+                record["outcome"] = "malformed_envelope"
+                raise ValueError("relay response is not one JSON object") from error
+            if not isinstance(document, dict):
+                record["outcome"] = "malformed_envelope"
+                raise ValueError("relay response is not one JSON object")
+            if isinstance(document.get("budget"), dict):
+                record["relay_budget"] = document["budget"]
+            return status, document
+
+    return IssueRelayOpener
+
+
+def build_clients(collector: Any, relay_collect: Any, opener: Any, *, api_version: str, request_budget: int,
+                  **overrides: Any) -> tuple[Any, Any]:
+    """The collector's build_clients shape, with the relay opener and no credential.
+
+    The REST client's recorded client version names the relay transport
+    (relay-collect's relay_client_class); requests, retries and budgets stay
+    the collector's.
+    """
+    sibling = collector._sibling
+    budget = sibling.RequestBudget(request_budget)
+    common = dict(api_version=api_version, budget=budget, opener=opener, token_provider=lambda: None, **overrides)
+    rest = relay_collect.relay_client_class(sibling)(**common)
+    graphql = collector.GraphqlQueryClient(**common)
+    graphql.request_events = rest.request_events
+    return rest, graphql
+
+
+def transport_record(opener: Any, source: dict[str, object], exit_code: Optional[int]) -> dict[str, object]:
+    return {
+        "schema_version": "1.0.0",
+        "relay_base_url": opener.base_url,
+        "transport": "srt-proxy" if opener.proxy is not None else "direct",
+        "no_proxy_ignored": opener.no_proxy_ignored,
+        "collector": source,
+        "note": TRANSPORT_NOTE,
+        "credential": "none: token_provider returned None and no Authorization header was sent",
+        "exit_code": exit_code,
+        "requests": opener.records,
+    }
+
+
+def build_parser(relay_collect: Any) -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="oss-research-relay-issues",
+                                     description="Collect general Issues through the loopback relay (new only).")
+    parser.add_argument("--relay-url", required=True)
+    parser.add_argument("--skills-dir", required=True, type=relay_collect._absolute_directory)
+    parser.add_argument("--transport-record", required=True)
+    parser.add_argument("--timeout-seconds", required=True, type=relay_collect._timeout)
+    parser.add_argument("--max-response-bytes", required=True,
+                        type=relay_collect._positive_int(relay_collect.MAX_RESPONSE_BYTES))
+    parser.add_argument("--require-proxy", action="store_true")
+    return parser
+
+
+def run(argv: list[str], environ: dict[str, str], *, captured_at: Optional[str] = None,
+        **client_overrides: Any) -> int:
+    """captured_at and client_overrides (sleeper, clock) are for tests only."""
+    relay_collect = load_relay_collect()
+    args, collector_argv = build_parser(relay_collect).parse_known_args(argv)
+    if any(name in environ for name in TOKEN_VARIABLES):
+        print("error: a GitHub token variable is set; this step runs without any credential", file=sys.stderr)
+        return 2
+    try:
+        collector, source = load_issue_collector(args.skills_dir)
+    except (OSError, ImportError) as error:
+        print("error: could not load collecting-open-source-issues: {0}".format(type(error).__name__),
+              file=sys.stderr)
+        return 2
+    try:
+        options = collector.build_parser().parse_args(["collect", *collector_argv])
+    except SystemExit:
+        return 2
+    if options.label:
+        print("error: labels are not supported (the relay refuses the quoted label qualifier)", file=sys.stderr)
+        return 2
+    outputs = [os.path.realpath(os.path.abspath(path)) for path in (options.output, options.manifest,
+                                                                    args.transport_record)]
+    if len(set(outputs)) != len(outputs):
+        print("error: --output, --manifest and --transport-record must be three distinct files", file=sys.stderr)
+        return 2
+    if any(os.path.lexists(path) for path in (options.output, options.manifest, args.transport_record)):
+        print("error: outputs must not exist yet; only new collections are supported", file=sys.stderr)
+        return 2
+    if not os.path.isdir(os.path.dirname(outputs[2])):
+        print("error: --transport-record directory does not exist", file=sys.stderr)
+        return 2
+    if options.api_version != collector._sibling.API_VERSION:
+        print("error: --api-version must be the collector's API_VERSION, which the relay sends", file=sys.stderr)
+        return 2
+    try:
+        request = collector._prepare_request(options)
+        proxy = relay_collect.srt_proxy(environ)
+        if proxy is None and args.require_proxy:
+            raise ValueError("--require-proxy: no HTTP_PROXY or http_proxy is set")
+        opener = issue_relay_opener_class(relay_collect)(
+            collector, args.relay_url, timeout_seconds=args.timeout_seconds,
+            max_response_bytes=args.max_response_bytes, proxy=proxy)
+        opener.no_proxy_ignored = proxy is not None and any(
+            name in environ for name in relay_collect.NO_PROXY_VARIABLES)
+        rest, graphql = build_clients(collector, relay_collect, opener, api_version=options.api_version,
+                                      request_budget=options.request_budget, **client_overrides)
+    except ValueError as error:
+        print("error: {0}".format(error), file=sys.stderr)
+        return 2
+    result = collector.collect(
+        rest, graphql, repositories=request["repositories"], date_field=options.date_field,
+        state=options.state, labels=[], interval=request["interval"],
+        max_per_repository=options.max_per_repo, existing_corpus=None, existing_manifest=None,
+        captured_at=captured_at)
+    collector._sibling.atomic_write_json(request["output"], result.corpus)
+    collector._sibling.atomic_write_json(request["manifest"], result.manifest)
+    collector._sibling.atomic_write_json(args.transport_record, transport_record(opener, source, result.exit_code))
+    return result.exit_code
+
+
+def main(argv: Optional[list[str]] = None) -> int:
+    return run(list(sys.argv[1:] if argv is None else argv), dict(os.environ))
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

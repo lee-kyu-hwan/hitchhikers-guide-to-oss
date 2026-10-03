@@ -54,6 +54,11 @@ _NUMBER = r"(?P<number>[1-9][0-9]{0,9})"
 _SHA = r"(?P<sha>[0-9a-f]{40}|[0-9a-f]{64})"
 _CONTENT_SEGMENT = r"[A-Za-z0-9_-][A-Za-z0-9_.-]{0,254}|\.[A-Za-z0-9_-][A-Za-z0-9_.-]{0,253}"
 _CONTENT_PATH = r"(?P<path>(?:" + _CONTENT_SEGMENT + r")(?:/(?:" + _CONTENT_SEGMENT + r")){0,19})"
+# A branch name in a path or ref. It is accepted only when it is exactly the
+# default branch this relay itself observed for that repository (see
+# Relay.default_branches); the pattern only keeps it plain.
+_BRANCH_NAME = r"[A-Za-z0-9_][A-Za-z0-9_./-]{0,254}"
+_BRANCH = r"(?P<branch>" + _BRANCH_NAME + r")"
 # Each entry: (kind, pattern). The kind selects the response scope check.
 REST_ENDPOINTS = tuple((kind, re.compile(r"\A" + pattern + r"\Z")) for kind, pattern in (
     ("repository", _REPO),
@@ -64,13 +69,36 @@ REST_ENDPOINTS = tuple((kind, re.compile(r"\A" + pattern + r"\Z")) for kind, pat
     ("list", _REPO + r"/pulls/" + _NUMBER + r"/(?:files|commits|reviews|comments)"),
     ("commit", _REPO + r"/commits/" + _SHA),
     ("contents", _REPO + r"/contents/" + _CONTENT_PATH),
+    # The candidate verifier's repository facts (verifying-open-source-contribution-candidates,
+    # github-verification-contract R3.1). The head commit is read by branch name, bound to the
+    # observed default branch.
+    ("head", _REPO + r"/commits/" + _BRANCH),
+    ("community", _REPO + r"/community/profile"),
+    ("vulnerability-reporting", _REPO + r"/private-vulnerability-reporting"),
 ))
 SEARCH_ENDPOINT = "/search/issues"
+# The candidate verifier's code evidence (R3.4). Only its exact query form; an
+# unauthenticated call is expected to answer 401, which is passed on as is.
+CODE_SEARCH_ENDPOINT = "/search/code"
+# The candidate verifier's exact search forms (R3.3, R3.4, R3.5): one unquoted
+# repo: qualifier and one quoted clue. A quoted phrase is text to GitHub, so it
+# cannot widen the scope; the clue itself may hold no quote, backslash or
+# control character (MAX_SEARCH_QUERY and the printable check still apply).
+_CLUE = r'"(?P<clue>[^"\\]{1,200})"'
+VERIFIER_ISSUE_QUERY = re.compile(r"\Arepo:(?P<repository>\S+) " + _CLUE + r" is:(?:issue|pr) is:(?:open|closed)\Z")
+VERIFIER_CODE_QUERY = re.compile(r"\Arepo:(?P<repository>\S+) " + _CLUE + r"\Z")
+# The one non-repository read: the collector's API-version preflight. Exact path, no query.
+VERSIONS_ENDPOINT = "/versions"
 FORBIDDEN_REQUEST_HEADERS = frozenset({
     "authorization", "cookie", "proxy-authorization", "transfer-encoding",
     "if-none-match", "if-modified-since", "expect",
 })
 FORWARDED_RESPONSE_HEADERS = ("etag", "link", "x-ratelimit-limit", "x-ratelimit-remaining", "x-ratelimit-reset")
+# Rate-limit headers kept when a received answer's retry wait passes the deadline:
+# short integer values only (anything else is dropped, never passed on).
+RATE_LIMIT_HEADERS = ("retry-after", "x-ratelimit-limit", "x-ratelimit-remaining", "x-ratelimit-reset",
+                      "x-ratelimit-used")
+RATE_LIMIT_RESOURCE_HEADER = "x-ratelimit-resource"
 _SEARCH_SCOPE_WORD = re.compile(r"(?:repo|org|user|owner)\s*:", re.IGNORECASE)
 _SEARCH_OPERATOR = frozenset({"or", "and", "not"})
 
@@ -95,6 +123,47 @@ class ByteBudgetExhausted(Exception):
 
 class DeadlineExceeded(Exception):
     """Raised before an attempt, a read, or a retry wait that would pass the deadline."""
+
+
+class RetryWaitPassesDeadline(DeadlineExceeded):
+    """The last attempt got an HTTP answer whose retry wait would pass the deadline.
+
+    That answer was really received, so its status (and its safe rate-limit
+    headers) are kept instead of being reported as a timeout."""
+
+    def __init__(self, status: int, headers: dict[str, str], wait_seconds: float,
+                 message: Optional[str] = None) -> None:
+        # The upstream's own message when it sent one (as for any other upstream
+        # failure), so the caller sees the answer as it was.
+        super().__init__(message or "upstream answered HTTP {0}".format(status))
+        self.status = status
+        self.headers = headers
+        self.wait_seconds = wait_seconds
+
+
+def _upstream_message(body: bytes) -> Optional[str]:
+    """The "message" of an upstream error body, printable and at most 500 characters."""
+    try:
+        document = json.loads(body.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError, RecursionError):
+        return None
+    message = document.get("message") if isinstance(document, dict) else None
+    if not isinstance(message, str):
+        return None
+    message = "".join(character for character in message if character.isprintable())[:500]
+    return message or None
+
+
+def _rate_limit_headers(headers: Any) -> dict[str, str]:
+    kept = {}
+    for name in RATE_LIMIT_HEADERS:
+        value = headers.get(name) if headers is not None else None
+        if isinstance(value, str) and re.fullmatch(r"[0-9]{1,12}", value.strip()):
+            kept[name] = value.strip()
+    value = headers.get(RATE_LIMIT_RESOURCE_HEADER) if headers is not None else None
+    if isinstance(value, str) and re.fullmatch(r"[a-z_]{1,32}", value.strip()):
+        kept[RATE_LIMIT_RESOURCE_HEADER] = value.strip()
+    return kept
 
 
 def _sha256(path: Path) -> str:
@@ -176,6 +245,8 @@ class _BoundedResponse:
             read = getattr(self._response, "read1", self._response.read)
             chunk = read(READ_CHUNK_BYTES)
             if not chunk:
+                if opener.last_response is not None and opener.last_response[0] >= 400:
+                    opener.last_message = _upstream_message(bytes(body))
                 return bytes(body)
             body.extend(chunk)
             opener.bytes_consumed += len(chunk)
@@ -199,11 +270,17 @@ class BoundedOpener:
         self.response_byte_budget = response_byte_budget
         self.bytes_consumed = 0
         self.deadline: Optional[float] = None
+        # (status, safe rate-limit headers) of the last attempt's answer, None
+        # when that attempt got no answer (a transport failure or refusal).
+        self.last_response: Optional[tuple[int, dict[str, str]]] = None
+        self.last_message: Optional[str] = None
 
     def remaining(self) -> Optional[float]:
         return None if self.deadline is None else self.deadline - self._clock()
 
     def open(self, request: urllib.request.Request, timeout: float) -> _BoundedResponse:
+        self.last_response = None
+        self.last_message = None
         if self.bytes_consumed >= self.response_byte_budget:
             raise ByteBudgetExhausted("relay response byte budget is exhausted")
         remaining = self.remaining()
@@ -215,7 +292,10 @@ class BoundedOpener:
             response = self._inner.open(request, timeout=timeout)
         except urllib.error.HTTPError as error:
             response = error
-        return _BoundedResponse(response, self)
+        bounded = _BoundedResponse(response, self)
+        if isinstance(bounded.status, int):
+            self.last_response = (bounded.status, _rate_limit_headers(response.headers))
+        return bounded
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -252,6 +332,9 @@ class Relay:
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self.repositories = {repository.lower(): repository for repository in repositories}
+        # repository (lowercase) -> the default_branch of this relay's own in-scope
+        # repository response. A branch ref is accepted only when it equals this.
+        self.default_branches: dict[str, str] = {}
         self.timeout_seconds = timeout_seconds
         self._clock = clock
         self._lock = threading.Lock()
@@ -272,6 +355,9 @@ class Relay:
     def _sleep_within_deadline(self, seconds: float) -> None:
         remaining = self._opener.remaining()
         if remaining is not None and seconds >= remaining:
+            answered = self._opener.last_response
+            if answered is not None and 400 <= answered[0] <= 599:
+                raise RetryWaitPassesDeadline(answered[0], answered[1], seconds, self._opener.last_message)
             raise DeadlineExceeded("retry wait would pass the relay request deadline")
         time.sleep(seconds)
 
@@ -307,10 +393,18 @@ class Relay:
         values = dict(pairs)
         params: dict[str, object] = {}
         facts: dict[str, str] = {}
+        if path == VERSIONS_ENDPOINT:
+            if query:
+                raise RelayError(400, "query_not_allowed", "/versions takes no query")
+            return path, params, "versions", facts
         if path == SEARCH_ENDPOINT:
             kind, allowed = "search", {"q", "page"}
             params["q"] = values.get("q")
             facts["repository"] = self._check_search_query(values.get("q"))
+        elif path == CODE_SEARCH_ENDPOINT:
+            kind, allowed = "code-search", {"q"}
+            params["q"] = values.get("q")
+            facts["repository"] = self._check_search_query(values.get("q"), code=True)
         else:
             kind, match = next(
                 ((kind, pattern.match(path)) for kind, pattern in REST_ENDPOINTS if pattern.match(path)),
@@ -330,10 +424,16 @@ class Relay:
                 facts["path"] = match.group("path")
                 allowed = {"ref"}
                 ref = values.get("ref")
-                if ref is None or re.fullmatch(_SHA, ref) is None:
-                    raise RelayError(400, "bad_query", "contents needs ref set to a full lowercase commit SHA")
+                if ref is None or (re.fullmatch(_SHA, ref) is None and not self._observed_branch(canonical, ref)):
+                    raise RelayError(400, "bad_query", "contents needs ref set to a full lowercase commit SHA "
+                                     "or to the repository's observed default branch")
                 params["ref"] = ref
-            elif kind in ("repository", "license", "item"):
+            elif kind == "head":
+                if not self._observed_branch(canonical, match.group("branch")):
+                    raise RelayError(403, "ref_not_observed", "a branch commit must name the repository's "
+                                     "default branch observed by this relay")
+                allowed = set()
+            elif kind in ("repository", "license", "item", "community", "vulnerability-reporting"):
                 allowed = set()
         if set(values) - allowed:
             raise RelayError(400, "query_not_allowed", "query parameter is not in the relay allowlist")
@@ -344,17 +444,27 @@ class Relay:
             params["page"] = int(page)
         return path, params, kind, facts
 
-    def _check_search_query(self, query: Optional[str]) -> str:
+    def _check_search_query(self, query: Optional[str], code: bool = False) -> str:
         """Accept only a flat query with exactly one allowed ``repo:`` qualifier.
 
         Boolean operators, parentheses, negation, and any second scope word are
-        refused because they can widen the search past the repository.
+        refused because they can widen the search past the repository. The one
+        exception is the candidate verifier's exact form (VERIFIER_ISSUE_QUERY,
+        or VERIFIER_CODE_QUERY for code search): one quoted clue beside the one
+        unquoted repo: qualifier. Code search takes only that form.
         """
         if (
             not isinstance(query, str) or not query.strip() or len(query) > MAX_SEARCH_QUERY
             or any(ord(character) < 0x20 or ord(character) == 0x7F for character in query)
         ):
             raise RelayError(400, "bad_query", "search q must be short printable text")
+        verifier = (VERIFIER_CODE_QUERY if code else VERIFIER_ISSUE_QUERY).match(query)
+        if verifier is not None and verifier.group("clue").strip():
+            owner, _, name = verifier.group("repository").partition("/")
+            return self._allowed_repository(owner, name)
+        if code:
+            raise RelayError(403, "search_grammar_not_allowed",
+                             "code search takes only repo:OWNER/NAME \"clue\"")
         tokens = query.split()
         # Quotes are refused outright: a qualifier inside a quoted phrase is
         # text to GitHub, so it would not scope the search.
@@ -395,6 +505,11 @@ class Relay:
         return {"operation": document["operation"],
                 "variables": {"owner": canonical_owner, "name": canonical_name, "number": number}}
 
+    def _observed_branch(self, repository: str, branch: object) -> bool:
+        """Whether branch is exactly the default branch this relay observed for repository."""
+        return (isinstance(branch, str) and re.fullmatch(_BRANCH_NAME, branch) is not None
+                and ".." not in branch and self.default_branches.get(repository.lower()) == branch)
+
     @staticmethod
     def check_scope(kind: str, facts: dict[str, str], payload: object) -> Optional[str]:
         """Return why a successful payload is outside the requested scope, or None."""
@@ -413,6 +528,26 @@ class Relay:
             if not isinstance(payload, dict) or payload.get("sha") != facts["sha"] \
                     or not _within_repository(payload.get("url"), repository):
                 return "commit response names another commit or repository"
+        elif kind == "head":
+            if not isinstance(payload, dict) or not isinstance(payload.get("sha"), str) \
+                    or re.fullmatch(_SHA, payload["sha"]) is None \
+                    or not _within_repository(payload.get("url"), repository):
+                return "head commit response is not a commit of the repository"
+        elif kind == "community":
+            if not isinstance(payload, dict) or not isinstance(payload.get("files"), dict):
+                return "community profile response has no files object"
+        elif kind == "vulnerability-reporting":
+            if not isinstance(payload, dict) or not isinstance(payload.get("enabled"), bool):
+                return "private vulnerability reporting response has no enabled flag"
+        elif kind == "code-search":
+            items = payload.get("items") if isinstance(payload, dict) else None
+            if not isinstance(items, list) or not all(
+                isinstance(item, dict) and isinstance(item.get("repository"), dict)
+                and isinstance(item["repository"].get("full_name"), str)
+                and item["repository"]["full_name"].lower() == repository.lower()
+                for item in items
+            ):
+                return "code search result holds an item from another repository"
         elif kind == "contents":
             entries = payload if isinstance(payload, list) else [payload]
             if not all(isinstance(entry, dict) and _within_repository(entry.get("url"), repository)
@@ -428,6 +563,9 @@ class Relay:
                 for item in items
             ):
                 return "search result holds an item from another repository"
+        elif kind == "versions":
+            if not isinstance(payload, list) or not payload or not all(isinstance(item, str) for item in payload):
+                return "versions response is not a list of version strings"
         elif kind == "graphql":
             if not isinstance(payload, dict) or not set(payload) & {"data", "errors"}:
                 return "GraphQL response has neither data nor errors"
@@ -446,6 +584,17 @@ class Relay:
                 raise RelayError(502, "upstream_too_large", str(error), endpoint=endpoint) from error
             except ByteBudgetExhausted as error:
                 raise RelayError(429, "byte_budget_exhausted", str(error), endpoint=endpoint) from error
+            except RetryWaitPassesDeadline as error:
+                # A received answer, not a timeout: keep its status. The relay
+                # neither waits nor asks again (one request, one budget unit).
+                print(json.dumps({"event": "upstream_retry_wait_passes_deadline", "endpoint": endpoint,
+                                  "upstream_status": error.status, "wait_seconds": round(error.wait_seconds, 3),
+                                  "rate_limit": error.headers}), file=sys.stderr, flush=True)
+                raise RelayError(502, "upstream_failed", str(error), endpoint=endpoint,
+                                 upstream_status=error.status,
+                                 relay_reason="the retry wait passes the relay request deadline",
+                                 upstream_retry_wait_seconds=round(error.wait_seconds, 3),
+                                 upstream_rate_limit=error.headers) from error
             except DeadlineExceeded as error:
                 raise RelayError(504, "upstream_timeout", str(error), endpoint=endpoint) from error
             except self._sibling.BudgetExhausted as error:
@@ -454,8 +603,13 @@ class Relay:
                 if self._clock() >= deadline:
                     raise RelayError(504, "upstream_timeout", "relay request deadline passed",
                                      endpoint=endpoint) from error
+                answered = self._opener.last_response
+                # The safe rate-limit headers of the answer this failure is, so the
+                # caller's own rule (for example no GraphQL quota at all) sees them.
+                kept = ({"upstream_rate_limit": answered[1]} if answered is not None and answered[1]
+                        and answered[0] == error.status else {})
                 raise RelayError(502, "upstream_failed", str(error), endpoint=endpoint,
-                                 upstream_status=error.status) from error
+                                 upstream_status=error.status, **kept) from error
             finally:
                 self._opener.deadline = None
         finally:
@@ -463,6 +617,10 @@ class Relay:
         problem = self.check_scope(kind, facts, response.payload)
         if problem is not None:
             raise RelayError(502, "upstream_out_of_scope", problem, endpoint=endpoint)
+        if kind == "repository":
+            branch = response.payload.get("default_branch")
+            if isinstance(branch, str) and re.fullmatch(_BRANCH_NAME, branch) and ".." not in branch:
+                self.default_branches[facts["repository"].lower()] = branch
         headers = {name: response.headers[name] for name in FORWARDED_RESPONSE_HEADERS if name in response.headers}
         return {"ok": True, "status": response.status, "headers": headers, "payload": response.payload}
 
