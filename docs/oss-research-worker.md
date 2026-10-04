@@ -824,6 +824,8 @@ executable_oss-research-candidate-reads --out-dir OUT --input-dir IN --stage loc
 - 호스트 offline 시험: `tests/test_oss_research_github_token.py`(가짜 sentinel만).
 - 게스트 사례: `tests/fixtures/oss_research_worker/linux/github_token_cases.sh`(`--egress none`, loopback mock, sentinel만). 세 entry의 normal(mock upstream이 모든 요청에서 `Bearer <sentinel>`을 보는지 mock 쪽에서만 대조), 인자 없는 익명, srt child의 읽기 시도(`token-probe`), wrapper SIGKILL, 설치 직후 harness SIGKILL(reaper가 사본을 지움), 인자 거부를 본다.
 - 실제 토큰과 실제 `api.github.com`은 사용하지 않았다. 실제 토큰 측정은 별도 작업이다.
+- 비밀값 파일(토큰 등)은 `secret-file-store <경로>`로 만들고, 에이전트는 값을 대화에 받지 않고 `receiving-secrets-from-user` 스킬 절차를 따른다.
+- 조사 대상 저장소와 조사 이력은 `docs/research/oss-research-targets.md` 등록부에 적고, 조직 단위 선별은 호스트의 읽기 전용 `oss-research-scope`로 한다(격리 entry가 아니다).
 
 ## 시계 검사 (unit wrapper의 실행 전 조건)
 
