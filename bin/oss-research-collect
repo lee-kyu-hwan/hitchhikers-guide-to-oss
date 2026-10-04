@@ -6,7 +6,7 @@ Linux guest only, as the research user inside the unit wrapper
 
     executable_oss-research-collect --out-dir OUT --repo OWNER/NAME \\
         --start-at 2026-09-01T00:00:00Z --end-at 2026-09-08T00:00:00Z \\
-        [--outcome all] [--max-per-repo 3] [--request-budget 60] [--timeout 300]
+        [--outcome all] [--docs-only title|label] [--max-per-repo 5] [--request-budget 60] [--timeout 300]
 
 It is not the research worker and opens no model path. There is no model,
 credential, profile, prompt or permission mode here; the child's policy is
@@ -31,10 +31,24 @@ it stops), and the UTC tz file (measured: without it the collector stops with
 "invalid timezone: UTC"). That set is the collection's, separate from the
 model read set.
 
-Limits are fixed here: at most MAX_PER_REPO PRs per repository, a request
+--docs-only narrows the collection to documentation pull requests (default: off). The search
+step sends one fixed positive form (title: the word docs with in:title; label: label:documentation),
+and after hydration a fixed rule keeps a PR whose title starts with docs, docs( or docs: or that
+changed a docs/ path, a Markdown file or a README (changelog files do not count). The manifest
+records "search matched n, hydrated, passed m, dropped" per repository: a PR dropped after
+hydration still cost its requests. --outcome closed-unmerged searches with is:unmerged.
+
+Limits are fixed here: at most MAX_PER_REPO PRs per repository (5: about 8 requests per PR
+inside the 60 request budget; 3 requests are fixed), a request
 budget of at most MAX_REQUEST_BUDGET (the relay gets the same budget), an
 explicit UTC interval of at most MAX_INTERVAL_DAYS days. No upstream, base URL
 or proxy can be passed: the relay talks to api.github.com only.
+
+An optional --github-token-file PATH hands a read-only GitHub token file to the RELAY
+only (anonymous without it). The entry checks the file before anything starts
+(checked_github_token: a private single-line file, outside every directory the child can
+read), adds the path to the relay's argv and records only {authenticated, token_file_sha256}.
+The child never gets the token, the path or a way to read the file.
 
 Output, in OUT/run: output/{corpus.json, collection-manifest.json,
 inventory.md, transport.json} from the child, and in result/ (not writable
@@ -60,7 +74,7 @@ import stat
 import sys
 from typing import NamedTuple
 
-MAX_PER_REPO = 3
+MAX_PER_REPO = 5
 MAX_REQUEST_BUDGET = 60
 MAX_INTERVAL_DAYS = 31
 MAX_TIMEOUT_SECONDS = 1800.0
@@ -70,6 +84,8 @@ RELAY_TIMEOUT_SECONDS = 30.0
 ADAPTER_TIMEOUT_SECONDS = "30"
 ADAPTER = "executable_oss-research-relay-collect"
 OUTCOMES = ("all", "merged", "closed-unmerged")
+# The documentation filter's fixed choices (the collector's DOCS_ONLY_MODES). No other value reaches it.
+DOCS_ONLY_MODES = ("title", "label")
 INSTANT = re.compile(r"\A\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ\Z")
 # The tz file the collector's ZoneInfo("UTC") opens, and its target (Debian).
 TZ_READ = ("/usr/share/zoneinfo/UTC", os.path.realpath("/usr/share/zoneinfo/UTC"))
@@ -101,11 +117,74 @@ class Collection(NamedTuple):
     outcome: str
     max_per_repo: int
     request_budget: int
+    docs_only: str | None = None
 
     def as_request(self) -> dict:
-        return {"repositories": list(self.repositories), "start_at": self.start_at,
-                "end_at": self.end_at, "outcome": self.outcome,
-                "max_per_repo": self.max_per_repo, "request_budget": self.request_budget}
+        request = {"repositories": list(self.repositories), "start_at": self.start_at,
+                   "end_at": self.end_at, "outcome": self.outcome,
+                   "max_per_repo": self.max_per_repo, "request_budget": self.request_budget}
+        if self.docs_only is not None:
+            # Named only when the filter is on, so an unfiltered request keeps its earlier shape.
+            request["docs_only"] = self.docs_only
+        return request
+
+
+ANONYMOUS_TOKEN = {"authenticated": False, "token_file_sha256": None}
+
+
+def load_relay(worker):
+    """The relay beside the worker, loaded by path for its token-file check only."""
+    relay, _ = worker.trusted_relay(Path(worker.__file__))
+    loader = importlib.machinery.SourceFileLoader("oss_research_relay_for_token", str(relay))
+    module = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
+    loader.exec_module(module)
+    return module
+
+
+def checked_github_token(worker, value, forbidden=()) -> tuple[Path | None, dict]:
+    """(token file, marker) for --github-token-file, before anything starts.
+
+    No value is anonymous. Otherwise the path must be a plain absolute path outside the
+    forbidden directories (the ones the child reads) and the skills tree, and the relay's
+    own check must accept the file (private, one line, one link, ...). The marker holds
+    only authenticated and the file's sha256. ValueError (a fixed text) otherwise."""
+    if value is None:
+        return None, dict(ANONYMOUS_TOKEN)
+    if type(value) is not str or not value or "\0" in value or len(value) > 4096 \
+            or not os.path.isabs(value) or os.path.normpath(value) != value:
+        raise ValueError("--github-token-file must be a plain absolute path")
+    path = Path(value)
+    resolved = Path(os.path.realpath(path))
+    _, skills = worker.trusted_relay(Path(worker.__file__))
+    for directory in (*forbidden, skills):
+        directory = Path(os.path.realpath(directory))
+        if resolved == directory or directory in resolved.parents:
+            raise ValueError("the GitHub token file must be outside the directories the child reads")
+    relay = load_relay(worker)
+    try:
+        token = relay.load_github_token(path)
+    except relay.TokenFileError as error:
+        raise ValueError(f"the GitHub token file is unusable: {error}") from None
+    marker = {"authenticated": True, "token_file_sha256": token.file_sha256}
+    del token
+    return path, marker
+
+
+def launch_with_token(launch, token_file: Path | None):
+    """The relay launch with the token file named in the relay's argv (the path, never the value)."""
+    if token_file is None:
+        return launch
+    return launch._replace(argv=[*launch.argv, "--github-token-file", str(token_file)])
+
+
+def token_path_is_readable_by_child(token_file: Path, allow_read: list[str]) -> bool:
+    """Whether the srt read set covers the token file (the file itself or a directory above it)."""
+    target = os.path.realpath(token_file)
+    for entry in allow_read:
+        base = os.path.realpath(entry)
+        if target == base or target.startswith(base.rstrip("/") + "/"):
+            return True
+    return False
 
 
 def load_worker(here: Path = Path(__file__)):
@@ -117,7 +196,8 @@ def load_worker(here: Path = Path(__file__)):
 
 
 def checked_collection(worker, repositories: list[str], start_at: str, end_at: str,
-                       outcome: str, max_per_repo: int, request_budget: int) -> Collection:
+                       outcome: str, max_per_repo: int, request_budget: int,
+                       docs_only: str | None = None) -> Collection:
     """Raise ValueError unless the request is inside this entry's fixed limits."""
     worker.checked_relay_request(repositories, request_budget, RELAY_MAX_RESPONSE_BYTES,
                                  RELAY_RESPONSE_BYTE_BUDGET, RELAY_TIMEOUT_SECONDS)
@@ -127,6 +207,8 @@ def checked_collection(worker, repositories: list[str], start_at: str, end_at: s
             raise ValueError(f"{label} must be an integer from 1 to {limit}")
     if outcome not in OUTCOMES:
         raise ValueError("outcome must be one of " + ", ".join(OUTCOMES))
+    if docs_only is not None and (type(docs_only) is not str or docs_only not in DOCS_ONLY_MODES):
+        raise ValueError("docs-only must be one of " + ", ".join(DOCS_ONLY_MODES))
     instants = []
     for label, value in (("start", start_at), ("end", end_at)):
         if INSTANT.match(value or "") is None:
@@ -134,7 +216,7 @@ def checked_collection(worker, repositories: list[str], start_at: str, end_at: s
         instants.append(datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc))
     if not instants[0] < instants[1] or instants[1] - instants[0] > timedelta(days=MAX_INTERVAL_DAYS):
         raise ValueError(f"the interval must be forward and at most {MAX_INTERVAL_DAYS} days")
-    return Collection(tuple(repositories), start_at, end_at, outcome, max_per_repo, request_budget)
+    return Collection(tuple(repositories), start_at, end_at, outcome, max_per_repo, request_budget, docs_only)
 
 
 def collector_file(worker) -> Path:
@@ -162,13 +244,16 @@ def adapter_arguments(worker, collection: Collection, port: int, run_dir: Path) 
             "--max-response-bytes", str(RELAY_MAX_RESPONSE_BYTES)]
     for repository in collection.repositories:
         argv += ["--repo", repository]
-    return argv + ["--output", str(output / "corpus.json"),
-                   "--manifest", str(output / "collection-manifest.json"),
-                   "--markdown-output", str(output / "inventory.md"),
-                   "--max-per-repo", str(collection.max_per_repo),
-                   "--request-budget", str(collection.request_budget),
-                   "--start-at", collection.start_at, "--end-at", collection.end_at,
-                   "--outcome", collection.outcome, "--require-proxy"]
+    argv += ["--output", str(output / "corpus.json"),
+             "--manifest", str(output / "collection-manifest.json"),
+             "--markdown-output", str(output / "inventory.md"),
+             "--max-per-repo", str(collection.max_per_repo),
+             "--request-budget", str(collection.request_budget),
+             "--start-at", collection.start_at, "--end-at", collection.end_at,
+             "--outcome", collection.outcome]
+    if collection.docs_only is not None:
+        argv += ["--docs-only", collection.docs_only]
+    return argv + ["--require-proxy"]
 
 
 def file_entry(path: Path) -> tuple[dict | None, str | None]:
@@ -206,7 +291,8 @@ def errno_name(error: OSError) -> str:
     return errno.errorcode.get(error.errno, str(error.errno))
 
 
-def recorder(worker, collection: Collection, upstream: str, unit: str | None):
+def recorder(worker, collection: Collection, upstream: str, unit: str | None,
+             github_token: dict | None = None):
     """The record function run_supervised calls instead of the model collect()."""
 
     def record(run_dir: Path, exit_code, stdout: str, stderr: str, failures: list[str],
@@ -236,12 +322,14 @@ def recorder(worker, collection: Collection, upstream: str, unit: str | None):
                     "exit_code": exit_code, "failures": list(failures), "problems": problems,
                     "policy_sha256": hashlib.sha256(
                         (run_dir / "policy/srt-settings.json").read_bytes()).hexdigest(),
-                    "request": collection.as_request(), "relay": relay}
+                    "request": collection.as_request(), "relay": relay,
+                    "github_token": dict(github_token or ANONYMOUS_TOKEN)}
         (result / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
         for name in ("relay.log", "manifest.json"):
             files["run-manifest.json" if name == "manifest.json" else name] = file_entry(result / name)[0]
         envelope = {"schema": ENVELOPE_SCHEMA, "entry": ENTRY, "upstream": upstream, "unit": unit,
                     "request": collection.as_request(), "adapter_exit": exit_code,
+                    "github_token": dict(github_token or ANONYMOUS_TOKEN),
                     "relay": {key: relay.get(key) for key in ("sources", "relay_sha256", "port")},
                     "files": files}
         (result / "collection-envelope.json").write_text(json.dumps(envelope, indent=1),
@@ -252,7 +340,8 @@ def recorder(worker, collection: Collection, upstream: str, unit: str | None):
 
 
 def run_collection(worker, runtime: list[str], out: Path, collection: Collection, seconds: float,
-                   launch, upstream: str = UPSTREAM, drop_read: tuple[str, ...] = ()) -> bool:
+                   launch, upstream: str = UPSTREAM, drop_read: tuple[str, ...] = (),
+                   github_token: dict | None = None, github_token_file: Path | None = None) -> bool:
     """One supervised collection in OUT/input (empty) and OUT/run.
 
     launch is the worker's relay_launch for this request. Tests hand the same
@@ -273,6 +362,9 @@ def run_collection(worker, runtime: list[str], out: Path, collection: Collection
         policy["filesystem"]["allowRead"] += collection_read(worker, python)
         policy["filesystem"]["allowRead"] = [path for path in policy["filesystem"]["allowRead"]
                                              if path not in drop_read]
+        if github_token_file is not None and token_path_is_readable_by_child(
+                github_token_file, policy["filesystem"]["allowRead"]):
+            raise worker.Blocked("the srt policy would let the child read the GitHub token file")
         return policy
 
     def command_for(policy_file):
@@ -289,7 +381,7 @@ def run_collection(worker, runtime: list[str], out: Path, collection: Collection
     return worker.run_supervised(
         inputs.resolve(), run_dir, worker.PROFILES[0], seconds, launch, policy_for, command_for,
         environment, record=recorder(worker, collection, upstream,
-                                     os.environ.get(worker.UNIT_ENV_MARKER)))
+                                     os.environ.get(worker.UNIT_ENV_MARKER), github_token))
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -300,20 +392,24 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--start-at", required=True)
     parser.add_argument("--end-at", required=True)
     parser.add_argument("--outcome", default="all")
+    parser.add_argument("--docs-only", default=None)
     parser.add_argument("--max-per-repo", type=int, default=MAX_PER_REPO)
     parser.add_argument("--request-budget", type=int, default=MAX_REQUEST_BUDGET)
     parser.add_argument("--timeout", type=float, default=300.0)
+    parser.add_argument("--github-token-file", default=None)
     options = parser.parse_args(argv)
     worker = load_worker()
     try:
         collection = checked_collection(worker, options.repo, options.start_at, options.end_at,
                                         options.outcome, options.max_per_repo,
-                                        options.request_budget)
+                                        options.request_budget, options.docs_only)
         if not 0 < options.timeout <= MAX_TIMEOUT_SECONDS:
             raise ValueError(f"timeout must be above 0 and at most {MAX_TIMEOUT_SECONDS:g}")
         out = options.out_dir
         if out.is_symlink() or not out.is_dir() or any(out.iterdir()):
             raise ValueError("--out-dir must be an existing empty directory")
+        token_file, github_token = checked_github_token(worker, options.github_token_file,
+                                                        forbidden=(out.resolve(),))
     except ValueError as error:
         print(f"OSS collection did not start: {error}", file=sys.stderr)
         return EXIT_BAD_INPUT
@@ -330,8 +426,9 @@ def main(argv: list[str] | None = None) -> int:
         request = worker.checked_relay_request(list(collection.repositories), collection.request_budget,
                                                RELAY_MAX_RESPONSE_BYTES, RELAY_RESPONSE_BYTE_BUDGET,
                                                RELAY_TIMEOUT_SECONDS)
-        launch = worker.relay_launch(request, dict(os.environ))
-        succeeded = run_collection(worker, runtime, out.resolve(), collection, options.timeout, launch)
+        launch = launch_with_token(worker.relay_launch(request, dict(os.environ)), token_file)
+        succeeded = run_collection(worker, runtime, out.resolve(), collection, options.timeout, launch,
+                                   github_token=github_token, github_token_file=token_file)
     except worker.Blocked as error:
         print(f"OSS collection blocked: {error}", file=sys.stderr)
         return EXIT_BLOCKED

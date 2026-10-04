@@ -7,7 +7,7 @@ Linux guest only, as the research user inside the unit wrapper
     executable_oss-research-collect-issues --out-dir OUT --repo OWNER/NAME \\
         --date-field created|updated|closed --state open|closed|all \\
         --start-at 2026-03-28T00:00:00Z --end-at 2026-09-28T00:00:00Z \\
-        [--max-per-repo 20] [--request-budget 60] [--timeout 300]
+        [--max-per-repo 14] [--request-budget 60] [--timeout 300]
 
 It is the PR collection entry (executable_oss-research-collect) with the Issue
 collector behind it, and nothing else changes: the same worker pieces (relay,
@@ -34,11 +34,19 @@ the UTC tz file.
 Limits are fixed here: at most MAX_ISSUES Issues in all (repositories x
 max-per-repo), a request budget of at most MAX_REQUEST_BUDGET (the relay gets
 the same budget), an explicit UTC interval of at most MAX_INTERVAL_DAYS days.
+The defaults (14 Issues, budget 60) are a cap the budget can read: an Issue
+costs about 4 requests, so 15 Issues need a budget of at least 70. --state takes
+open, closed or all, and --date-field created, updated or closed (closed needs a
+state that has closed Issues).
 
 Status is the collector's, never raised: its exit 0 with a complete collection
 is "succeeded" (exit 0); its exit 3 is "partial" (exit EXIT_PARTIAL), because
 the cap, the budget or an unknown GraphQL category left it incomplete; anything
 else is "failed" (exit 4). Every outcome is kept.
+
+An optional --github-token-file PATH hands a read-only GitHub token file to the RELAY only
+(anonymous without it), checked and recorded exactly as in executable_oss-research-collect
+(collect_entry.checked_github_token): the child never gets the token or the path.
 
 Output, in OUT/run: output/{corpus.json, collection-manifest.json,
 transport.json} from the child, and in result/ manifest.json (this run),
@@ -62,8 +70,15 @@ import re
 import sys
 from typing import NamedTuple
 
+# An Issue costs about 4 requests (the Issue, its comments and timeline, one GraphQL) and a
+# repository 3 fixed ones. Measured 2026-10-03 with 14 Issues: 59 and 60 requests. So the
+# DEFAULT cap is the number the DEFAULT budget can read (14 of 60), while the ceilings leave
+# room for a full cap: 3 + 4 x 20 = 83 <= 90. A caller who wants 15 Issues asks for a budget
+# of at least 70; 15 with the default budget is then no longer a silent "14 and partial".
 MAX_ISSUES = 20
-MAX_REQUEST_BUDGET = 60
+MAX_REQUEST_BUDGET = 90
+DEFAULT_ISSUES = 14
+DEFAULT_REQUEST_BUDGET = 60
 MAX_INTERVAL_DAYS = 184
 MAX_TIMEOUT_SECONDS = 1800.0
 RELAY_MAX_RESPONSE_BYTES = 4 * 1024 * 1024
@@ -204,7 +219,8 @@ def run_status(exit_code, problems: list[str]) -> str:
     return "succeeded" if exit_code == COLLECTOR_COMPLETE else "partial"
 
 
-def recorder(worker, collect_entry, collection: IssueCollection, upstream: str, unit: str | None):
+def recorder(worker, collect_entry, collection: IssueCollection, upstream: str, unit: str | None,
+             github_token: dict | None = None):
     """The record function run_supervised calls instead of the model collect()."""
 
     def record(run_dir: Path, exit_code, stdout: str, stderr: str, failures: list[str],
@@ -235,13 +251,15 @@ def recorder(worker, collect_entry, collection: IssueCollection, upstream: str, 
                     "exit_code": exit_code, "failures": list(failures), "problems": problems,
                     "policy_sha256": hashlib.sha256(
                         (run_dir / "policy/srt-settings.json").read_bytes()).hexdigest(),
-                    "request": collection.as_request(), "relay": relay}
+                    "request": collection.as_request(), "relay": relay,
+                    "github_token": dict(github_token or collect_entry.ANONYMOUS_TOKEN)}
         (result / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
         for name in ("relay.log", "manifest.json"):
             files["run-manifest.json" if name == "manifest.json" else name] = \
                 collect_entry.file_entry(result / name)[0]
         envelope = {"schema": ENVELOPE_SCHEMA, "entry": ENTRY, "upstream": upstream, "unit": unit,
                     "request": collection.as_request(), "adapter_exit": exit_code,
+                    "github_token": dict(github_token or collect_entry.ANONYMOUS_TOKEN),
                     "relay": {key: relay.get(key) for key in ("sources", "relay_sha256", "port")},
                     "files": files}
         (result / "collection-envelope.json").write_text(json.dumps(envelope, indent=1),
@@ -253,7 +271,8 @@ def recorder(worker, collect_entry, collection: IssueCollection, upstream: str, 
 
 def run_collection(worker, collect_entry, runtime: list[str], out: Path,
                    collection: IssueCollection, seconds: float, launch,
-                   upstream: str = UPSTREAM, drop_read: tuple[str, ...] = ()) -> bool:
+                   upstream: str = UPSTREAM, drop_read: tuple[str, ...] = (),
+                   github_token: dict | None = None, github_token_file: Path | None = None) -> bool:
     """One supervised Issue collection in OUT/input (empty) and OUT/run.
 
     launch is the worker's relay_launch for this request. Tests hand the same
@@ -274,6 +293,9 @@ def run_collection(worker, collect_entry, runtime: list[str], out: Path,
         policy["filesystem"]["allowRead"] += collection_read(worker, python)
         policy["filesystem"]["allowRead"] = [path for path in policy["filesystem"]["allowRead"]
                                              if path not in drop_read]
+        if github_token_file is not None and collect_entry.token_path_is_readable_by_child(
+                github_token_file, policy["filesystem"]["allowRead"]):
+            raise worker.Blocked("the srt policy would let the child read the GitHub token file")
         return policy
 
     def command_for(policy_file):
@@ -289,10 +311,10 @@ def run_collection(worker, collect_entry, runtime: list[str], out: Path,
     return worker.run_supervised(
         inputs.resolve(), run_dir, worker.PROFILES[0], seconds, launch, policy_for, command_for,
         environment, record=recorder(worker, collect_entry, collection, upstream,
-                                     os.environ.get(worker.UNIT_ENV_MARKER)))
+                                     os.environ.get(worker.UNIT_ENV_MARKER), github_token))
 
 
-def main(argv: list[str] | None = None) -> int:
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--out-dir", required=True, type=Path)
@@ -301,10 +323,15 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--state", required=True)
     parser.add_argument("--start-at", required=True)
     parser.add_argument("--end-at", required=True)
-    parser.add_argument("--max-per-repo", type=int, default=MAX_ISSUES)
-    parser.add_argument("--request-budget", type=int, default=MAX_REQUEST_BUDGET)
+    parser.add_argument("--max-per-repo", type=int, default=DEFAULT_ISSUES)
+    parser.add_argument("--request-budget", type=int, default=DEFAULT_REQUEST_BUDGET)
     parser.add_argument("--timeout", type=float, default=300.0)
-    options = parser.parse_args(argv)
+    parser.add_argument("--github-token-file", default=None)
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    options = build_parser().parse_args(argv)
     collect_entry = load_collect_entry()
     worker = collect_entry.load_worker()
     try:
@@ -316,6 +343,8 @@ def main(argv: list[str] | None = None) -> int:
         out = options.out_dir
         if out.is_symlink() or not out.is_dir() or any(out.iterdir()):
             raise ValueError("--out-dir must be an existing empty directory")
+        token_file, github_token = collect_entry.checked_github_token(worker, options.github_token_file,
+                                                                      forbidden=(out.resolve(),))
     except ValueError as error:
         print(f"OSS Issue collection did not start: {error}", file=sys.stderr)
         return EXIT_BAD_INPUT
@@ -334,9 +363,10 @@ def main(argv: list[str] | None = None) -> int:
         request = worker.checked_relay_request(list(collection.repositories), collection.request_budget,
                                                RELAY_MAX_RESPONSE_BYTES, RELAY_RESPONSE_BYTE_BUDGET,
                                                RELAY_TIMEOUT_SECONDS)
-        launch = worker.relay_launch(request, dict(os.environ))
+        launch = collect_entry.launch_with_token(worker.relay_launch(request, dict(os.environ)), token_file)
         kept = run_collection(worker, collect_entry, runtime, out.resolve(), collection,
-                              options.timeout, launch)
+                              options.timeout, launch, github_token=github_token,
+                              github_token_file=token_file)
     except worker.Blocked as error:
         print(f"OSS Issue collection blocked: {error}", file=sys.stderr)
         return EXIT_BLOCKED

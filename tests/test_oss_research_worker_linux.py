@@ -1649,11 +1649,35 @@ class CollectEntryTests(unittest.TestCase):
     def collection(self, **changes):
         names = ("repositories", "start_at", "end_at", "outcome", "max_per_repo", "request_budget")
         values = dict(zip(names, self.GOOD), **changes)
-        return collect_entry.checked_collection(worker, *[values[n] for n in names])
+        return collect_entry.checked_collection(worker, *[values[n] for n in names],
+                                                **({"docs_only": values["docs_only"]} if "docs_only" in values else {}))
+
+    def test_the_cap_is_five_pull_requests_per_repository(self):
+        self.assertEqual(collect_entry.MAX_PER_REPO, 5)
+        self.assertEqual(self.collection(max_per_repo=5).as_request()["max_per_repo"], 5)
+        self.assertEqual(self.collection(max_per_repo=5, request_budget=60).as_request()["request_budget"], 60)
+
+    def test_docs_only_is_a_fixed_choice_and_appears_in_the_request_only_when_set(self):
+        self.assertNotIn("docs_only", self.collection().as_request())
+        self.assertNotIn("docs_only", self.collection(docs_only=None).as_request())
+        for mode in ("title", "label"):
+            self.assertEqual(self.collection(docs_only=mode).as_request()["docs_only"], mode)
+        for mode in ("", "body", "docs", True, 1):
+            with self.subTest(mode=mode), self.assertRaises(ValueError):
+                self.collection(docs_only=mode)
+
+    def test_the_argv_names_docs_only_before_require_proxy_only_when_set(self):
+        out = self.root / "argv"
+        plain = collect_entry.adapter_arguments(worker, self.collection(), 4242, out)
+        self.assertNotIn("--docs-only", plain)
+        docs = collect_entry.adapter_arguments(worker, self.collection(docs_only="title"), 4242, out)
+        self.assertEqual(docs[docs.index("--docs-only") + 1], "title")
+        self.assertEqual(docs[-1], "--require-proxy")
+        self.assertEqual([a for a in docs if a not in ("--docs-only", "title")], plain)
 
     def test_limits_are_fixed_and_refused_outside(self):
         self.assertEqual(self.collection().as_request()["request_budget"], 60)
-        bad = {"cap 4": dict(max_per_repo=4), "cap 0": dict(max_per_repo=0),
+        bad = {"cap 6": dict(max_per_repo=6), "cap 0": dict(max_per_repo=0),
                "cap true": dict(max_per_repo=True), "budget 61": dict(request_budget=61),
                "budget true": dict(request_budget=True), "outcome": dict(outcome="open"),
                "no Z": dict(start_at="2026-09-01T00:00:00"), "date only": dict(end_at="2026-09-08"),
@@ -1810,7 +1834,8 @@ class CollectEntryTests(unittest.TestCase):
         base = ["--out-dir", str(out), "--repo", "octo/demo", "--start-at", "2026-09-01T00:00:00Z",
                 "--end-at", "2026-09-08T00:00:00Z"]
         with mock.patch.object(sys, "stderr"):
-            self.assertEqual(collect_entry.main(base + ["--max-per-repo", "4"]), 2)
+            self.assertEqual(collect_entry.main(base + ["--max-per-repo", "6"]), 2)
+            self.assertEqual(collect_entry.main(base + ["--docs-only", "body"]), 2)
             self.assertEqual(collect_entry.main(base + ["--request-budget", "61"]), 2)
             (out / "x").write_text("")
             self.assertEqual(collect_entry.main(base), 2)  # not empty
@@ -1847,9 +1872,11 @@ class CollectPickupTests(unittest.TestCase):
                                "requests": requests},
             "relay.log": "",
             "run-manifest.json": {"status": "succeeded", "exit_code": 0, "failures": [], "problems": [],
+                                  "github_token": {"authenticated": False, "token_file_sha256": None},
                                   "relay": {"sources": self.SOURCES, "relay_sha256": "e" * 64, "port": 4242}},
             "envelope": {"schema": "oss-research-collection-envelope/1",
                          "unit": "oss-research-0123456789abcdef", "upstream": "loopback-mock",
+                         "github_token": {"authenticated": False, "token_file_sha256": None},
                          "request": {"repositories": ["octo/demo"], "start_at": "2026-09-01T00:00:00Z",
                                      "end_at": "2026-09-08T00:00:00Z", "outcome": "all",
                                      "max_per_repo": 3, "request_budget": 200},
@@ -1894,6 +1921,117 @@ class CollectPickupTests(unittest.TestCase):
                                     "--upstream", upstream],
                                    capture_output=True, text=True, timeout=60)
         return completed.returncode, json.loads(completed.stdout)
+
+    ZERO = REPO / "tests/fixtures/oss_research_worker/linux/pickup_zero"
+    ZERO_COLLECTOR = "207701508a7ffc92b981882be5b5a236966be579992a51815e98df7737488cc6"
+
+    def empty_members(self, **repository):
+        """A complete collection whose search matched nothing: no corpus records, one 'no-results' repository."""
+        members = self.members()
+        members["corpus.json"] = {"records": []}
+        entry = {"repository": "octo/demo", "collection_status": "no-results", "matched_count": 0,
+                 "selected_count": 0}
+        entry.update(repository)
+        members["collection-manifest.json"]["records"][0]["repositories"] = [entry]
+        return members
+
+    def test_a_complete_collection_that_matched_nothing_is_a_normal_result(self):
+        code, seen = self.verify(self.pack("empty", self.empty_members()))
+        self.assertEqual((code, seen["problems"], seen["records"]), (0, [], 0), seen)
+
+    def test_an_empty_corpus_the_manifest_does_not_explain_is_still_refused(self):
+        def with_repository(**change):
+            return self.empty_members(**change)
+        no_entry = self.empty_members()
+        del no_entry["collection-manifest.json"]["records"][0]["repositories"]
+        cases = {
+            "no repository entry": no_entry,
+            "matched but nothing selected": with_repository(matched_count=2, collection_status="collected"),
+            "selected but empty corpus": with_repository(selected_count=1, collection_status="collected"),
+            "partial repository": with_repository(collection_status="partial"),
+            "failed repository": with_repository(collection_status="failed"),
+            "unknown repository status": with_repository(collection_status="whatever"),
+            "boolean counts": with_repository(matched_count=False, selected_count=False),
+            "other repository": with_repository(repository="other/repo"),
+        }
+        partial = self.empty_members()
+        partial["collection-manifest.json"]["records"][0]["collection_status"] = "partial"
+        cases["partial collection"] = partial
+        failed_run = self.empty_members()
+        failed_run["run-manifest.json"]["status"] = "failed"
+        cases["failed run"] = failed_run
+        for label, members in cases.items():
+            with self.subTest(label):
+                code, seen = self.verify(self.pack("empty-" + label.replace(" ", "-"), members))
+                self.assertEqual(code, 1, seen)
+                self.assertTrue(seen["problems"], seen)
+
+    def test_docs_only_is_bound_between_the_request_the_manifest_and_each_repository(self):
+        def docs(request_mode="title", **filter_change):
+            members = self.members()
+            members["envelope"]["request"]["docs_only"] = request_mode
+            run = members["collection-manifest.json"]["records"][0]
+            run["docs_only"] = request_mode
+            run["repositories"] = [{"repository": "octo/demo", "collection_status": "collected", "matched_count": 4,
+                                    "selected_count": 2, "docs_filter": dict(
+                                        {"mode": request_mode, "rule": "docs-title-prefix-or-docs-path/1",
+                                         "search_matched": 4, "hydrated": 4, "passed": 2, "dropped": 2},
+                                        **filter_change)}]
+            return members
+        code, seen = self.verify(self.pack("docs-good", docs()))
+        self.assertEqual((code, seen["problems"]), (0, []), seen)
+        wrong_run = docs()
+        wrong_run["collection-manifest.json"]["records"][0]["docs_only"] = "label"
+        no_run = docs()
+        del no_run["collection-manifest.json"]["records"][0]["docs_only"]
+        unrequested = self.members()
+        unrequested["collection-manifest.json"]["records"][0]["docs_only"] = "title"
+        cases = {"manifest names another mode": wrong_run, "manifest names none": no_run,
+                 "manifest names an unrequested filter": unrequested,
+                 "repository mode differs": docs(mode="label"),
+                 "passed more than hydrated": docs(passed=5),
+                 "counts do not add up": docs(dropped=0),
+                 "matched fewer than hydrated": docs(search_matched=3),
+                 "selected differs from passed": docs(passed=1, dropped=3)}
+        for label, members in cases.items():
+            with self.subTest(label):
+                code, seen = self.verify(self.pack("docs-" + label.replace(" ", "-"), members))
+                self.assertEqual(code, 1, seen)
+                self.assertTrue(seen["problems"], seen)
+
+    def test_a_filter_that_dropped_everything_is_a_normal_empty_result_only_when_it_says_so(self):
+        members = self.empty_members(collection_status="collected", matched_count=3)
+        members["envelope"]["request"]["docs_only"] = "title"
+        run = members["collection-manifest.json"]["records"][0]
+        run["docs_only"] = "title"
+        run["repositories"][0]["docs_filter"] = {"mode": "title", "rule": "docs-title-prefix-or-docs-path/1",
+                                                 "search_matched": 3, "hydrated": 3, "passed": 0, "dropped": 3}
+        code, seen = self.verify(self.pack("docs-empty", members))
+        self.assertEqual((code, seen["problems"], seen["records"]), (0, [], 0), seen)
+        silent = self.empty_members(collection_status="collected", matched_count=3)
+        self.assertEqual(self.verify(self.pack("docs-silent", silent))[0], 1)
+
+    def verify_fixture(self, name):
+        directory = self.ZERO / name
+        completed = subprocess.run([sys.executable, "-I", "-B", str(self.VERIFY), str(directory / "collect.tar"),
+                                    str(64 << 20), str(self.root / f"fx-{name}"), "--collect",
+                                    "--collector-sha256", self.ZERO_COLLECTOR,
+                                    "--wrapper-record", str(directory / "record.json"),
+                                    "--upstream", "github-rest-via-relay"],
+                                   capture_output=True, text=True, timeout=60)
+        return completed.returncode, json.loads(completed.stdout)
+
+    def test_the_real_zero_result_runs_of_2026_10_03_are_normal_and_the_refused_search_run_is_not(self):
+        """r3 run5 (#21366) and run6 (#21315): a one-second closed: search matched nothing (complete,
+        no-results). run2 (#20898, --outcome closed-unmerged): the relay refused the negated search (failed)."""
+        for name in ("run5-pr21366", "run6-pr21315"):
+            with self.subTest(name):
+                code, seen = self.verify_fixture(name)
+                self.assertEqual((code, seen["problems"], seen["records"], seen["authenticated"]),
+                                 (0, [], 0, True), seen)
+        code, seen = self.verify_fixture("run2-pr20898")
+        self.assertEqual(code, 1, seen)
+        self.assertIn("collection is not complete", seen["problems"])
 
     def test_only_a_whole_bound_collection_passes(self):
         code, seen = self.verify(self.pack("good", self.members()))

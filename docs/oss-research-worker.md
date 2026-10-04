@@ -753,13 +753,31 @@ Linux 게스트 안의 별도 로그인(`.credentials.json`), API key·`apiKeyHe
 | 게이트 | `require_runtime`: 측정된 launch 하나(Linux: Debian 13 aarch64, 측정 node·claude sha256, read-only, dontAsk, relay 없음, claude-profile2, claude-opus-5-5 medium, unit wrapper 안)만 열고 나머지는 닫는다. `SYSTEM_READ_MEASURED["linux"]`는 False다(`2026-09-28-189-linux-model-evidence.md` 11절) | 모델 gate와 무관하다. 모델·credential·profile·prompt·permission 인자와 코드 경로가 없다(시험이 확인). 그래서 모델 gate를 우회하는 수단이 될 수 없다 |
 | srt 정책 | `build_policy(model=True)`: 모델 endpoint, 모델 readset | `build_policy(model=False)`: relay loopback port만. 읽기는 Linux 시스템 집합과 수집 전용 집합(pinned python, collector의 `SKILL_REVISION_PATHS` 6개 파일, tz `UTC`와 대상) |
 | 재사용 | — | worker의 `relay_launch`·`build_policy`·`run_supervised`(모델 run이 아닐 때만 쓰는 `record` 인자)·`parent_eof_guard`·`verify_runtime`·`platform_problems`. 코드를 복제하지 않았다 |
-| 상한 | 사용자 선택 | 고정: PR 3개/저장소, 요청 예산 60(relay 예산도 같다), 명시 UTC 구간 31일 이하, relay 응답 4 MiB·총 64 MiB, 30 s |
+| 상한 | 사용자 선택 | 고정: PR 5개/저장소(PR당 약 8요청 + 고정 3요청이 예산 60 안에 들어가는 값. 2026-10-03 전에는 3), 요청 예산 60(relay 예산도 같다), 명시 UTC 구간 31일 이하, relay 응답 4 MiB·총 64 MiB, 30 s |
 | 결과 | `result/manifest.json`, `report.md` 등 | `run/output`(corpus·collection-manifest·inventory·transport)과 `run/result`(manifest·relay.log·stderr.log·collection-envelope). 출력 파일은 regular·16 MiB 이하만 O_NOFOLLOW·비차단으로 읽어 hash한다 |
 | 회수 | `verify_pickup.py`(기본·auto 계약) | `verify_pickup.py --collect --collector-sha256 <호스트 검토 sha> --wrapper-record <root wrapper JSON> --upstream github-rest-via-relay|loopback-mock` |
 
 - upstream·base URL·proxy를 넘기는 CLI 옵션이나 env는 없다. relay는 api.github.com에만 간다.
 - 시험(`unit_inner.py collect`)은 같은 `run_collection`에 local mock upstream과 relay용 시험 `sitecustomize`만 옆에 둔다. 이때 envelope의 `upstream`은 `loopback-mock`이다. live 채택은 `--upstream github-rest-via-relay`를 요구하므로 mock 결과는 live로 받아지지 않는다.
-- 실측과 한계: `2026-09-28-189-linux-model-evidence.md` 10절. 실제 GitHub 조회와 relay→pin→api.github.com은 아직 실행하지 않았다.
+- 실측과 한계: `2026-09-28-189-linux-model-evidence.md` 10절. (실제 GitHub 조회와 relay→pin→api.github.com은 2026-10-02·03에 실행했다: `2026-10-02-candidate-reads-live.md`, `2026-10-03-eslint-docs-research/README.md`.)
+
+### 문서 위주 수집 보완 (#192 후속, 2026-10-03)
+
+2026-10-03 조사(`docs/research/2026-10-03-eslint-docs-research/README.md` 결함 절)에서 발견한 결함 4건과, 문서 위주 조사에 필요한 수집 기능을 코드로 보완했다. 코드·gate·srt 정책·모델 경로는 바꾸지 않았고, relay 변경은 응답 헤더 전달 두 개뿐이다(허용 route·메서드·예산·쓰기 거부 규칙은 그대로).
+
+| 변경 | 내용 |
+|---|---|
+| `--docs-only title\|label` (PR 수집, 기본 꺼짐) | 검색 단계는 고정 양성 형태 하나만 붙인다: `title` = `docs in:title`(제목에 단어 docs), `label` = `label:documentation`. 따옴표·부정·OR 없는 평평한 토큰이라 relay 검색 문법을 넓히지 않아도 통과한다. 검색이 못 거르는 부분은 hydrate 뒤 **고정 규칙**(`docs-title-prefix-or-docs-path/1`)이 거른다: 제목이 `docs`, `docs(`, `docs:`로 시작(대소문자 무시, `docs ...` 포함)하거나, 변경 파일 경로가 `docs/` 디렉터리 아래이거나 `.md`·`.mdx`·`README*`이면 통과(`CHANGELOG*`는 문서 변경으로 치지 않는다: release PR 때문). 둘 중 하나면 통과(OR). 규칙은 collector의 상수이며 호출자 입력이 아니다 |
+| 필터의 manifest 기록 | 실행 record에 `docs_only`, 저장소마다 `docs_filter` = `{mode, rule, search_matched, hydrated, passed, dropped}`(검색 매치 n, hydrate m, 통과, 탈락). 탈락한 PR도 요청 예산을 쓴 것이므로 기록한다. 탈락은 경고도 partial도 아니다. cap은 **통과한** PR 수로 센다. 필터가 꺼져 있으면 두 필드가 없고 요청 fingerprint도 그대로다. envelope `request`에도 `docs_only`는 켰을 때만 있다 |
+| `--outcome closed-unmerged` | 검색에 부정 토큰 `-is:merged` 대신 GitHub의 양성 qualifier **`is:unmerged`**를 쓴다. 2026-10-03 run에서 relay가 부정 토큰을 `403 search_grammar_not_allowed`로 거부해 이 값이 relay 경로에서 쓸 수 없었다. relay는 부정 토큰을 계속 거부한다 |
+| PR cap | entry 상한 PR 3 → **5**(저장소당). 예산은 60 그대로: 3회차 실측 PR당 약 8요청, 고정 3요청 |
+| 이슈 cap·예산(`collect-issues`) | 이슈 하나가 약 4요청(이슈·댓글·timeline REST 3 + GraphQL 1), 저장소당 고정 3요청이다(2026-10-03 실측 14건 = 59·60요청). 그래서 **기본값**을 cap 14·예산 60(예산이 읽을 수 있는 값)으로 하고, **상한**은 cap 20 그대로·예산 60 → **90**(3 + 4×20 = 83)으로 올렸다. cap 15는 예산 70 이상을 주면 완결된다(15에 기본 예산 60이면 14건 + partial인 것은 그대로다: 호출자가 예산을 정한다). worker의 relay 예산 상한(10,000)은 그대로다. 이전에 cap 20·예산 60 상한이 서로 맞지 않아 15건 지시가 항상 14건 + partial이 되던 불일치를 이 방향(기본값을 내리고 상한을 올림)으로 해소했다 |
+| 닫힌 이슈 | `collect-issues --state closed\|all`, `--date-field closed`는 collector와 entry가 이미 지원했다(`open`+`closed` 날짜만 거부). 코드 변경은 없고 relay 경유 종단 시험으로 고정했다: state가 manifest `filters`에 남고, 검색은 `is:closed`·`closed:`로 나가며 부정 토큰이 없다 |
+| 0건 수집의 회수 | `verify_pickup.py --collect`가 「검색 매치 0·수집 0」(`collection_status: complete`, 저장소 `no-results`, records 0)을 정상 결과(rc 0)로 받는다. 빈 corpus는 manifest가 설명할 때만 정상: 요청한 저장소마다 항목이 있고 `selected_count 0`이며, (`no-results`이고 `matched_count 0`) 이거나 (docs 필터를 요청했고 `collected`이며 `docs_filter.passed 0`)이다. 설명이 없거나 partial·failed·다른 저장소·불린 카운트면 계속 rc 1이다. adapter 오류·partial은 0건과 구분된다. `--issues`는 이미 0건을 받았다(변경 없음) |
+| 인증 표기의 의미 | transport.json에 `credential_scope: "child"`와 `credential_scope_note`를 더했다. 기존 `credential`(`none: token_provider returned None …`)과 collector manifest의 `preflight.login: "anonymous"`는 값을 바꾸지 않는다(child 관점에서 맞다. collector manifest는 skill 소유 스키마이고 gh→urllib 바이트 동등성 비교기 `tests/transport_output_equivalence.py`가 비교한다). relay가 읽기 전용 토큰을 가졌는지는 envelope·run manifest의 `github_token.authenticated`가 말한다 |
+| rate-limit 헤더 기록 | relay가 성공 응답에 `x-ratelimit-used`·`x-ratelimit-resource`를 더 전달한다(짧은 숫자·식별자일 때만). 어댑터가 요청마다 `rate_limit: {limit, remaining, used, resource}`(정수·식별자)를 transport 기록에 남긴다(REST·GraphQL 공통, 헤더가 없으면 필드 없음). 값은 쿼터 사실이고 비밀이 아니다. 토큰·Authorization·`reset`은 기록하지 않는다. 2026-10-03 조사에서 성공 응답의 한도를 헤더로 증명하지 못한 공백을 메운다 |
+
+시험과 실측은 아래 「검증 상태」 표의 해당 행과 `docs/research/2026-10-03-eslint-docs-research/README.md` 결함 절의 해소 표시에 있다. 게스트 사례는 `tests/fixtures/oss_research_worker/linux/collect_docs_cases.sh`(`--egress none`, loopback mock)와 `github_token_cases.sh` T4~T7(sentinel)이다.
 
 ## 후보 verifier 읽기 entry (`executable_oss-research-candidate-reads`)
 
@@ -788,6 +806,24 @@ executable_oss-research-candidate-reads --out-dir OUT --input-dir IN --stage loc
 - 호스트 offline 시험: `tests/test_oss_research_candidate_reads.py`(실 relay와 실 adapter를 loopback mock에 붙여 만든 산출물을 한 member씩 고쳐 반례를 만든다. srt 없이 돌아 transport가 `direct`이므로 pickup 시험은 그 한 줄을 `srt-proxy`로 바꾼 member로 한다).
 - 게스트 사례: `tests/fixtures/oss_research_worker/linux/candidate_reads_cases.sh`(`--egress none`, loopback mock). 실제 api.github.com을 대상으로 한 실행은 없다. 이름 해석만으로도 DNS 질의가 나갈 수 있어서다.
 - 이 entry는 verifier가 읽는 근거만 모은다. 후보 판정(`record`)·`recheck`·`render`는 하지 않는다. 입력의 분석 산출물은 지금 synthetic fixture이고 실제 패턴은 아직 없다.
+
+## 읽기 전용 GitHub 토큰 (비AI entry 셋의 `--github-token-file`)
+
+`collect`·`collect-issues`·`candidate-reads`는 선택 인자 `--github-token-file /absolute/path`를 받아 relay에만 넘긴다. relay 쪽 계약(파일 검사, 붙는 곳, 노출 금지, 권장 토큰)은 `oss-research-relay.md` 「읽기 전용 GitHub 토큰」이 정한다. 아래는 entry와 회수 쪽이다. 설계·측정·한계는 `2026-10-03-github-read-token.md`다. 모델 gate와 모델 토큰 경로는 바뀌지 않았다.
+
+| | 계약 |
+|---|---|
+| 기본 | **토큰 없음 = 익명**이다. 인자가 없으면 오류가 아니고 지금까지와 같다. 환경 변수(`GH_TOKEN`, `GITHUB_TOKEN`)와 `gh auth token`은 읽지 않는다 |
+| 인자 | `--github-token-file`은 한 번만, 4096자 이하의 평범한 절대 경로(정규화됨, NUL 없음)여야 한다. 출력 디렉터리, `candidate-reads`의 입력 디렉터리, skills 트리 안의 경로는 거부한다 |
+| 거부 시점 | entry 부모가 relay와 같은 검사(`load_github_token`)로 **relay를 띄우기 전에** 한 번 읽어 확인한다. 실패하면 고정 문구로 exit 2이고 relay·srt·unit 안의 프로세스는 시작하지 않는다. 부모는 값을 보관하지 않고 sha256만 남긴다 |
+| 전달 | relay argv에 `--github-token-file <path>`만 덧붙인다(`launch_with_token`). srt 안의 child는 값도 파일도 받지 못한다. 정책의 읽기 집합이 그 경로를 덮으면 `Blocked`다(`token_path_is_readable_by_child`). 경로를 child에 알려 주지도 않는다 |
+| 기록 | manifest와 envelope에 `github_token: {authenticated: bool, token_file_sha256: hex64 | null}`만 남는다. 값·접두어·길이는 없다. 익명이면 `authenticated: false`, sha256 `null`이다 |
+| 회수 | `verify_pickup.py`는 이 표지를 **필수**로 본다(envelope와 run manifest가 같고 정확히 이 두 키). 표지가 없거나 모양이 틀리면 FAIL이다. relay.log·transport.json·run manifest·envelope에 자격 모양(`ghp_`·`github_pat_`·`Bearer`)이 있으면 FAIL이다. 마지막 옵션 `--forbid-value-file FILE`을 주면 **모든** member에 그 값이 정확히 있는지도 본다(파일은 일반 파일, 4096바이트 이하, 8자 이상 한 줄이어야 하고 못 쓰면 건너뛰지 않고 FAIL) |
+| 게스트 설치 | 모델 토큰과 같은 방식이다. run 전용 tmpfs `/run/oss-research-credentials/<RID>/github-readonly/token`(위쪽 root 0711, 디렉터리 ossresearch 0700, 파일 0600, `O_EXCL`·`O_NOFOLLOW`)에 설치하고, 설치 전에 그 경로만 지우는 reaper(systemd timer)를 걸어 활성을 확인한다. 끝나면 사본과 reaper를 지운다. 이 설치는 시험 하네스(`github_token_cases.sh`)가 한다. wrapper는 `--` 뒤 인자를 그대로 넘기므로 바뀐 것이 없다. srt의 읽기 집합에는 이 경로가 없다 |
+
+- 호스트 offline 시험: `tests/test_oss_research_github_token.py`(가짜 sentinel만).
+- 게스트 사례: `tests/fixtures/oss_research_worker/linux/github_token_cases.sh`(`--egress none`, loopback mock, sentinel만). 세 entry의 normal(mock upstream이 모든 요청에서 `Bearer <sentinel>`을 보는지 mock 쪽에서만 대조), 인자 없는 익명, srt child의 읽기 시도(`token-probe`), wrapper SIGKILL, 설치 직후 harness SIGKILL(reaper가 사본을 지움), 인자 거부를 본다.
+- 실제 토큰과 실제 `api.github.com`은 사용하지 않았다. 실제 토큰 측정은 별도 작업이다.
 
 ## 시계 검사 (unit wrapper의 실행 전 조건)
 
@@ -853,6 +889,7 @@ Linux 게스트(Lima/VZ)는 호스트 Mac이 잠자는 동안 **시스템 시계
 | staged 설정 보호 | PASS (실측, 비AI probe) | `StagedBoundaryTests` 2건. 상위 디렉터리 rename·삭제 포함 변경 거부, `output/` 쓰기 허용. denyWrite를 뺀 대조군은 실패 |
 | unit wrapper의 시계 검사 | PASS (오프라인 + 게스트 실측) | 시스템 시계를 과거로 돌리고 wrapper를 실행하면 재동기되고(record `resynced`), 재설정 프로그램을 쓸 수 없게 한 반례와 오차 과대에서는 Blocked로 아무것도 시작하지 않는다. 실행 도중의 호스트 잠자기는 막지 못한다(위 「시계 검사」). `2026-10-02-189-isolation-acceptance-matrix.md` 13절 |
 | 후보 verifier 읽기 entry(`candidate-reads`) | PASS (mock) / 실제 조회 미검증 | 호스트 offline 22건, 게스트 사례(`--egress none`, loopback mock): discover complete·partial, locus-search, 읽기 집합 항목 누락·verifier 누락·어댑터 의존 누락, 대상 route 없음, 무응답, 쓰기 메서드 거부, proxy 없는 직접 접속, 부모 EOF, 인자·입력 거부(relay 전), unit 밖 Blocked. 실제 GitHub 조회·익명 `/search/code`·모델과의 연결은 미검증. `docs/research/2026-10-02-189-isolation-acceptance-matrix.md` |
+| 문서 위주 수집 보완(#192 후속: `--docs-only`, `is:unmerged`, cap, 0건 회수, `credential_scope`, quota 헤더) | PASS (오프라인 + 게스트 mock 실측) / 실제 조회는 하지 않음 | 시험 먼저: 새 시험이 구현 전 실패(collector 시험 162건 중 failures 2·errors 40, relay·어댑터·entry·pickup 새 시험도 각각 구현 전 실패)한 뒤 통과. 호스트 offline(17개 모듈) **Ran 593 OK, skipped 39**(기준 556), collector 스킬 시험 PR 162·이슈 67 OK(기준 143·67). 게스트(`src-8972cd0`) `ossresearch` 묶음 **Ran 542 OK, skipped 11**, root `RealUnitWrapperTests` Ran 5 OK. 게스트 사례 `collect_docs_cases.sh`(`--egress none`, loopback mock): docs-only title/label(4건 중 1건 통과), cap 5(6건 중 5건), `is:unmerged`(검색에 부정 토큰 없음), 빈 검색(complete·records 0), quota(33/33 요청에 rate_limit), 닫힌 이슈(`state: closed`), cap 15 + 예산 70, 인자 거부 4건(cap 6, docs-only body, 이슈 예산 91, open+closed 날짜). 8개 산출물 모두 호스트 strict pickup rc 0(빈 검색 포함). sentinel `github_token_cases.sh` T1~T7·A·P·R·K·B `SUMMARY fails=0`, 값 0회. 증거 `/Users/lee-kyu-hwan/.oss-research-vm/logs/a192-collect-docs-20261003T104109Z/` |
 | 스킬·서브에이전트 호환성 | 미검증 | 구성기만 있다. Claude가 staged 스킬·워크플로를 로드해 실행하는지, 자식 경계는 live 필요 |
 | auto 모드 | **FAIL(1회 관찰) / OS gate INSUFFICIENT** | Linux 1회(관찰용 stream-json). init `permissionMode=auto`는 관찰했다. CLI가 refusal(cyber) 뒤 세션 전체를 `claude-opus-4-8`로 자동 전환했다(A-V4 FAIL). decoy 시도는 모두 Claude `--restricted` 층이 거부해 OS 증거가 없다(SKIP). 같은 문서 4절 |
 

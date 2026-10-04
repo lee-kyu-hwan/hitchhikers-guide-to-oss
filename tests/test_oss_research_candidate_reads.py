@@ -189,7 +189,7 @@ class CandidateReadsEntryTests(EntryCase):
         self.assertEqual(options, {"--out-dir", "--input-dir", "--stage", "--repo", "--pattern", "--clue",
                                    "--max-candidates-per-repo", "--max-candidates-total",
                                    "--max-clues-per-pattern", "--max-clues-per-locus", "--request-budget",
-                                   "--timeout"})
+                                   "--timeout", "--github-token-file"})
 
     def test_the_read_set_is_the_verifiers_revision_files(self):
         verifier = relay_verify_tests.verifier

@@ -316,11 +316,220 @@ class BuildClosedQueryTests(unittest.TestCase):
             "owner/repo", self.interval, "closed-unmerged"
         )
 
-        self.assertIn("-is:merged", query)
+        self.assertIn("is:unmerged", query)
+        self.assertNotIn("is:merged", query)
+        # The relay refuses negation, so no token may start with "-".
+        self.assertFalse([token for token in query.split() if token.startswith("-")])
 
     def test_rejects_unknown_outcome(self):
         with self.assertRaises(ValueError):
             self.collector.build_closed_query("owner/repo", self.interval, "unknown")
+
+
+class DocsOnlyQueryTests(unittest.TestCase):
+    def setUp(self):
+        self.collector = load_collector()
+        self.interval = self.collector.resolve_interval(
+            start_at="2026-09-01T00:00:00Z", end_at="2026-09-02T00:00:00Z", start_date=None,
+            end_date=None, recent_days=None, timezone_name="UTC", as_of=None,
+        )
+
+    def tokens(self, docs_only, outcome="all"):
+        return self.collector.build_closed_query("owner/repo", self.interval, outcome, docs_only=docs_only).split()
+
+    def test_without_docs_only_the_query_is_unchanged(self):
+        self.assertEqual(
+            self.collector.build_closed_query("owner/repo", self.interval, "all"),
+            self.collector.build_closed_query("owner/repo", self.interval, "all", docs_only=None),
+        )
+        self.assertNotIn("in:title", self.tokens(None))
+
+    def test_title_mode_adds_the_docs_word_and_in_title_qualifier_only(self):
+        base = self.tokens(None)
+        tokens = self.tokens("title")
+        self.assertEqual(tokens[:len(base)], base)
+        self.assertEqual(tokens[len(base):], ["docs", "in:title"])
+
+    def test_label_mode_adds_the_documentation_label_qualifier_only(self):
+        base = self.tokens(None)
+        self.assertEqual(self.tokens("label")[len(base):], ["label:documentation"])
+
+    def test_added_tokens_are_flat_positive_and_unquoted_for_every_outcome(self):
+        for outcome in ("all", "merged", "closed-unmerged"):
+            for mode in ("title", "label"):
+                query = " ".join(self.tokens(mode, outcome))
+                with self.subTest(outcome=outcome, mode=mode):
+                    self.assertEqual(query.count("repo:"), 1)
+                    self.assertFalse([token for token in query.split() if token.startswith(("-", "~", "!"))])
+                    self.assertFalse(set(query) & set('()\\"\''))
+                    self.assertFalse({"or", "and", "not"} & {token.lower() for token in query.split()})
+
+    def test_unknown_docs_mode_is_refused(self):
+        for mode in ("", "body", "docs", True):
+            with self.subTest(mode=mode), self.assertRaises(ValueError):
+                self.collector.build_closed_query("owner/repo", self.interval, "all", docs_only=mode)
+
+
+class DocsPullRequestRuleTests(unittest.TestCase):
+    def setUp(self):
+        self.collector = load_collector()
+
+    def record(self, title, paths=()):
+        return {"pull_request": {"title": title},
+                "evidence_snapshot": {"changed_files": [{"path": path} for path in paths]}}
+
+    def test_title_prefix_passes_without_looking_at_files(self):
+        for title in ("docs: fix a link", "docs(rules): add an example", "Docs: Revamp", "docs update", "docs"):
+            with self.subTest(title=title):
+                self.assertTrue(self.collector.is_docs_pull_request(self.record(title, ["lib/a.js"])))
+
+    def test_docs_directory_markdown_and_readme_paths_pass(self):
+        for path in ("docs/src/use/a.md", "packages/x/docs/guide.txt", "README.md", "readme", "packages/x/README.rst",
+                     "src/content/blog/post.md", "notes.MDX"):
+            with self.subTest(path=path):
+                self.assertTrue(self.collector.is_docs_pull_request(self.record("fix: x", [path])))
+
+    def test_code_and_dependency_pull_requests_do_not_pass(self):
+        for title, paths in (("fix: a rule", ["lib/rules/a.js", "tests/lib/rules/a.js"]),
+                             ("chore: update dependency docs-tool", ["package.json", "package-lock.json"]),
+                             ("documentation fix", ["lib/a.js"]), ("fix: mydocs: thing", ["lib/a.js"])):
+            with self.subTest(title=title):
+                self.assertFalse(self.collector.is_docs_pull_request(self.record(title, paths)))
+
+    def test_changelog_markdown_alone_is_not_a_docs_change(self):
+        for path in ("CHANGELOG.md", "packages/x/CHANGELOG.md", "changelog-2026.md"):
+            with self.subTest(path=path):
+                self.assertFalse(self.collector.is_docs_pull_request(self.record("chore: release 1.2.3", [path])))
+
+    def test_missing_or_malformed_evidence_does_not_pass(self):
+        for record in ({}, {"pull_request": {}}, {"pull_request": {"title": None}, "evidence_snapshot": {"changed_files": "x"}},
+                       {"pull_request": {"title": "fix"}, "evidence_snapshot": {"changed_files": [None, {"path": 3}]}}):
+            with self.subTest(record=record):
+                self.assertFalse(self.collector.is_docs_pull_request(record))
+
+
+class DocsOnlyCollectTests(unittest.TestCase):
+    def setUp(self):
+        self.collector = load_collector()
+        self.interval = self.collector.resolve_interval(
+            start_at="2026-09-01T00:00:00Z", end_at="2026-09-02T00:00:00Z", start_date=None,
+            end_date=None, recent_days=None, timezone_name="UTC", as_of=None,
+        )
+
+    def hit(self, number):
+        return {"node_id": "PR_node_" + str(number), "number": number, "closed_at": "2026-09-01T12:00:00Z",
+                "html_url": "https://github.com/owner/repo/pull/" + str(number)}
+
+    def hydrated(self, number, title, paths):
+        return {
+            "identity_status": "resolved", "record_key": "github-pr:PR_node_" + str(number),
+            "pull_request_node_id": "PR_node_" + str(number),
+            "repository": {"full_name": "owner/repo", "node_id": "R_repo"},
+            "pull_request": {"number": number, "title": title, "normalized_state": "merged",
+                             "url": "https://github.com/owner/repo/pull/" + str(number), "updated_at": "2026-09-01T12:00:00Z"},
+            "sources": [], "state_history": [], "hydration_status": "complete",
+            "evidence_snapshot": {"body_excerpt": "body-" + str(number),
+                                  "changed_files": [{"path": path} for path in paths],
+                                  "completeness": {"pull_request_body": {"pages_complete": True}}},
+        }
+
+    def search(self, hits, selected=None, overflow=None):
+        return self.collector.RepositorySearchResult(
+            repository="owner/repo", preflight={"full_name": "owner/repo", "node_id": "R_repo"}, preflight_outcome="collected",
+            collection_status="collected", partitions=(), hits=tuple(hits),
+            selected_hits=tuple(selected if selected is not None else hits), overflow_hits=tuple(overflow or ()),
+            matched_count=len(hits), selected_count=len(selected if selected is not None else hits),
+            excluded_by_cap=len(overflow or ()), warnings=(),
+        )
+
+    def run_collect(self, hydrated, *, docs_only, cap=5, hits=None, search=None):
+        class Client:
+            api_version = "2026-03-10"
+            budget = self.collector.RequestBudget(60)
+        hits = hits if hits is not None else [self.hit(number) for number in range(1, len(hydrated) + 1)]
+        search = search or self.search(hits)
+        with patch.object(self.collector, "collect_repository_hits", return_value=search) as searched, \
+                patch.object(self.collector, "hydrate_pull_request", side_effect=hydrated) as hydrate:
+            run = self.collector.collect(Client(), ["owner/repo"], self.interval, max_per_repository=cap, docs_only=docs_only)
+        return run, searched, hydrate
+
+    def four(self):
+        return [self.hydrated(1, "docs: fix a link", ["lib/a.js"]), self.hydrated(2, "fix: a typo", ["docs/src/a.md"]),
+                self.hydrated(3, "chore: bump", ["package.json"]), self.hydrated(4, "feat: rule", ["lib/b.js"])]
+
+    def test_filter_keeps_only_docs_pull_requests_and_counts_the_rest(self):
+        run, searched, hydrate = self.run_collect(self.four(), docs_only="title")
+        self.assertEqual([record["pull_request"]["number"] for record in run.corpus["records"]], [1, 2])
+        self.assertEqual(hydrate.call_count, 4)
+        repository = run.record["repositories"][0]
+        self.assertEqual(repository["docs_filter"], {
+            "mode": "title", "rule": self.collector.DOCS_FILTER_RULE,
+            "search_matched": 4, "hydrated": 4, "passed": 2, "dropped": 2})
+        self.assertEqual(repository["selected_count"], 2)
+        self.assertEqual(run.record["docs_only"], "title")
+        self.assertEqual(run.record["collection_status"], "complete")
+        self.assertEqual(run.exit_code, 0)
+        self.assertEqual(searched.call_args.kwargs.get("docs_only"), "title")
+
+    def test_dropped_pull_requests_are_not_warnings_and_do_not_make_the_run_partial(self):
+        run, _searched, _hydrate = self.run_collect(self.four(), docs_only="label")
+        self.assertEqual(run.record["repositories"][0]["warnings"], [])
+        self.assertEqual(run.record["repositories"][0]["docs_filter"]["mode"], "label")
+
+    def test_cap_counts_only_pull_requests_that_pass(self):
+        hydrated = [self.hydrated(1, "chore: a", ["x"]), self.hydrated(2, "docs: b", ["x"]), self.hydrated(3, "docs: c", ["x"])]
+        run, _searched, hydrate = self.run_collect(hydrated, docs_only="title", cap=1,
+                                                   search=self.search([self.hit(1), self.hit(2), self.hit(3)],
+                                                                      selected=[self.hit(1)], overflow=[self.hit(2), self.hit(3)]))
+        self.assertEqual([record["pull_request"]["number"] for record in run.corpus["records"]], [2])
+        self.assertEqual(hydrate.call_count, 2)
+        docs = run.record["repositories"][0]["docs_filter"]
+        self.assertEqual((docs["search_matched"], docs["hydrated"], docs["passed"], docs["dropped"]), (3, 2, 1, 1))
+
+    def test_nothing_passing_is_a_complete_empty_selection(self):
+        hydrated = [self.hydrated(1, "chore: a", ["x"]), self.hydrated(2, "feat: b", ["y"])]
+        run, _searched, _hydrate = self.run_collect(hydrated, docs_only="title")
+        self.assertEqual(run.corpus["records"], [])
+        self.assertEqual(run.record["repositories"][0]["selected_count"], 0)
+        self.assertEqual(run.record["repositories"][0]["docs_filter"]["passed"], 0)
+        self.assertEqual(run.record["collection_status"], "complete")
+
+    def test_without_the_filter_the_manifest_has_no_docs_fields(self):
+        run, searched, _hydrate = self.run_collect(self.four(), docs_only=None)
+        self.assertEqual(len(run.corpus["records"]), 4)
+        self.assertNotIn("docs_only", run.record)
+        self.assertNotIn("docs_filter", run.record["repositories"][0])
+        self.assertIsNone(searched.call_args.kwargs.get("docs_only"))
+
+    def test_the_request_fingerprint_names_the_filter_only_when_it_is_on(self):
+        plain = self.collector.request_fingerprint(["owner/repo"], self.interval, "all", 5, 60, "2026-03-10")
+        self.assertEqual(plain, self.collector.request_fingerprint(["owner/repo"], self.interval, "all", 5, 60, "2026-03-10",
+                                                                    docs_only=None))
+        titled = self.collector.request_fingerprint(["owner/repo"], self.interval, "all", 5, 60, "2026-03-10", docs_only="title")
+        labelled = self.collector.request_fingerprint(["owner/repo"], self.interval, "all", 5, 60, "2026-03-10", docs_only="label")
+        self.assertEqual(len({plain, titled, labelled}), 3)
+
+    def test_unknown_mode_is_refused_before_any_request(self):
+        class Client:
+            api_version = "2026-03-10"
+            budget = self.collector.RequestBudget(60)
+        with patch.object(self.collector, "collect_repository_hits") as searched, self.assertRaises(ValueError):
+            self.collector.collect(Client(), ["owner/repo"], self.interval, docs_only="everything")
+        searched.assert_not_called()
+
+    def test_inventory_states_the_filter_counts(self):
+        run, _searched, _hydrate = self.run_collect(self.four(), docs_only="title")
+        text = self.collector.render_inventory_markdown(run.corpus, run.manifest)
+        self.assertIn("docs filter: matched 4, hydrated 4, passed 2, dropped 2", text)
+
+    def test_cli_accepts_the_two_modes_only(self):
+        parser = self.collector.build_parser()
+        base = ["collect", "--repo", "owner/repo", "--recent-days", "2", "--output", "o", "--manifest", "m"]
+        self.assertIsNone(parser.parse_args(base).docs_only)
+        self.assertEqual(parser.parse_args(base + ["--docs-only", "title"]).docs_only, "title")
+        self.assertEqual(parser.parse_args(base + ["--docs-only", "label"]).docs_only, "label")
+        with patch("sys.stderr", new=io.StringIO()), self.assertRaises(SystemExit):
+            parser.parse_args(base + ["--docs-only", "body"])
 
 
 class GhApiClientTests(unittest.TestCase):
@@ -828,7 +1037,8 @@ class RepositorySearchTests(unittest.TestCase):
         for endpoint, params in client.calls:
             if endpoint == "/search/issues":
                 self.assertEqual(params["q"].count("closed:"), 1)
-                self.assertIn("-is:merged", params["q"])
+                self.assertIn("is:unmerged", params["q"])
+                self.assertNotIn("-is:merged", params["q"])
                 self.assertNotIn("per_page", params)
         leaf_pages = [params["page"] for endpoint, params in client.calls if endpoint == "/search/issues" and "00:00:00Z..2026-09-01T00:00:01Z" in params["q"]]
         self.assertEqual(leaf_pages, [1, 2])

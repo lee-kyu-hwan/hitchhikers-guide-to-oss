@@ -211,6 +211,40 @@ class RelayedResponse:
         return None
 
 
+# The quota facts of one relayed answer, kept in the per-request record: short plain numbers
+# and one resource name, nothing else of the upstream's headers. The relay already passes
+# only such values on; this checks them again. They are not secrets and say nothing about
+# a credential (the relay holds any token; this process never sees it).
+QUOTA_NUMBERS = (("limit", "x-ratelimit-limit"), ("remaining", "x-ratelimit-remaining"), ("used", "x-ratelimit-used"))
+QUOTA_RESOURCE = "x-ratelimit-resource"
+
+
+def quota_record(headers: Any) -> dict[str, object]:
+    kept: dict[str, object] = {}
+    if not isinstance(headers, dict):
+        return kept
+    for name, header in QUOTA_NUMBERS:
+        value = headers.get(header)
+        if isinstance(value, str) and re.fullmatch(r"[0-9]{1,12}", value):
+            kept[name] = int(value)
+    resource = headers.get(QUOTA_RESOURCE)
+    if isinstance(resource, str) and re.fullmatch(r"[a-z_]{1,32}", resource):
+        kept["resource"] = resource
+    return kept
+
+
+# What the "credential" field of the transport record is about. It speaks for this child process
+# only. The relay may hold a read-only GitHub token (--github-token-file); whether it did is the
+# entry's statement in the envelope and run manifest, github_token.authenticated, and the
+# collector's own preflight.login ("anonymous") is the same child-side view.
+CREDENTIAL_SCOPE = "child"
+CREDENTIAL_SCOPE_NOTE = (
+    "credential describes this child process only: it never held a token or sent Authorization. "
+    "The relay may hold a read-only token; whether it did is github_token.authenticated in the "
+    "envelope and run manifest, not this record or the collector's preflight.login."
+)
+
+
 class RelayOpener:
     """An opener for ``GhApiClient`` that reaches GitHub only through the relay.
 
@@ -296,6 +330,9 @@ class RelayOpener:
                 record["outcome"] = "malformed_envelope"
                 raise ValueError("relay envelope is malformed")
             record.update(outcome="relayed", upstream_status=upstream_status)
+            quota = quota_record(headers)
+            if quota:
+                record["rate_limit"] = quota
             body = json.dumps(document["payload"]).encode("utf-8")
             return RelayedResponse(logical_url, upstream_status, dict(headers), body)
         code = document.get("error")
@@ -378,6 +415,10 @@ class RelayOpener:
         return status, document
 
 
+RelayOpener.credential_scope = CREDENTIAL_SCOPE
+RelayOpener.credential_scope_note = CREDENTIAL_SCOPE_NOTE
+
+
 def relay_client_class(collector: Any) -> type:
     """A ``GhApiClient`` whose recorded client version names the relay transport.
 
@@ -408,6 +449,8 @@ def transport_record(opener: RelayOpener, collector_source: dict[str, str], run:
         "collector": collector_source,
         "note": TRANSPORT_NOTE,
         "credential": "none: token_provider returned None and no Authorization header was sent",
+        "credential_scope": CREDENTIAL_SCOPE,
+        "credential_scope_note": CREDENTIAL_SCOPE_NOTE,
         "exit_code": getattr(run, "exit_code", None),
         "requests": opener.records,
     }
@@ -467,6 +510,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--start-at")
     parser.add_argument("--end-at")
     parser.add_argument("--outcome", choices=("all", "merged", "closed-unmerged"), default="all")
+    parser.add_argument("--docs-only", choices=("title", "label"), default=None)
     parser.add_argument("--require-proxy", action="store_true",
                         help="refuse to run without srt's loopback HTTP proxy (the isolated step)")
     return parser
@@ -508,6 +552,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             client, args.repo, interval, outcome=args.outcome, max_per_repository=args.max_per_repo,
             request_budget=args.request_budget, output=args.output, manifest_output=args.manifest,
             markdown_output=args.markdown_output, api_version=api_version,
+            **({"docs_only": args.docs_only} if args.docs_only is not None else {}),
         )
     except ValueError as error:
         print("error: {0}".format(error), file=sys.stderr)

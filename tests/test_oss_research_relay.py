@@ -475,6 +475,95 @@ class PathAndSsrfRefusalTests(RelayHarness):
         self.assertEqual(relay._check_search_query("repo:Octo/Demo is:issue"), "octo/demo")
 
 
+class DocsCollectionSearchTests(RelayHarness):
+    """The collector's closed-unmerged and docs-only search forms (#192 follow-up).
+
+    The relay checks the shape of a query (flat, unquoted, no negation or boolean
+    operator, exactly one repo: scope), not a list of qualifier names. These tests
+    pin that the fixed positive forms the collector now sends pass, that the old
+    negated form is still refused, and that nothing added can leave the repository.
+    """
+
+    BASE = "repo:octo/demo is:pr is:closed closed:2026-09-01T00:00:00Z..2026-09-01T23:59:59Z"
+
+    def setUp(self):
+        super().setUp()
+        self.route("/search/issues", {"total_count": 0, "items": []})
+
+    def search(self, query):
+        return self.request("GET", "/v1/rest/search/issues?" + urllib.parse.urlencode({"q": query, "page": 1}))
+
+    def test_the_positive_unmerged_and_docs_forms_are_relayed_unchanged(self):
+        forms = (self.BASE + " is:unmerged", self.BASE + " docs in:title", self.BASE + " label:documentation",
+                 self.BASE + " is:unmerged docs in:title", self.BASE + " is:merged label:documentation")
+        for query in forms:
+            with self.subTest(query=query):
+                status, document = self.search(query)
+                self.assertEqual(status, 200, document)
+        sent = [urllib.parse.parse_qs(urllib.parse.urlsplit(request["path"]).query)["q"][0]
+                for request in self.upstream.requests]
+        self.assertEqual(sent, list(forms))
+
+    def test_the_old_negated_unmerged_form_stays_refused(self):
+        for query in (self.BASE + " -is:merged", self.BASE + " -is:merged docs in:title", self.BASE + " docs -in:title"):
+            with self.subTest(query=query):
+                status, document = self.search(query)
+                self.assert_refused(status, document, 403, "search_grammar_not_allowed")
+        self.assertEqual(self.upstream.requests, [])
+
+    def test_the_added_tokens_cannot_widen_the_scope(self):
+        for query in (self.BASE + " docs in:title org:other", self.BASE + " docs in:title repo:other/x",
+                      self.BASE + " docs in:title user:other", self.BASE + " docs OR label:documentation",
+                      self.BASE + ' docs in:title "label:documentation"', "docs in:title is:unmerged",
+                      self.BASE + " docs in:title owner:other"):
+            with self.subTest(query=query):
+                status, document = self.search(query)
+                self.assertIn(status, (400, 403), document)
+                self.assertFalse(document["ok"])
+        self.assertEqual(self.upstream.requests, [])
+
+
+class RateLimitHeaderForwardingTests(RelayHarness):
+    """The safe rate-limit headers of a relayed answer, for the transport record (#192 follow-up)."""
+
+    GOOD = {"x-ratelimit-limit": "5000", "x-ratelimit-remaining": "4990", "x-ratelimit-reset": "1790000000",
+            "x-ratelimit-used": "10", "x-ratelimit-resource": "core"}
+
+    def test_a_successful_rest_answer_carries_limit_remaining_used_and_resource(self):
+        self.route("/repos/octo/demo", {"full_name": "octo/demo"}, headers=self.GOOD)
+        status, document = self.request("GET", "/v1/rest/repos/octo/demo")
+        self.assertEqual(status, 200, document)
+        for name, value in self.GOOD.items():
+            self.assertEqual(document["headers"].get(name), value, name)
+
+    def test_the_graphql_answer_names_its_resource(self):
+        self.route("/graphql", {"data": {"repository": {"issue": None}}},
+                   headers=dict(self.GOOD, **{"x-ratelimit-resource": "graphql", "x-ratelimit-limit": "5000"}))
+        status, document = self.graphql({"operation": "IssueEvidence",
+                                         "variables": {"owner": "octo", "name": "demo", "number": 5}})
+        self.assertEqual(status, 200, document)
+        self.assertEqual(document["headers"]["x-ratelimit-resource"], "graphql")
+        self.assertEqual(document["headers"]["x-ratelimit-used"], "10")
+
+    def test_values_that_are_not_plain_numbers_or_identifiers_are_dropped(self):
+        self.route("/repos/octo/demo", {"full_name": "octo/demo"}, headers={
+            "x-ratelimit-used": "ten; x=1", "x-ratelimit-resource": "co re\"", "Set-Cookie": "a=b",
+            "Authorization": "Bearer x", "x-ratelimit-limit": "60"})
+        status, document = self.request("GET", "/v1/rest/repos/octo/demo")
+        self.assertEqual(status, 200, document)
+        self.assertNotIn("x-ratelimit-used", document["headers"])
+        self.assertNotIn("x-ratelimit-resource", document["headers"])
+        self.assertEqual(document["headers"]["x-ratelimit-limit"], "60")
+        lowered = {name.lower() for name in document["headers"]}
+        self.assertFalse(lowered & {"set-cookie", "authorization"})
+
+    def test_no_rate_limit_headers_means_none_are_invented(self):
+        self.route("/repos/octo/demo", {"full_name": "octo/demo"})
+        status, document = self.request("GET", "/v1/rest/repos/octo/demo")
+        self.assertEqual(status, 200, document)
+        self.assertFalse([name for name in document["headers"] if name.startswith("x-ratelimit")])
+
+
 class GraphqlRefusalTests(RelayHarness):
     def test_raw_documents_mutations_and_bad_variables_are_refused(self):
         valid = {"owner": "octo", "name": "demo", "number": 1}

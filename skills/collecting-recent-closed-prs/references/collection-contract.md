@@ -17,6 +17,20 @@ outcome `all`, `--max-per-repo 25`, `--request-budget 1000`, and API version
 Malformed inputs fail before GitHub requests. Existing output paths are only
 replaced as part of the explicitly requested output operation.
 
+`--outcome closed-unmerged` searches with GitHub's positive `is:unmerged`
+qualifier (a negated `-is:merged` is refused by the relay's search grammar).
+`--docs-only title|label` (default off) narrows to documentation pull requests:
+the search adds one fixed positive form (`title`: the word `docs` with
+`in:title`; `label`: `label:documentation`), and after hydration a fixed rule
+keeps a pull request whose title starts with `docs`, `docs(` or `docs:`
+(case-insensitive) or that changed a path under a `docs/` directory, a
+Markdown file (`.md`, `.mdx`) or a README; changelog files do not count. When
+the filter is on, the run record carries `docs_only` and each repository
+carries `docs_filter` (`mode`, `rule`, `search_matched`, `hydrated`, `passed`,
+`dropped`). A pull request dropped after hydration still cost its requests and
+is neither a warning nor a partial result. With the filter off neither field
+exists and the request fingerprint is unchanged.
+
 ## Corpus 1.0.0
 
 The corpus envelope contains `schema_version: "1.0.0"`, `generated_by` with

@@ -52,6 +52,11 @@ exit 3 is "partial" (exit EXIT_PARTIAL: a budget stop, an unavailable anonymous
 code search or an unreadable source), anything else is "failed" (exit 4). Every
 outcome is kept.
 
+An optional --github-token-file PATH hands a read-only GitHub token file to the RELAY only
+(anonymous without it), checked and recorded exactly as in executable_oss-research-collect
+(collect_entry.checked_github_token). The file must also lie outside --input-dir, which the
+child reads. The child never gets the token or the path.
+
 Output, in OUT/run: output/{discovery.json | locus-search.json,
 verification-manifest.json, transport.json} from the child, and in result/
 manifest.json (this run), relay.log, stderr.log and read-envelope.json, which
@@ -347,7 +352,7 @@ def run_status(exit_code, problems: list[str]) -> str:
 
 
 def recorder(worker, collect_entry, reads: Reads, inputs: dict[str, dict], upstream: str,
-             unit: str | None):
+             unit: str | None, github_token: dict | None = None):
     """The record function run_supervised calls instead of the model collect()."""
 
     def record(run_dir: Path, exit_code, stdout: str, stderr: str, failures: list[str],
@@ -378,7 +383,8 @@ def recorder(worker, collect_entry, reads: Reads, inputs: dict[str, dict], upstr
                     "exit_code": exit_code, "failures": list(failures), "problems": problems,
                     "policy_sha256": hashlib.sha256(
                         (run_dir / "policy/srt-settings.json").read_bytes()).hexdigest(),
-                    "request": reads.as_request(), "inputs": inputs, "relay": relay}
+                    "request": reads.as_request(), "inputs": inputs, "relay": relay,
+                    "github_token": dict(github_token or collect_entry.ANONYMOUS_TOKEN)}
         (result / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
         for name in ("relay.log", "manifest.json"):
             files["run-manifest.json" if name == "manifest.json" else name] = \
@@ -386,6 +392,7 @@ def recorder(worker, collect_entry, reads: Reads, inputs: dict[str, dict], upstr
         envelope = {"schema": ENVELOPE_SCHEMA, "entry": ENTRY, "upstream": upstream, "unit": unit,
                     "stage": reads.stage, "request": reads.as_request(), "inputs": inputs,
                     "adapter_exit": exit_code,
+                    "github_token": dict(github_token or collect_entry.ANONYMOUS_TOKEN),
                     "relay": {key: relay.get(key) for key in ("sources", "relay_sha256", "port")},
                     "files": files}
         (result / "read-envelope.json").write_text(json.dumps(envelope, indent=1), encoding="utf-8")
@@ -396,7 +403,8 @@ def recorder(worker, collect_entry, reads: Reads, inputs: dict[str, dict], upstr
 
 def run_reads(worker, collect_entry, runtime: list[str], out: Path, input_dir: Path, reads: Reads,
               inputs: dict[str, dict], seconds: float, launch, upstream: str = UPSTREAM,
-              drop_read: tuple[str, ...] = ()) -> bool:
+              drop_read: tuple[str, ...] = (), github_token: dict | None = None,
+              github_token_file: Path | None = None) -> bool:
     """One supervised candidate-reads step: input_dir read-only, OUT/run the run directory.
 
     launch is the worker's relay_launch for this request. Tests hand the same launch with
@@ -415,6 +423,9 @@ def run_reads(worker, collect_entry, runtime: list[str], out: Path, input_dir: P
         policy["filesystem"]["allowRead"] += candidate_read(worker, python)
         policy["filesystem"]["allowRead"] = [path for path in policy["filesystem"]["allowRead"]
                                              if path not in drop_read]
+        if github_token_file is not None and collect_entry.token_path_is_readable_by_child(
+                github_token_file, policy["filesystem"]["allowRead"]):
+            raise worker.Blocked("the srt policy would let the child read the GitHub token file")
         return policy
 
     def command_for(policy_file):
@@ -430,7 +441,7 @@ def run_reads(worker, collect_entry, runtime: list[str], out: Path, input_dir: P
     return worker.run_supervised(
         input_dir, run_dir, worker.PROFILES[0], seconds, launch, policy_for, command_for,
         environment, record=recorder(worker, collect_entry, reads, inputs, upstream,
-                                     os.environ.get(worker.UNIT_ENV_MARKER)))
+                                     os.environ.get(worker.UNIT_ENV_MARKER), github_token))
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -448,6 +459,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--max-clues-per-locus", type=int)
     parser.add_argument("--request-budget", type=int, default=MAX_REQUEST_BUDGET)
     parser.add_argument("--timeout", type=float, default=300.0)
+    parser.add_argument("--github-token-file", default=None)
     options = parser.parse_args(argv)
     collect_entry = load_collect_entry()
     worker = collect_entry.load_worker()
@@ -467,6 +479,8 @@ def main(argv: list[str] | None = None) -> int:
         if out.is_symlink() or not out.is_dir() or any(out.iterdir()):
             raise ValueError("--out-dir must be an existing empty directory")
         inputs = checked_inputs(reads, options.input_dir)
+        token_file, github_token = collect_entry.checked_github_token(
+            worker, options.github_token_file, forbidden=(out.resolve(), options.input_dir.resolve()))
     except ValueError as error:
         print(f"OSS candidate reads did not start: {error}", file=sys.stderr)
         return EXIT_BAD_INPUT
@@ -492,9 +506,9 @@ def main(argv: list[str] | None = None) -> int:
         request = worker.checked_relay_request(list(reads.repositories), reads.request_budget,
                                                RELAY_MAX_RESPONSE_BYTES, RELAY_RESPONSE_BYTE_BUDGET,
                                                RELAY_TIMEOUT_SECONDS)
-        launch = worker.relay_launch(request, dict(os.environ))
+        launch = collect_entry.launch_with_token(worker.relay_launch(request, dict(os.environ)), token_file)
         kept = run_reads(worker, collect_entry, runtime, out.resolve(), options.input_dir, reads, inputs,
-                         options.timeout, launch)
+                         options.timeout, launch, github_token=github_token, github_token_file=token_file)
     except worker.Blocked as error:
         print(f"OSS candidate reads blocked: {error}", file=sys.stderr)
         return EXIT_BLOCKED

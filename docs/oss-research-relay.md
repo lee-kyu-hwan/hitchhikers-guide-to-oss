@@ -4,7 +4,9 @@
 안의 조사 워커(child)는 이 relay의 `127.0.0.1` 포트만 목적지로 허용받는다.
 child는 GitHub에 직접 연결하지 않는다. relay는 범용 proxy가 아니다. 정해진
 저장소 읽기 endpoint와 고정 GraphQL operation 하나만 받는다. 받은 요청은
-기존 #192 클라이언트(`GhApiClient`, `GraphqlQueryClient`)로 인증 없이 보낸다.
+기존 #192 클라이언트(`GhApiClient`, `GraphqlQueryClient`)로 보낸다. 기본은 인증 없음(익명)이고,
+부모가 `--github-token-file`로 읽기 전용 GitHub 토큰 파일을 주면 relay만 그 값을
+`api.github.com` 요청에 붙인다(아래 「읽기 전용 GitHub 토큰」).
 
 srt는 목적지 host:port만 제한한다. 허용된 서버가 GitHub 자체라면 REST
 POST, GraphQL mutation, git push 탐색 요청도 그 서버에 도달한다. 그래서
@@ -22,11 +24,12 @@ GraphQL 성공, 모델 인증의 증거가 아니다. GitHub GraphQL은 인증�
 oss-research-relay --repo OWNER/NAME [--repo OWNER/.github ...] \
   --request-budget N --max-response-bytes N \
   --response-byte-budget N --timeout-seconds S \
-  [--skills-dir /absolute/path/to/skills]
+  [--skills-dir /absolute/path/to/skills] \
+  [--github-token-file /absolute/path/to/token]
 ```
 
-`--skills-dir`를 뺀 인자는 모두 필수이고 기본값이 없다. 부모가 경계를
-명시해야 한다.
+`--skills-dir`와 `--github-token-file`을 뺀 인자는 모두 필수이고 기본값이 없다.
+부모가 경계를 명시해야 한다.
 
 | 인자 | 의미 | 범위 |
 | --- | --- | --- |
@@ -36,6 +39,7 @@ oss-research-relay --repo OWNER/NAME [--repo OWNER/.github ...] \
 | `--response-byte-budget` | relay 수명 전체의 응답 본문 바이트 합계 | 1–1GiB |
 | `--timeout-seconds` | relay 요청 하나의 부분 기한. 범위는 아래 "기한" 참고 | 0초 초과 300초 이하 |
 | `--skills-dir` | 클라이언트 source를 읽을 skills 디렉터리. 절대 경로만 | 기본 `$HOME/.codex/skills` |
+| `--github-token-file` | 읽기 전용 GitHub 토큰 파일. 절대 경로만, 한 번만 | 기본 없음 = 익명 |
 
 upstream URL과 opener를 바꾸는 인자는 없다. 클라이언트 source는 신뢰된
 부모가 `--skills-dir`로 고른 디렉터리에서만 읽는다. 생략하면
@@ -67,6 +71,38 @@ resolve된 경로와 SHA-256이다. 부모는 이 값을 provenance로 기록하
 ```
 
 bind 주소는 `127.0.0.1:0`으로 고정이다. 포트는 커널이 고른다.
+
+## 읽기 전용 GitHub 토큰
+
+익명 호출은 한도가 낮고 GraphQL·코드 검색이 401로 끝난다. 그래서 부모가 선택적으로
+토큰 하나를 relay에만 줄 수 있다. 계약은 다음과 같다.
+
+- **토큰 없음 = 익명**: `--github-token-file`을 주지 않으면 오류가 아니라 지금까지와 같은
+  익명 relay다. 기본값은 없고 환경 변수는 읽지 않는다(`GH_TOKEN`, `GITHUB_TOKEN`,
+  `gh auth token` 모두).
+- **파일 인자로만**: 값은 argv·환경 변수·stdin이 아니라 파일 경로로만 전달한다. 경로는
+  절대 경로이고 한 번만 줄 수 있다. 읽는 쪽은 relay 하나다. srt 안의 조사 프로세스(collector·
+  verifier·모델)는 값도 파일도 보지 못한다(정책의 읽기 집합에 경로가 없고, 있으면 entry가
+  `Blocked`로 막는다).
+- **파일 검사**(모델 `load_credential`과 같은 수준, 실패는 relay를 띄우기 전에 거부):
+  디렉터리와 파일을 심볼릭 링크 없이(`O_NOFOLLOW`) 열고, 일반 파일이며, 소유자가 실행 사용자와 같고,
+  디렉터리·파일 모두 group·other 권한이 없고(`0o077` 비트 없음), hardlink가 하나이고, 크기가
+  1~512바이트이며, 읽는 동안 바뀌지 않고, ASCII 한 줄이고(앞뒤 공백·개행만 제거, 안쪽 공백 없음),
+  `[A-Za-z0-9_-]{20,500}`이다. 실패 메시지는 고정 문구이고 값·접두어·길이를 담지 않는다.
+- **붙이는 곳**: `Authorization: Bearer`는 클라이언트의 읽기 전용 검사를 통과한 뒤
+  `https://api.github.com/` 요청에만 붙는다. opener는 그 밖의 URL로 가는 요청에
+  `Authorization`이 있으면 `UnsafeCredentialUse`로 거부한다. child가 보낸
+  `Authorization`은 계속 400으로 거부한다.
+- **노출 금지**: 값은 로그·stderr·응답 본문·transport 기록·manifest·envelope·오류 어디에도
+  나오지 않는다(응답과 로그에 값이 섞이면 `<credential>`로 가린다). 남기는 것은
+  `authenticated`(참/거짓)와 토큰 파일 sha256뿐이다. `/v1/health`는 `authenticated`를 돌려준다.
+  ready 줄은 바뀌지 않았다.
+- **권장 토큰**: 읽기 전용 fine-grained PAT(Repository access: Public Repositories (read-only),
+  권한 추가 없음)만 쓴다. 코드는 토큰의 실제 권한을 검증할 수 없다. 더 넓은 토큰을 넣으면 relay의
+  GET 전용·허용 route 규칙이 막아 주지만, 그것을 토큰 권한의 증명으로 읽으면 안 된다.
+  토큰은 공유하지 않는다. 사람마다 자기 토큰 파일을 쓰고, 요청은 그 사용자 계정의 것으로 기록된다.
+  권장 경로는 `~/.oss-research-credentials/github-readonly/token`(디렉터리 0700, 파일 0600)이다.
+- 허용 route·GET 전용·고정 GraphQL·예산 규칙은 토큰 때문에 넓어지지 않았다.
 
 ## HTTP 계약
 
@@ -114,6 +150,12 @@ upstream을 호출하지 않는다. `{"ok":true,"budget":{...}}`를 돌려준다
   거부한다. 인용 phrase 안의 `repo:`는 GitHub에서 범위가 아니라 텍스트이기
   때문이다(예: `"foo repo:a/b bar"`). 그래서 공백이 든 label 같은 인용 검색은
   지원하지 않는다. 예외는 아래 후보 verifier의 정확한 형태 하나뿐이다.
+- 검사는 질의의 **형태**(평평함, 따옴표·부정·`OR` 없음, `repo:` 하나)이지 qualifier 이름의 허용 목록이
+  아니다. 그래서 수집 collector가 보내는 양성 토큰은 그대로 통과한다: `is:pr is:closed closed:A..B`,
+  `--outcome closed-unmerged`의 `is:unmerged`(부정 토큰 `-is:merged` 대신, 2026-10-03 변경),
+  `--docs-only`의 `docs in:title` 또는 `label:documentation`. 시험이 이 형태들의 통과와,
+  부정(`-is:merged`, `-in:title`)·범위 확장(`org:`·`user:`·`owner:`·둘째 `repo:`·`OR`·인용)이 이 토큰들 옆에서도
+  계속 거부됨을 고정한다(`DocsCollectionSearchTests`).
 - `/versions`는 저장소가 아닌 유일한 읽기로, collector의 API 버전 사전 확인용이다.
   정확한 경로의 GET만 받는다. query가 있으면 400 `query_not_allowed`다(끝의
   빈 `?`는 빈 query로 본다). 요청 예산·응답 크기·timeout은 다른 endpoint와 같다.
@@ -167,7 +209,10 @@ query string은 붙일 수 없다.
 ```
 
 전달하는 응답 헤더는 `etag`, `link`, `x-ratelimit-limit`,
-`x-ratelimit-remaining`, `x-ratelimit-reset`뿐이다.
+`x-ratelimit-remaining`, `x-ratelimit-reset`과, 값이 짧은 정수(`x-ratelimit-used`, 1~12자리)이거나
+식별자(`x-ratelimit-resource`, `[a-z_]` 32자 이하)일 때만 그 둘(2026-10-03 추가)뿐이다. 그 밖의
+upstream 헤더(`Set-Cookie`, `Authorization` 등)는 전달하지 않는다. adapter는 이 값으로 요청마다
+`rate_limit {limit, remaining, used, resource}`를 transport 기록에 남긴다(정수·식별자만, `reset`은 아님).
 
 실패 응답은 `{"ok":false,"error":<code>,"message":...,"budget":{...}}`다.
 upstream 실패에는 `endpoint`와 `upstream_status`가 붙을 수 있다.
@@ -221,8 +266,9 @@ collector(`collect_recent_closed_prs._retry_delay`)는 서버가 명시한 대�
 
 ## 보안 제약
 
-- 인증 없음: 두 클라이언트에 `token_provider`로 항상 `None`을 주입한다.
-  `GH_TOKEN`, `GITHUB_TOKEN`, `gh auth token`을 읽지 않는다. child가 보낸
+- 기본은 인증 없음: `--github-token-file`이 없으면 두 클라이언트에 `token_provider`로 항상
+  `None`을 주입한다. 있으면 relay가 읽은 값만 `api.github.com` 요청에 붙는다(위 「읽기 전용 GitHub
+  토큰」). 어느 쪽이든 `GH_TOKEN`, `GITHUB_TOKEN`, `gh auth token`을 읽지 않는다. child가 보낸
   `Authorization`, `Proxy-Authorization`, `Cookie`는 전달하지 않고 요청 자체를
   400으로 거부한다. `If-None-Match`, `If-Modified-Since`, `Expect`,
   `Transfer-Encoding`도 거부한다.
@@ -266,7 +312,7 @@ collector(`collect_recent_closed_prs._retry_delay`)는 서버가 명시한 대�
 
 ## 미지원
 
-- 인증 토큰, 모델 auth broker, 사용자 credential 전달
+- 모델 auth broker, 읽기 전용 GitHub 토큰 파일 하나 외의 사용자 credential 전달
 - clone, `git-upload-pack`, archive(`tarball`/`zipball`)
 - `/user`, `/versions/...` 같은 하위 경로, 조직·사용자 endpoint
 - 관측한 default branch가 아닌 branch 이름 ref. 코드 검색도 verifier의 정확한 질의 형태만 받는다
@@ -305,3 +351,15 @@ relay→fixture 구간 모두 실제 HTTP로 검사한다. 부모 환경에
   `--skills-dir` 거부, ready 줄, `sources` 경로·SHA-256 기록, 로드 중 hash
   변경 시 실패, HTTP query로 source 지정 불가, health, SIGTERM 종료,
   기본 스킬 경로가 없으면 종료 코드 2.
+
+- 수집 보완(2026-10-03): 검색 토큰 통과·거부(`DocsCollectionSearchTests`), 성공 응답의 quota 헤더 전달과 이상한 값
+  폐기(`RateLimitHeaderForwardingTests`). 어댑터 쪽 기록은 `tests/test_oss_research_relay_collect.py`
+  (`QuotaRecordTests`, `NoQuotaRecordTests`, `CredentialScopeTests`, `DocsOnlyCommandLineTests`, `UnmergedCommandLineTests`)와
+  `tests/test_oss_research_relay_issues.py`(`QuotaRecordTests`, `CredentialScopeTests`, `ClosedIssuesTests`)가 본다.
+
+읽기 전용 토큰 경로(`--github-token-file`)는 `tests/test_oss_research_github_token.py`가
+가짜 sentinel 토큰만으로 검사한다(실제 토큰·`api.github.com` 호출 없음).
+파일 검사의 거부 사례(링크·권한·소유자·hardlink·크기·형태), 토큰이 `api.github.com` 요청에만
+붙고 다른 URL에는 `UnsafeCredentialUse`로 막히는 것, 값이 로그·응답·stderr에 남지 않는 것,
+child가 보낸 `Authorization` 거부, 토큰 없음 = 익명을 본다. 설계·측정·한계는
+`docs/research/2026-10-03-github-read-token.md`다.

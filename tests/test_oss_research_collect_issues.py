@@ -79,7 +79,7 @@ class IssueEntryTests(unittest.TestCase):
         self.assertEqual(len(self.collection(repositories=["a/b", "c/d"], max_per_repo=10).repositories), 2)
         bad = {"cap 21": dict(max_per_repo=21), "cap 0": dict(max_per_repo=0),
                "cap true": dict(max_per_repo=True), "two repos over 20": dict(repositories=["a/b", "c/d"]),
-               "budget 61": dict(request_budget=61), "budget true": dict(request_budget=True),
+               "budget 91": dict(request_budget=91), "budget true": dict(request_budget=True),
                "no date field": dict(date_field=None), "other date field": dict(date_field="merged"),
                "other state": dict(state="merged"), "closed open": dict(date_field="closed", state="open"),
                "no Z": dict(start_at="2026-03-28T00:00:00"), "date only": dict(end_at="2026-09-28"),
@@ -93,9 +93,34 @@ class IssueEntryTests(unittest.TestCase):
         # 184 days exactly is the edge that passes.
         self.collection(start_at="2026-03-28T00:00:00Z", end_at="2026-09-28T00:00:00Z")
 
+    def test_the_budget_ceiling_covers_a_full_cap_and_the_defaults_fit_their_budget(self):
+        """About 3 fixed requests and 4 per Issue (measured 2026-10-03: 14 Issues took 59-60):
+        a cap that the budget cannot read must not be the default, and a full cap must fit the ceiling."""
+        self.assertEqual((entry.MAX_ISSUES, entry.MAX_REQUEST_BUDGET), (20, 90))
+        self.assertLessEqual(3 + 4 * entry.MAX_ISSUES, entry.MAX_REQUEST_BUDGET)
+        self.assertEqual((entry.DEFAULT_ISSUES, entry.DEFAULT_REQUEST_BUDGET), (14, 60))
+        self.assertLessEqual(3 + 4 * entry.DEFAULT_ISSUES, entry.DEFAULT_REQUEST_BUDGET)
+        for cap, budget in ((14, 60), (15, 70), (20, 90)):
+            with self.subTest(cap=cap, budget=budget):
+                request = self.collection(max_per_repo=cap, request_budget=budget).as_request()
+                self.assertEqual((request["max_per_repo"], request["request_budget"]), (cap, budget))
+
+    def test_the_command_line_defaults_are_a_cap_the_default_budget_can_read(self):
+        parsed = entry.build_parser().parse_args(["--out-dir", "/x", "--repo", "a/b", "--date-field", "updated",
+                                                  "--state", "open", "--start-at", "2026-07-05T00:00:00Z",
+                                                  "--end-at", "2026-10-03T00:00:00Z"])
+        self.assertEqual((parsed.max_per_repo, parsed.request_budget), (14, 60))
+
+    def test_closed_and_all_states_and_the_closed_date_field_are_accepted(self):
+        for state, date_field in (("closed", "updated"), ("closed", "closed"), ("closed", "created"),
+                                  ("all", "closed"), ("all", "updated"), ("open", "updated")):
+            with self.subTest(state=state, date_field=date_field):
+                request = self.collection(state=state, date_field=date_field).as_request()
+                self.assertEqual((request["state"], request["date_field"]), (state, date_field))
+
     def test_the_pr_entry_and_its_limits_are_unchanged(self):
         self.assertEqual((collect_entry.MAX_PER_REPO, collect_entry.MAX_REQUEST_BUDGET,
-                          collect_entry.MAX_INTERVAL_DAYS), (3, 60, 31))
+                          collect_entry.MAX_INTERVAL_DAYS), (5, 60, 31))
         self.assertEqual(wrapper.ENTRIES["collect"], "dot_local/bin/executable_oss-research-collect")
         self.assertEqual(wrapper.ENTRIES["collect-issues"], entry.ENTRY)
         self.assertEqual(set(wrapper.ENTRIES), {"worker", "collect", "collect-issues", "candidate-reads", "verify"})
@@ -255,7 +280,7 @@ class IssueEntryTests(unittest.TestCase):
             self.assertEqual(refused.exception.code, 2)
             good = base + ["--date-field", "created"]
             self.assertEqual(entry.main(good + ["--max-per-repo", "21"]), 2)
-            self.assertEqual(entry.main(good + ["--request-budget", "61"]), 2)
+            self.assertEqual(entry.main(good + ["--request-budget", "91"]), 2)
             self.assertEqual(entry.main(good + ["--timeout", "1801"]), 2)
             (out / "x").write_text("")
             self.assertEqual(entry.main(good), 2)
@@ -313,10 +338,12 @@ class IssuePickupTests(unittest.TestCase):
             "relay.log": "",
             "run-manifest.json": {"kind": "issue-collection", "status": status, "exit_code": adapter,
                                   "failures": [], "problems": [],
+                                  "github_token": {"authenticated": False, "token_file_sha256": None},
                                   "relay": {"sources": sources, "relay_sha256": "e" * 64, "port": 4242}},
             "envelope": {"schema": "oss-research-issue-collection-envelope/1",
                          "entry": "dot_local/bin/executable_oss-research-collect-issues",
                          "unit": "oss-research-0123456789abcdef", "upstream": "loopback-mock",
+                         "github_token": {"authenticated": False, "token_file_sha256": None},
                          "request": dict(self.REQUEST), "adapter_exit": adapter,
                          "relay": {"sources": sources, "relay_sha256": "e" * 64, "port": 4242}},
         }
@@ -537,7 +564,7 @@ class IssuePickupTests(unittest.TestCase):
                  "no Z": dict(start_at="2026-03-28T00:00:00", end_at="2026-09-28T00:00:00"),
                  "date field merged": dict(date_field="merged"), "state merged": dict(state="merged"),
                  "closed date of open Issues": dict(date_field="closed"),
-                 "cap 21": dict(max_per_repo=21), "budget 61": dict(request_budget=61)}
+                 "cap 21": dict(max_per_repo=21), "budget 91": dict(request_budget=91)}
         for label, request in cases.items():
             with self.subTest(label):
                 code, seen = self.verify(self.pack("limit-" + label.replace(" ", "-"), consistent(**request)))

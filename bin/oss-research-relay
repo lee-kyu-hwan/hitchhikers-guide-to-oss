@@ -4,22 +4,28 @@
 The parent starts this relay and lets a sandboxed child reach only its
 127.0.0.1 port. The relay is not a proxy: it accepts a fixed set of
 repository read endpoints and one fixed GraphQL operation, then calls the
-existing #192 clients (``GhApiClient`` and ``GraphqlQueryClient``) without a
-credential. See docs/research/oss-research-relay.md for the contract.
+existing #192 clients (``GhApiClient`` and ``GraphqlQueryClient``). They run
+anonymously unless the parent names a token FILE with --github-token-file: then
+this process alone reads it and adds ``Authorization: Bearer`` to its own requests
+to api.github.com, and to nothing else. No environment variable, ``gh`` or
+command-line value carries a token. See docs/research/oss-research-relay.md.
 """
 
 from __future__ import annotations
 
 import argparse
+import errno
 import hashlib
 import http.server
 import importlib.util
 import json
+import os
 from pathlib import Path
 import re
 import signal
 import socket
 import socketserver
+import stat
 import sys
 import threading
 import time
@@ -94,6 +100,10 @@ FORBIDDEN_REQUEST_HEADERS = frozenset({
     "if-none-match", "if-modified-since", "expect",
 })
 FORWARDED_RESPONSE_HEADERS = ("etag", "link", "x-ratelimit-limit", "x-ratelimit-remaining", "x-ratelimit-reset")
+# Also forwarded on a successful answer, but only when the value is a short plain number
+# or identifier (see _rate_limit_headers): they are quota facts for the transport record,
+# never a credential. Nothing else of the upstream's headers is passed on.
+FORWARDED_QUOTA_HEADERS = ("x-ratelimit-used", "x-ratelimit-resource")
 # Rate-limit headers kept when a received answer's retry wait passes the deadline:
 # short integer values only (anything else is dropped, never passed on).
 RATE_LIMIT_HEADERS = ("retry-after", "x-ratelimit-limit", "x-ratelimit-remaining", "x-ratelimit-reset",
@@ -209,6 +219,99 @@ def _no_credential() -> None:
     return None
 
 
+# A GitHub token file: the characters the #192 clients accept in a token (a classic
+# or fine-grained PAT fits), one line, never more than this many bytes.
+GITHUB_TOKEN_MAX_BYTES = 512
+GITHUB_TOKEN_PATTERN = re.compile(r"[A-Za-z0-9_-]{20,500}")
+CREDENTIAL_MARK = "<credential>"
+
+
+class TokenFileError(ValueError):
+    """The token file cannot be used. The text is fixed: it never holds the content or the path."""
+
+
+class UnsafeCredentialUse(Exception):
+    """A request holding the credential would go somewhere but api.github.com. Never raised in use."""
+
+
+class GithubToken:
+    """A checked token held in memory. repr and str never show the value."""
+
+    __slots__ = ("_value", "file_sha256")
+
+    def __init__(self, value: str, file_sha256: str) -> None:
+        self._value = value
+        self.file_sha256 = file_sha256  # sha256 of the file's bytes: an identifier, not the value
+
+    def __repr__(self) -> str:
+        return "<github token (hidden)>"
+
+    __str__ = __repr__
+
+    def __reduce__(self) -> Any:
+        raise TypeError("a token is never serialized")
+
+    def reveal(self) -> str:
+        """The value, for the Authorization header and the scrub of this process's own output only."""
+        return self._value
+
+
+def load_github_token(path: Path) -> GithubToken:
+    """The token in a private file, or TokenFileError.
+
+    The file and its directory are opened without following a link, and the owner,
+    mode and link count are checked on those descriptors (what is checked is what is
+    read): the file and its directory belong to this process's user and have no
+    group or other permission (0600 or 0400, and 0700 or tighter), the file is
+    regular with exactly one link and at most GITHUB_TOKEN_MAX_BYTES, and, once
+    surrounding whitespace is removed, it is one token of the accepted characters.
+    The file must not change while it is read. Messages never include the content.
+    """
+    path = Path(path)
+    if not path.is_absolute():
+        raise TokenFileError("the token file path must be absolute")
+    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
+    directory_fd = file_fd = None
+    try:
+        directory_fd = os.open(path.parent, flags | os.O_DIRECTORY)
+        file_fd = os.open(path.name, flags, dir_fd=directory_fd)
+        directory, info = os.fstat(directory_fd), os.fstat(file_fd)
+        if not stat.S_ISREG(info.st_mode):
+            raise TokenFileError("the token file is not a regular file")
+        for label, entry in (("directory", directory), ("file", info)):
+            if entry.st_uid != os.geteuid():
+                raise TokenFileError(f"the token {label} is not owned by this user")
+            if stat.S_IMODE(entry.st_mode) & 0o077:
+                raise TokenFileError(f"the token {label} is accessible to group or others")
+        if info.st_nlink != 1:
+            raise TokenFileError("the token file must have exactly one link")
+        if not 0 < info.st_size <= GITHUB_TOKEN_MAX_BYTES:
+            raise TokenFileError("the token file is empty or too large")
+        data = os.read(file_fd, GITHUB_TOKEN_MAX_BYTES + 1)
+        after = os.fstat(file_fd)
+    except OSError as error:
+        if error.errno == errno.ELOOP:
+            raise TokenFileError("the token file and its directory must not be links") from None
+        raise TokenFileError("the token file is unusable") from None
+    finally:
+        for descriptor in (directory_fd, file_fd):
+            if descriptor is not None:
+                os.close(descriptor)
+    if (after.st_size, after.st_mtime_ns) != (info.st_size, info.st_mtime_ns) or len(data) != info.st_size:
+        raise TokenFileError("the token file changed while it was read")
+    try:
+        text = data.decode("ascii").strip()
+    except UnicodeDecodeError:
+        raise TokenFileError("the token file is not a single-line ASCII token") from None
+    if not text:
+        raise TokenFileError("the token file holds no token")
+    if re.search(r"\s", text):
+        raise TokenFileError("the token file holds more than one line or whitespace inside the token")
+    if GITHUB_TOKEN_PATTERN.fullmatch(text) is None:
+        raise TokenFileError("the token file does not hold a GitHub token of the accepted characters")
+    return GithubToken(text, hashlib.sha256(data).hexdigest())
+
+
 def _response_socket(response: Any) -> Optional[socket.socket]:
     """Find the socket under an http.client response, if one is reachable."""
     stream = getattr(response, "fp", None)
@@ -281,6 +384,8 @@ class BoundedOpener:
     def open(self, request: urllib.request.Request, timeout: float) -> _BoundedResponse:
         self.last_response = None
         self.last_message = None
+        if request.has_header("Authorization") and not request.full_url.startswith(GITHUB_API + "/"):
+            raise UnsafeCredentialUse("the credential would leave api.github.com")
         if self.bytes_consumed >= self.response_byte_budget:
             raise ByteBudgetExhausted("relay response byte budget is exhausted")
         remaining = self.remaining()
@@ -330,8 +435,11 @@ class Relay:
         timeout_seconds: float,
         opener: Any,
         clock: Callable[[], float] = time.monotonic,
+        token: Optional[GithubToken] = None,
     ) -> None:
         self.repositories = {repository.lower(): repository for repository in repositories}
+        # The token, when the parent named a file; None is anonymous (no Authorization at all).
+        self._token = token
         # repository (lowercase) -> the default_branch of this relay's own in-scope
         # repository response. A branch ref is accepted only when it equals this.
         self.default_branches: dict[str, str] = {}
@@ -343,7 +451,8 @@ class Relay:
         sibling = issues_module._sibling
         self.budget = sibling.RequestBudget(request_budget)
         common = dict(
-            budget=self.budget, opener=self._opener, token_provider=_no_credential,
+            budget=self.budget, opener=self._opener,
+            token_provider=_no_credential if token is None else token.reveal,
             sleeper=self._sleep_within_deadline,
         )
         self.rest = sibling.GhApiClient(**common)
@@ -360,6 +469,19 @@ class Relay:
                 raise RetryWaitPassesDeadline(answered[0], answered[1], seconds, self._opener.last_message)
             raise DeadlineExceeded("retry wait would pass the relay request deadline")
         time.sleep(seconds)
+
+    @property
+    def authenticated(self) -> bool:
+        return self._token is not None
+
+    def scrub(self, text: str) -> str:
+        """text without the token's value (it should never be there; an upstream error text can echo it)."""
+        if self._token is None:
+            return text
+        return text.replace(self._token.reveal(), CREDENTIAL_MARK)
+
+    def log_event(self, document: dict[str, object]) -> None:
+        print(self.scrub(json.dumps(document)), file=sys.stderr, flush=True)
 
     def budget_state(self) -> dict[str, int]:
         return {"limit": self.budget.limit, "consumed": self.budget.consumed,
@@ -587,9 +709,9 @@ class Relay:
             except RetryWaitPassesDeadline as error:
                 # A received answer, not a timeout: keep its status. The relay
                 # neither waits nor asks again (one request, one budget unit).
-                print(json.dumps({"event": "upstream_retry_wait_passes_deadline", "endpoint": endpoint,
-                                  "upstream_status": error.status, "wait_seconds": round(error.wait_seconds, 3),
-                                  "rate_limit": error.headers}), file=sys.stderr, flush=True)
+                self.log_event({"event": "upstream_retry_wait_passes_deadline", "endpoint": endpoint,
+                                "upstream_status": error.status, "wait_seconds": round(error.wait_seconds, 3),
+                                "rate_limit": error.headers})
                 raise RelayError(502, "upstream_failed", str(error), endpoint=endpoint,
                                  upstream_status=error.status,
                                  relay_reason="the retry wait passes the relay request deadline",
@@ -597,6 +719,9 @@ class Relay:
                                  upstream_rate_limit=error.headers) from error
             except DeadlineExceeded as error:
                 raise RelayError(504, "upstream_timeout", str(error), endpoint=endpoint) from error
+            except UnsafeCredentialUse as error:
+                raise RelayError(500, "credential_misuse", "the credential would leave api.github.com; refused",
+                                 endpoint=endpoint) from error
             except self._sibling.BudgetExhausted as error:
                 raise RelayError(429, "budget_exhausted", "relay request budget is exhausted") from error
             except self._sibling.ApiFailure as error:
@@ -622,6 +747,8 @@ class Relay:
             if isinstance(branch, str) and re.fullmatch(_BRANCH_NAME, branch) and ".." not in branch:
                 self.default_branches[facts["repository"].lower()] = branch
         headers = {name: response.headers[name] for name in FORWARDED_RESPONSE_HEADERS if name in response.headers}
+        quota = _rate_limit_headers(response.headers)
+        headers.update({name: quota[name] for name in FORWARDED_QUOTA_HEADERS if name in quota})
         return {"ok": True, "status": response.status, "headers": headers, "payload": response.payload}
 
     def rest_get(self, target: str) -> dict[str, object]:
@@ -649,7 +776,7 @@ class RelayHandler(http.server.BaseHTTPRequestHandler):
         return None
 
     def _send(self, status: int, document: dict[str, object]) -> None:
-        body = json.dumps(document, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+        body = self.relay.scrub(json.dumps(document, separators=(",", ":"), ensure_ascii=False)).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
@@ -690,7 +817,8 @@ class RelayHandler(http.server.BaseHTTPRequestHandler):
             if route == "/v1/health":
                 if method != "GET" or self.path != route:
                     raise RelayError(405, "method_not_allowed", "health accepts only GET without a query")
-                self._send(200, {"ok": True, "budget": self.relay.budget_state()})
+                self._send(200, {"ok": True, "budget": self.relay.budget_state(),
+                                 "authenticated": self.relay.authenticated})
             elif route == "/v1/graphql":
                 if method != "POST" or self.path != route:
                     raise RelayError(405, "method_not_allowed", "GraphQL relay accepts only POST without a query")
@@ -785,6 +913,21 @@ def _absolute_directory(value: str) -> Path:
     return path
 
 
+def _absolute_file(value: str) -> Path:
+    path = Path(value)
+    if not value or not path.is_absolute():
+        raise argparse.ArgumentTypeError("must be an absolute path")
+    return path
+
+
+class _StoreOnce(argparse.Action):
+    def __call__(self, parser: argparse.ArgumentParser, namespace: argparse.Namespace, values: Any,
+                 option_string: Optional[str] = None) -> None:
+        if getattr(namespace, self.dest, None) is not None:
+            parser.error("{0} may be given only once".format(option_string))
+        setattr(namespace, self.dest, values)
+
+
 def _repository(value: str) -> str:
     if REPOSITORY.match(value) is None:
         raise argparse.ArgumentTypeError("must be OWNER/NAME")
@@ -806,6 +949,10 @@ def build_parser() -> argparse.ArgumentParser:
                         help="upstream response body bytes allowed for the relay lifetime")
     parser.add_argument("--timeout-seconds", required=True, type=_timeout,
                         help="deadline for one relay request after its body is read; see the docs for its limits")
+    parser.add_argument("--github-token-file", dest="github_token_file", type=_absolute_file, default=None,
+                        action=_StoreOnce,
+                        help="a private file holding one read-only GitHub token, read by this process only; "
+                             "without it every request is anonymous")
     parser.add_argument("--skills-dir", type=_absolute_directory, default=None,
                         help="absolute directory holding the collecting-* skills to load "
                              "(default: $HOME/.codex/skills)")
@@ -813,10 +960,12 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def build_server(args: argparse.Namespace, *, opener: Any, issues_module: Any) -> RelayServer:
+    path = getattr(args, "github_token_file", None)
     relay = Relay(
         issues_module=issues_module, repositories=args.repositories, request_budget=args.request_budget,
         max_response_bytes=args.max_response_bytes, response_byte_budget=args.response_byte_budget,
         timeout_seconds=args.timeout_seconds, opener=opener,
+        token=None if path is None else load_github_token(path),
     )
     return RelayServer(relay)
 
@@ -833,7 +982,11 @@ def main(argv: Optional[list[str]] = None) -> int:
         print("error: could not load the installed collecting skills: {0}".format(type(error).__name__),
               file=sys.stderr)
         return 2
-    server = build_server(args, opener=production_opener(), issues_module=issues_module)
+    try:
+        server = build_server(args, opener=production_opener(), issues_module=issues_module)
+    except TokenFileError as error:
+        print("error: the GitHub token file is unusable: {0}".format(error), file=sys.stderr)
+        return 2
 
     def stop(_signum: int, _frame: object) -> None:
         threading.Thread(target=server.shutdown, daemon=True).start()

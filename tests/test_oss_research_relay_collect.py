@@ -607,6 +607,158 @@ PROXY_BASIC = "Basic " + __import__("base64").b64encode(
 PROXY_SECRETS = (PROXY_USER, PROXY_PASSWORD, "pa%40ss-91c2", PROXY_BASIC, PROXY_BASIC.split()[1])
 
 
+QUOTA = {"x-ratelimit-limit": "5000", "x-ratelimit-remaining": "4990", "x-ratelimit-reset": "1790000000",
+         "x-ratelimit-used": "10", "x-ratelimit-resource": "core"}
+
+
+class QuotaRecordTests(RelayCollectHarness):
+    """Every relayed request records the quota facts of its answer (#192 follow-up)."""
+
+    def start(self, routes):
+        for route in routes.values():
+            route.setdefault("headers", {}).update(QUOTA)
+        super().start(routes)
+
+    def test_each_relayed_request_records_limit_remaining_used_and_resource(self):
+        _run, _paths, opener, client = self.relayed()
+        self.assertEqual(len(opener.records), client.budget.consumed)
+        for entry in opener.records:
+            self.assertEqual(entry["rate_limit"], {"limit": 5000, "remaining": 4990, "resource": "core", "used": 10})
+        encoded = json.dumps(opener.records)
+        self.assertNotIn("Authorization", encoded)
+        self.assertNotIn("1790000000", encoded)
+
+
+class NoQuotaRecordTests(RelayCollectHarness):
+    def test_an_answer_without_quota_headers_records_no_rate_limit_field(self):
+        _run, _paths, opener, _client = self.relayed()
+        self.assertTrue(opener.records)
+        self.assertFalse([entry for entry in opener.records if "rate_limit" in entry])
+
+    def test_quota_record_keeps_only_plain_numbers_and_one_identifier(self):
+        self.assertEqual(adapter.quota_record({"x-ratelimit-limit": "5000", "x-ratelimit-used": "abc",
+                                               "x-ratelimit-resource": "core", "etag": "x"}),
+                         {"limit": 5000, "resource": "core"})
+        self.assertEqual(adapter.quota_record({"x-ratelimit-resource": "co re"}), {})
+        self.assertEqual(adapter.quota_record({"x-ratelimit-limit": "99999999999999"}), {})
+        self.assertEqual(adapter.quota_record({}), {})
+
+
+def docs_world(mode="title"):
+    """world() where only pull request 2 has a docs title, plus the search route of --docs-only MODE.
+
+    The search answers all four pull requests (a title or label search is index-backed and may match
+    more than the rule keeps); the collector's rule keeps pull request 2."""
+    routes = world()
+    root = "/repos/" + REPO
+    routes[(root + "/pulls/2", ())]["payload"]["title"] = "docs: relay fixture"
+    interval = interval_for()
+    items = routes[("/search/issues", _query_key(urllib.parse.urlencode(
+        {"q": collector.build_closed_query(REPO, interval, "all"), "page": 1})))]["payload"]
+    docs_query = collector.build_closed_query(REPO, interval, "all", docs_only=mode)
+    routes[("/search/issues", _query_key(urllib.parse.urlencode({"q": docs_query, "page": 1})))] = dict(payload=items)
+    return routes
+
+
+class CredentialScopeTests(RelayCollectHarness):
+    """The transport record's "credential" speaks for the child only; the new fields say so (#192 follow-up)."""
+
+    def test_the_transport_record_says_what_its_credential_field_means(self):
+        run, _paths, opener, _client = self.relayed()
+        record = adapter.transport_record(opener, collector_source, run)
+        self.assertEqual(record["credential_scope"], "child")
+        self.assertIn("github_token.authenticated", record["credential_scope_note"])
+        self.assertTrue(record["credential"].startswith("none: token_provider returned None"))
+
+    def test_the_existing_value_and_the_collectors_manifest_are_not_changed(self):
+        run, paths, opener, _client = self.relayed()
+        self.assertEqual(adapter.transport_record(opener, collector_source, run)["credential"],
+                         "none: token_provider returned None and no Authorization header was sent")
+        self.assertEqual(_load(paths["manifest.json"])["records"][0]["preflight"]["login"], "anonymous")
+
+
+class DocsOnlyCommandLineTests(CommandLineTests):
+    """--docs-only reaches the collector: the docs search form is sent and the rule decides after hydration."""
+
+    def start(self, routes):
+        super().start(docs_world("title"))
+
+    def test_docs_only_title_filters_after_the_docs_search_form(self):
+        with self.without_proxy_variables(), mock.patch.object(sys, "stderr"):
+            code = adapter.main(self.argv("docs", **{"--docs-only": "title"}))
+        self.assertEqual(code, 0)
+        searched = [request["path"] for request in self.upstream.requests if request["path"].startswith("/search/issues")]
+        self.assertEqual(len(searched), 1)
+        self.assertIn("docs+in%3Atitle", searched[0])
+        self.assertEqual(self.upstream.unmatched, [])
+        corpus = _load(self.directory / "docs-corpus.json")
+        self.assertEqual([record["pull_request"]["number"] for record in corpus["records"]], [2])
+        manifest = _load(self.directory / "docs-manifest.json")["records"][0]
+        self.assertEqual(manifest["docs_only"], "title")
+        docs = manifest["repositories"][0]["docs_filter"]
+        self.assertEqual((docs["mode"], docs["search_matched"], docs["hydrated"], docs["passed"], docs["dropped"]),
+                         ("title", 4, 4, 1, 3))
+
+    def test_an_unknown_docs_mode_is_refused_by_the_adapter(self):
+        with self.without_proxy_variables(), mock.patch.object(sys, "stderr"), self.assertRaises(SystemExit) as caught:
+            adapter.main(self.argv("bad", **{"--docs-only": "body"}))
+        self.assertEqual(caught.exception.code, 2)
+        self.assertEqual(self.upstream.requests, [])
+
+
+def unmerged_world():
+    """world() with every pull request closed without a merge, and the search route of --outcome closed-unmerged."""
+    routes = world()
+    root = "/repos/" + REPO
+    for number in (1, 2, 3, 4):
+        routes[(root + "/pulls/%d" % number, ())]["payload"]["merged_at"] = None
+        routes[(root + "/issues/%d/timeline" % number, _query_key("page=1"))]["payload"] = []
+    interval = interval_for()
+    plain = routes[("/search/issues", _query_key(urllib.parse.urlencode(
+        {"q": collector.build_closed_query(REPO, interval, "all"), "page": 1})))]["payload"]
+    query = collector.build_closed_query(REPO, interval, "closed-unmerged")
+    routes[("/search/issues", _query_key(urllib.parse.urlencode({"q": query, "page": 1})))] = dict(payload=plain)
+    return routes
+
+
+class UnmergedCommandLineTests(CommandLineTests):
+    """--outcome closed-unmerged searches with the positive is:unmerged qualifier, which the relay lets through."""
+
+    def start(self, routes):
+        super().start(unmerged_world())
+
+    def test_closed_unmerged_is_collected_through_the_relay_without_a_negated_token(self):
+        with self.without_proxy_variables(), mock.patch.object(sys, "stderr"):
+            code = adapter.main(self.argv("unmerged", **{"--outcome": "closed-unmerged"}))
+        self.assertEqual(code, 0)
+        searched = [request["path"] for request in self.upstream.requests if request["path"].startswith("/search/issues")]
+        self.assertEqual(len(searched), 1)
+        query = urllib.parse.parse_qs(urllib.parse.urlsplit(searched[0]).query)["q"][0]
+        self.assertIn("is:unmerged", query)
+        self.assertFalse([token for token in query.split() if token.startswith("-")])
+        self.assertEqual(self.upstream.unmatched, [])
+        record = _load(self.directory / "unmerged-transport.json")
+        self.assertTrue(all(entry["outcome"] == "relayed" for entry in record["requests"]))
+        corpus = _load(self.directory / "unmerged-corpus.json")
+        self.assertEqual({r["pull_request"]["normalized_state"] for r in corpus["records"]}, {"closed-unmerged"})
+        self.assertEqual(len(corpus["records"]), 3)
+
+    def test_the_old_negated_form_is_what_the_relay_refused(self):
+        """The 2026-10-03 failure, kept as the reason for the change: a negated token is a relay refusal."""
+        status, document = self.raw_search("repo:octo/demo is:pr is:closed -is:merged")
+        self.assertEqual((status, document["error"]), (403, "search_grammar_not_allowed"))
+
+    def raw_search(self, query):
+        import http.client
+        connection = http.client.HTTPConnection("127.0.0.1", self.server.server_address[1], timeout=10)
+        try:
+            connection.request("GET", "/v1/rest/search/issues?" + urllib.parse.urlencode({"q": query, "page": 1}))
+            response = connection.getresponse()
+            return response.status, json.loads(response.read())
+        finally:
+            connection.close()
+
+
 class LoopbackProxy(http.server.ThreadingHTTPServer):
     """Stands in for srt's in-sandbox HTTP proxy: session Basic auth, then absolute-form
     GETs to one relay, forwarded without the proxy header."""

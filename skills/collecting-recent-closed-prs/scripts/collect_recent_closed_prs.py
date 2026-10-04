@@ -555,10 +555,61 @@ def resolve_interval(
     )
 
 
-def build_closed_query(repository: str, interval: Interval, outcome: str) -> str:
+# The documentation filter (--docs-only). The search step narrows with ONE fixed
+# positive form, flat and unquoted (no negation, no OR, no quotes), so the relay's
+# search grammar needs no widening: the title word ``docs`` with ``in:title``, or
+# the ``documentation`` label. What search cannot tell is decided after hydration
+# by is_docs_pull_request. Both parts are fixed constants, never caller input.
+DOCS_ONLY_MODES = ("title", "label")
+DOCS_SEARCH_QUALIFIERS = {"title": ("docs", "in:title"), "label": ("label:documentation",)}
+DOCS_FILTER_RULE = "docs-title-prefix-or-docs-path/1"
+# A title that starts with docs, docs( or docs: (case-insensitive), or is just "docs ...".
+DOCS_TITLE_PREFIX = re.compile(r"\Adocs(?:\(|:|\s|\Z)", re.IGNORECASE)
+# A changed path that sits under a docs/ directory, is a Markdown file, or is a README.
+# Changelog files are not documentation changes (release pull requests touch them).
+DOCS_DIRECTORY_SEGMENT = "docs"
+DOCS_FILE_SUFFIXES = (".md", ".mdx")
+DOCS_README_BASENAME = re.compile(r"\AREADME(?:\.[A-Za-z0-9]+)?\Z", re.IGNORECASE)
+DOCS_CHANGELOG_BASENAME = re.compile(r"\ACHANGELOG", re.IGNORECASE)
+
+
+def _checked_docs_only(docs_only: object) -> Optional[str]:
+    if docs_only is None:
+        return None
+    if not isinstance(docs_only, str) or docs_only not in DOCS_ONLY_MODES:
+        raise ValueError("docs_only must be one of " + ", ".join(DOCS_ONLY_MODES))
+    return docs_only
+
+
+def _is_docs_path(path: str) -> bool:
+    segments = path.split("/")
+    basename = segments[-1]
+    if DOCS_DIRECTORY_SEGMENT in segments[:-1]:
+        return True
+    if DOCS_CHANGELOG_BASENAME.match(basename):
+        return False
+    return basename.lower().endswith(DOCS_FILE_SUFFIXES) or DOCS_README_BASENAME.match(basename) is not None
+
+
+def is_docs_pull_request(record: object) -> bool:
+    """True when a hydrated record's title starts with docs or a changed path is documentation."""
+    pull = record.get("pull_request") if isinstance(record, dict) else None
+    title = pull.get("title") if isinstance(pull, dict) else None
+    if isinstance(title, str) and DOCS_TITLE_PREFIX.match(title.strip()):
+        return True
+    snapshot = record.get("evidence_snapshot") if isinstance(record, dict) else None
+    files = snapshot.get("changed_files") if isinstance(snapshot, dict) else None
+    if not isinstance(files, list):
+        return False
+    return any(isinstance(item, dict) and isinstance(item.get("path"), str) and _is_docs_path(item["path"])
+               for item in files)
+
+
+def build_closed_query(repository: str, interval: Interval, outcome: str, docs_only: Optional[str] = None) -> str:
     """Build one Search API qualifier for a UTC half-open closed interval."""
     if outcome not in {"all", "merged", "closed-unmerged"}:
         raise ValueError("outcome must be all, merged, or closed-unmerged")
+    docs_only = _checked_docs_only(docs_only)
 
     start = parse_timestamp(interval.start_at, "interval.start_at")
     end = parse_timestamp(interval.end_at, "interval.end_at")
@@ -574,7 +625,10 @@ def build_closed_query(repository: str, interval: Interval, outcome: str) -> str
     if outcome == "merged":
         qualifiers.append("is:merged")
     elif outcome == "closed-unmerged":
-        qualifiers.append("-is:merged")
+        # GitHub's own positive qualifier; a negated is:merged would be refused by the relay.
+        qualifiers.append("is:unmerged")
+    if docs_only is not None:
+        qualifiers.extend(DOCS_SEARCH_QUALIFIERS[docs_only])
     return " ".join(qualifiers)
 
 
@@ -658,6 +712,7 @@ def collect_repository_hits(
     outcome: str,
     max_per_repository: int,
     *,
+    docs_only: Optional[str] = None,
     safe_leaves: Optional[list[dict[str, object]]] = None,
     on_safe_leaf: Optional[Callable[[dict[str, object]], None]] = None,
     on_split_observation: Optional[Callable[[dict[str, object]], None]] = None,
@@ -675,6 +730,7 @@ def collect_repository_hits(
         raise ValueError("max_per_repository must be a positive integer")
     if outcome not in {"all", "merged", "closed-unmerged"}:
         raise ValueError("outcome must be all, merged, or closed-unmerged")
+    docs_only = _checked_docs_only(docs_only)
 
     try:
         preflight_response = client.get_json("/repos/{0}".format(repository))
@@ -733,7 +789,7 @@ def collect_repository_hits(
         if stopped:
             return
         partition_interval = _partition_interval(interval, start, end)
-        query = build_closed_query(repository, partition_interval, outcome)
+        query = build_closed_query(repository, partition_interval, outcome, docs_only=docs_only)
         for saved in safe_leaves or []:
             meta = saved.get("partition", {})
             if (meta.get("query") == query and meta.get("pagination_complete") is True
@@ -2430,9 +2486,12 @@ def utc_string(value: datetime) -> str:
     return value.astimezone(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
-def request_fingerprint(repositories: list[str], interval: Interval, outcome: str, max_per_repository: int, request_budget: int, api_version: str) -> str:
+def request_fingerprint(repositories: list[str], interval: Interval, outcome: str, max_per_repository: int, request_budget: int, api_version: str, docs_only: Optional[str] = None) -> str:
     """Hash the complete collection request without reordering repositories."""
     payload = {"repositories": repositories, "interval": {"start_at": interval.start_at, "end_at": interval.end_at, "timezone": interval.timezone, "input_mode": interval.input_mode}, "outcome": outcome, "max_per_repository": max_per_repository, "request_budget": request_budget, "api_version": api_version}
+    if docs_only is not None:
+        # Named only when the filter is on, so an unfiltered request keeps its earlier fingerprint.
+        payload["docs_only"] = docs_only
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
     return "sha256:" + hashlib.sha256(encoded).hexdigest()
 
@@ -2612,6 +2671,7 @@ def collect(
     api_version: Optional[str] = None,
     client_version: str = "unknown",
     skill_revision: Optional[str] = None,
+    docs_only: Optional[str] = None,
 ) -> CollectionRun:
     """Collect each repository serially, checkpointing usable evidence.
 
@@ -2637,6 +2697,7 @@ def collect(
         raise ValueError("interval must be an Interval")
     if outcome not in {"all", "merged", "closed-unmerged"}:
         raise ValueError("outcome must be all, merged, or closed-unmerged")
+    docs_only = _checked_docs_only(docs_only)
     if not isinstance(max_per_repository, int) or isinstance(max_per_repository, bool) or max_per_repository <= 0:
         raise ValueError("max_per_repository must be a positive integer")
     budget = getattr(client, "budget", None)
@@ -2647,7 +2708,7 @@ def collect(
             raise ValueError("request_budget must be a positive integer")
         effective_budget = request_budget
     effective_api_version = api_version or getattr(client, "api_version", API_VERSION)
-    fingerprint = request_fingerprint(repositories, interval, outcome, max_per_repository, effective_budget, effective_api_version)
+    fingerprint = request_fingerprint(repositories, interval, outcome, max_per_repository, effective_budget, effective_api_version, docs_only=docs_only)
     prior = _resume_record(existing_manifest, fingerprint, run_id)
     if prior is not None and existing_corpus is None:
         raise ValueError("resume requires its existing corpus")
@@ -2772,7 +2833,7 @@ def collect(
             save_checkpoint()
 
         try:
-            search = collect_repository_hits(client, repository, interval, outcome, max_per_repository,
+            search = collect_repository_hits(client, repository, interval, outcome, max_per_repository, docs_only=docs_only,
                                              safe_leaves=checkpoint_repo["safe_leaves"], on_safe_leaf=checkpoint_leaf,
                                              on_split_observation=checkpoint_split)
         except KeyboardInterrupt:
@@ -2784,6 +2845,7 @@ def collect(
         partial_records: list[dict[str, object]] = []
         candidates = list(search.selected_hits) + list(search.overflow_hits)
         processed_hits = 0
+        docs_hydrated = docs_passed = 0
         for hit in candidates:
             if len(selected_records) >= max_per_repository:
                 break
@@ -2813,6 +2875,13 @@ def collect(
             if indexed_state is not None and hydrated_state != indexed_state:
                 repo_warnings.append("outcome index race: candidate was reclassified during hydration")
                 continue
+            if docs_only is not None:
+                # The search narrowed by title or label only; the rule decides here. A dropped
+                # pull request already cost its requests, so the counts are recorded.
+                docs_hydrated += 1
+                if not is_docs_pull_request(hydrated):
+                    continue
+                docs_passed += 1
             prepared = _prepare_observation(hydrated, stable_run_id, timestamp)
             if prepared is None:
                 repo_warnings.append("required pull-request evidence was incomplete; record retained as partial evidence")
@@ -2845,6 +2914,11 @@ def collect(
             "partial_prs": hydration_partial_count,
             "partial_records": partial_records,
         }
+        if docs_only is not None:
+            repository_checkpoint["docs_filter"] = {
+                "mode": docs_only, "rule": DOCS_FILTER_RULE, "search_matched": search.matched_count,
+                "hydrated": docs_hydrated, "passed": docs_passed, "dropped": docs_hydrated - docs_passed,
+            }
         checkpoint_repo.update(repository_checkpoint)
         if output is not None and collected_any:
             atomic_write_json(output, corpus)
@@ -2861,6 +2935,7 @@ def collect(
                 "interval": {"start_at": interval.start_at, "end_at": interval.end_at, "timezone": interval.timezone, "input_mode": deepcopy(interval.input_mode), "as_of": interval.as_of, "last_day_partial": interval.last_day_partial},
                 "repositories_requested": deepcopy(repositories),
                 "outcome": outcome,
+                **({"docs_only": docs_only} if docs_only is not None else {}),
                 "max_per_repository": max_per_repository,
                 "request_budget": effective_budget,
                 "request_count": getattr(budget, "consumed", 0),
@@ -2890,6 +2965,7 @@ def collect(
         "interval": {"start_at": interval.start_at, "end_at": interval.end_at, "timezone": interval.timezone, "input_mode": deepcopy(interval.input_mode), "as_of": interval.as_of, "last_day_partial": interval.last_day_partial},
         "repositories_requested": deepcopy(repositories),
         "outcome": outcome,
+        **({"docs_only": docs_only} if docs_only is not None else {}),
         "max_per_repository": max_per_repository,
         "request_budget": effective_budget,
         "request_count": consumed,
@@ -3024,6 +3100,14 @@ def render_inventory_markdown(corpus: dict[str, object], manifest: dict[str, obj
                     repository.get("excluded_by_cap", 0),
                 )
             )
+            docs = repository.get("docs_filter")
+            if isinstance(docs, dict):
+                lines.append(
+                    "  - docs filter: matched {0}, hydrated {1}, passed {2}, dropped {3} ({4}, {5})".format(
+                        docs.get("search_matched", 0), docs.get("hydrated", 0), docs.get("passed", 0),
+                        docs.get("dropped", 0), docs.get("mode"), docs.get("rule"),
+                    )
+                )
     for record in corpus.get("records", []) if isinstance(corpus.get("records"), list) else []:
         if isinstance(record, dict):
             pull = record.get("pull_request") if isinstance(record.get("pull_request"), dict) else {}
@@ -3051,6 +3135,7 @@ def build_parser() -> argparse.ArgumentParser:
     collect_parser.add_argument("--start-at")
     collect_parser.add_argument("--end-at")
     collect_parser.add_argument("--outcome", choices=("all", "merged", "closed-unmerged"), default="all")
+    collect_parser.add_argument("--docs-only", choices=DOCS_ONLY_MODES, default=None)
     migrate = commands.add_parser("migrate-manifest")
     migrate.add_argument("--input", required=True)
     migrate.add_argument("--output", required=True)
@@ -3098,6 +3183,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             args.repo,
             interval,
             outcome=args.outcome,
+            docs_only=args.docs_only,
             max_per_repository=args.max_per_repo,
             request_budget=args.request_budget,
             run_id=args.resume_run_id,

@@ -13,6 +13,10 @@
         --relay-sibling-sha256 HEX --wrapper-record RECORD.json \
         --upstream github-rest-via-relay|loopback-mock
 
+--collect, --issues and --candidate-reads also take a last option
+`--forbid-value-file FILE`: a file holding a secret value (the GitHub token file of the
+run) that no member may contain. See "GitHub token marker" below.
+
 A test fixture for the Linux evidence run, not product protection. The tar is
 data only and never executed. Before anything is unpacked:
 
@@ -72,7 +76,7 @@ apply first, then every JSON file must be one object, and all of:
   again (unique OWNER/NAME repositories, date field created|updated|closed,
   state open|closed|all but not closed+open, a forward whole-second UTC
   interval of at most 184 days, positive cap and budget, repositories x cap
-  at most 20 Issues, budget at most 60);
+  at most 20 Issues, budget at most 90);
 - the run's status is the collector's: succeeded (adapter exit 0, collection
   complete, wrapper exit 0) or partial (adapter exit 3, collection partial,
   wrapper exit 5), no failures or problems, the envelope's relay;
@@ -140,14 +144,28 @@ A value of the wrong JSON type fails the pickup (no traceback). Exit 0 only for 
 bound complete step, 3 for a bound partial one, 1 for anything else. Exit 0 or 3
 says the pickup checks held; it is not evidence that GitHub was read: the upstream
 is a statement, and a mock result is refused when the host asks for the live one.
+
+GitHub token marker (the three contracts above). The entry hands an optional read-only
+GitHub token FILE to the relay only; its envelope and run manifest then both carry
+"github_token": {"authenticated": bool, "token_file_sha256": hex64 or null} and nothing else.
+The pickup requires exactly that object, identical in both files (authenticated true needs the
+sha256 of the file, false needs null: no value, prefix or length), prints it as "authenticated"
+and "token_file_sha256", and fails the pickup when it is missing or malformed. It also fails when
+the relay log, the transport record, the run manifest or the envelope holds a credential-shaped
+value (a GitHub token shape or a bearer value; corpus and discovery members hold remote text and
+are not shape-scanned), and, with --forbid-value-file, when ANY member holds that file's exact
+value. The file must be a regular file of at most 4096 bytes holding at least 8 characters; one
+that cannot be used fails the pickup (it is never skipped). Messages never include the value.
 """
 
 from datetime import datetime, timedelta, timezone
 import hashlib
 import importlib.util
 import json
+import os
 from pathlib import Path
 import re
+import stat
 import sys
 import tarfile
 
@@ -266,6 +284,7 @@ def collect_problems(dest: Path, result: dict, host: dict) -> list:
           and all(isinstance(r, dict) and r.get("outcome") == "relayed" for r in requests),
           "not every transport request was relayed")
     records = collection.get("records")
+    record = {}
     if check(isinstance(records, list) and len(records) == 1 and isinstance(records[0], dict),
              "collection manifest does not have exactly one record"):
         record = records[0]
@@ -286,9 +305,18 @@ def collect_problems(dest: Path, result: dict, host: dict) -> list:
               "transport requests differ from the collection request count")
     corpus_records = corpus.get("records")
     limit = request.get("max_per_repo")
-    if check(isinstance(corpus_records, list) and corpus_records and _count(limit)
+    docs_only = request.get("docs_only")
+    check(docs_only is None or docs_only in DOCS_ONLY_MODES, "envelope request names an unknown docs filter")
+    check(record.get("docs_only") == docs_only,
+          "collection manifest docs filter differs from the request")
+    docs_ok = _check_docs_filter(record, repositories, docs_only, check)
+    empty = isinstance(corpus_records, list) and not corpus_records
+    if empty and not (docs_ok and _empty_collection_is_explained(record, repositories, docs_only)):
+        problems.append("corpus is empty but the manifest does not say that nothing was matched or selected")
+    if check((empty or (isinstance(corpus_records, list) and corpus_records)) and _count(limit)
              and isinstance(repositories, list) and len(corpus_records) <= limit * len(repositories),
-             "corpus record count is outside 1..max_per_repo x repositories"):
+             "corpus record count is outside 0..max_per_repo x repositories" if empty
+             else "corpus record count is outside 1..max_per_repo x repositories"):
         wanted = {r.lower() for r in repositories}
         for item in corpus_records:
             repository = item.get("repository") if isinstance(item, dict) else None
@@ -298,12 +326,72 @@ def collect_problems(dest: Path, result: dict, host: dict) -> list:
     return problems
 
 
+DOCS_ONLY_MODES = ("title", "label")
+REPOSITORY_STATUSES = ("collected", "no-results")
+
+
+def _plain_count(value) -> bool:
+    return type(value) is int and value >= 0
+
+
+def _check_docs_filter(record: dict, repositories, docs_only, check) -> bool:
+    """The docs filter's counts, when the request names one: per repository mode, rule and arithmetic.
+
+    Without a filter in the request no repository may carry one. Returns whether every check held."""
+    entries = record.get("repositories") if isinstance(record, dict) else None
+    ok = True
+    for entry in entries if isinstance(entries, list) else []:
+        entry = entry if isinstance(entry, dict) else {}
+        docs = entry.get("docs_filter")
+        if docs_only is None:
+            ok &= bool(check(docs is None, "a repository states a docs filter the request did not ask for"))
+            continue
+        good = isinstance(docs, dict) and docs.get("mode") == docs_only and isinstance(docs.get("rule"), str)
+        counts = [docs.get(name) for name in ("search_matched", "hydrated", "passed", "dropped")] \
+            if isinstance(docs, dict) else []
+        good = good and len(counts) == 4 and all(_plain_count(value) for value in counts)
+        if good:
+            matched, hydrated, passed, dropped = counts
+            good = hydrated == passed + dropped and hydrated <= matched and entry.get("selected_count") == passed
+            good = good and entry.get("matched_count") == matched
+        ok &= bool(check(good, "a repository's docs filter counts or mode do not fit the request and the manifest"))
+    if docs_only is not None and isinstance(repositories, list):
+        found = [entry.get("repository") for entry in entries if isinstance(entry, dict)] \
+            if isinstance(entries, list) else []
+        ok &= bool(check(sorted(found) == sorted(repositories),
+                         "the docs filter is not recorded for exactly the requested repositories"))
+    return ok
+
+
+def _empty_collection_is_explained(record: dict, repositories, docs_only) -> bool:
+    """True when an empty corpus is a normal complete result: every requested repository's entry says
+    nothing was selected, and why (no search match, or the docs filter passed none)."""
+    entries = record.get("repositories") if isinstance(record, dict) else None
+    if not isinstance(entries, list) or not isinstance(repositories, list) or len(entries) != len(repositories):
+        return False
+    seen = []
+    for entry in entries:
+        if not isinstance(entry, dict) or entry.get("collection_status") not in REPOSITORY_STATUSES:
+            return False
+        seen.append(entry.get("repository"))
+        if not (_plain_count(entry.get("matched_count")) and _plain_count(entry.get("selected_count"))
+                and entry["selected_count"] == 0):
+            return False
+        if entry["matched_count"] == 0 and entry["collection_status"] == "no-results":
+            continue
+        docs = entry.get("docs_filter")
+        if not (docs_only is not None and isinstance(docs, dict) and docs.get("passed") == 0
+                and entry["collection_status"] == "collected"):
+            return False
+    return sorted(seen) == sorted(repositories)
+
+
 ISSUE_FILES = {"corpus.json", "collection-manifest.json", "transport.json", "relay.log",
                "run-manifest.json", "collection-envelope.json"}
 ISSUE_ENVELOPE = "oss-research-issue-collection-envelope/1"
 ISSUE_ENTRY = "dot_local/bin/executable_oss-research-collect-issues"
 ISSUE_SKILL = "collecting-open-source-issues"
-ISSUE_LIMITS = {"issues": 20, "request_budget": 60, "interval_days": 184}
+ISSUE_LIMITS = {"issues": 20, "request_budget": 90, "interval_days": 184}
 ISSUE_DATE_FIELDS = ("created", "updated", "closed")
 ISSUE_STATES = ("open", "closed", "all")
 ISSUE_REQUEST_FIELDS = {"repositories", "date_field", "state", "start_at", "end_at", "max_per_repo",
@@ -818,6 +906,78 @@ def candidate_bindings(dest: Path, docs: dict, result: dict, host: dict) -> list
     return problems
 
 
+HEX64 = re.compile(r"[0-9a-f]{64}")
+TOKEN_SHAPES = re.compile(rb"gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}"
+                          rb"|(?i:bearer)\s+[A-Za-z0-9._~+/=-]{8,}")
+# Members that hold the run's own records, not remote text: scanned for credential shapes.
+TOKEN_SCAN_MEMBERS = ("relay.log", "transport.json", "run-manifest.json", "collection-envelope.json",
+                      "read-envelope.json", "verification-manifest.json")
+FORBID_MAX_BYTES = 4096
+
+
+def marker_problems(marker) -> list:
+    """The github_token object: exactly authenticated (a bool) and token_file_sha256 (hex64, or null)."""
+    if not isinstance(marker, dict) or set(marker) != {"authenticated", "token_file_sha256"}:
+        return ["github token marker is not exactly {authenticated, token_file_sha256}"]
+    authenticated, digest = marker["authenticated"], marker["token_file_sha256"]
+    if type(authenticated) is not bool:
+        return ["github token marker: authenticated is not a boolean"]
+    if authenticated and not (isinstance(digest, str) and HEX64.fullmatch(digest)):
+        return ["github token marker: an authenticated run needs the sha256 of the token file"]
+    if not authenticated and digest is not None:
+        return ["github token marker: an anonymous run has no token file sha256"]
+    return []
+
+
+def forbidden_value(path: Path | None):
+    """(value bytes or None, problems) of the file named by --forbid-value-file."""
+    if path is None:
+        return None, []
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError:
+        return None, ["the --forbid-value-file cannot be opened"]
+    try:
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode) or info.st_size > FORBID_MAX_BYTES:
+            return None, ["the --forbid-value-file is not a small regular file"]
+        value = os.read(descriptor, FORBID_MAX_BYTES + 1).strip()
+    finally:
+        os.close(descriptor)
+    if len(value) < 8 or any(character in value for character in b"\r\n\0"):
+        return None, ["the --forbid-value-file does not hold one value of at least 8 characters"]
+    return value, []
+
+
+def token_problems(dest: Path, result: dict, envelope_name: str, forbid: Path | None) -> list:
+    """The GitHub token marker and the exposure checks over an unpacked tar (never printing a value)."""
+    problems = []
+    docs, found = json_documents(dest, {envelope_name, "run-manifest.json"})
+    envelope, run = docs.get(envelope_name), docs.get("run-manifest.json")
+    result["authenticated"] = result["token_file_sha256"] = None
+    if envelope is None or run is None:
+        problems.append("github token marker: the envelope or the run manifest cannot be read")
+    else:
+        marker = envelope.get("github_token")
+        bad = marker_problems(marker)
+        problems += bad
+        if not bad and run.get("github_token") != marker:
+            problems.append("github token marker differs between the envelope and the run manifest")
+        elif not bad:
+            result["authenticated"], result["token_file_sha256"] = marker["authenticated"], marker["token_file_sha256"]
+    value, forbid_problems = forbidden_value(forbid)
+    problems += forbid_problems
+    for path in sorted(dest.iterdir()):
+        if not path.is_file():
+            continue
+        data = path.read_bytes()
+        if path.name in TOKEN_SCAN_MEMBERS and TOKEN_SHAPES.search(data):
+            problems.append(f"{path.name} holds a credential-shaped value")
+        if value is not None and value in data:
+            problems.append(f"{path.name} holds the forbidden value")
+    return problems
+
+
 def member_problems(bundle: tarfile.TarFile, cap: int, required=REQUIRED,
                     forbidden=frozenset(), allowed=RESULT_FILES) -> list[str]:
     problems, seen, total, count = [], set(), 0, 0
@@ -849,6 +1009,13 @@ def member_problems(bundle: tarfile.TarFile, cap: int, required=REQUIRED,
 
 def main() -> int:
     tail = sys.argv[4:]
+    forbid = None
+    if "--forbid-value-file" in tail:
+        if tail[-2:-1] != ["--forbid-value-file"] or tail[:1] not in (["--collect"], ["--issues"],
+                                                                      ["--candidate-reads"]):
+            raise SystemExit(__doc__)
+        forbid = Path(tail[-1])
+        tail = tail[:-2]
     collect = tail[:1] == ["--collect"]
     issues = tail[:1] == ["--issues"]
     candidate = tail[:1] == ["--candidate-reads"]
@@ -906,6 +1073,7 @@ def main() -> int:
         result["contract"] = "issues"
         result["files"] = sorted(p.name for p in dest.iterdir())
         problems = issue_problems(dest, result, host)
+        problems += token_problems(dest, result, "collection-envelope.json", forbid)
         result["problems"] = problems
         print(json.dumps(result))
         if problems:
@@ -916,6 +1084,7 @@ def main() -> int:
         result["stage"] = host["stage"]
         result["files"] = sorted(p.name for p in dest.iterdir())
         problems = candidate_problems(dest, result, host)
+        problems += token_problems(dest, result, "read-envelope.json", forbid)
         result["problems"] = problems
         print(json.dumps(result))
         if problems:
@@ -925,6 +1094,7 @@ def main() -> int:
         result["contract"] = "collect"
         result["files"] = sorted(p.name for p in dest.iterdir())
         problems = collect_problems(dest, result, host)
+        problems += token_problems(dest, result, "collection-envelope.json", forbid)
         result["problems"] = problems
         print(json.dumps(result))
         return 0 if not problems else 1

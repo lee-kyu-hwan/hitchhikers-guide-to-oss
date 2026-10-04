@@ -7,12 +7,19 @@
     unit_inner.py model-once OUT_DIR CREDENTIAL MODEL EFFORT SECONDS   # one model run
     unit_inner.py model-auto OUT_DIR CREDENTIAL MODEL EFFORT SECONDS CONTROL DECOY_CRED DECOY_HOME
     unit_inner.py collect OUT_DIR   # the production collection entry with a local mock upstream
-    unit_inner.py collect-case OUT_DIR CASE   # the same with one counterexample (COLLECT_CASES)
+    unit_inner.py collect-case OUT_DIR CASE [TOKEN_FILE]   # the same with one counterexample (COLLECT_CASES)
     unit_inner.py unit-check OUT_DIR   # the worker's unit_problems() inside the real unit
     unit_inner.py collect-issues OUT_DIR   # the Issue collection entry with a local mock upstream
-    unit_inner.py collect-issues-case OUT_DIR CASE   # the same with one case (ISSUE_CASES)
+    unit_inner.py collect-issues-case OUT_DIR CASE [TOKEN_FILE]   # the same with one case (ISSUE_CASES)
     unit_inner.py candidate-reads OUT_DIR   # the candidate-reads entry (discover, locus-search), local mock upstream
-    unit_inner.py candidate-reads-case OUT_DIR CASE   # the same with one case (CANDIDATE_CASES)
+    unit_inner.py candidate-reads-case OUT_DIR CASE [TOKEN_FILE]   # the same with one case (CANDIDATE_CASES)
+    unit_inner.py token-probe OUT_DIR TOKEN_FILE   # what an srt child can read of the token file (it cannot)
+
+collect-case, collect-issues-case and candidate-reads-case take an optional TOKEN_FILE: the
+fixture token (a sentinel the harness installed in a run-only tmpfs path) that the entry hands
+to the RELAY with --github-token-file. The summary then counts, on the mock upstream only,
+how many requests carried exactly `Authorization: Bearer <that value>`; the value is never
+printed. token-probe runs a probe inside the collection policy that tries to read the file.
 
 Runs inside the wrapper's unit as the research user, from the source tree
 root (it imports the tests package), with OSS_RESEARCH_SRT_PREFIX set. It
@@ -51,6 +58,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import sys
+import urllib.parse
 
 # model-once: the one approved research profile and a fixed short answer.
 MODEL_ONCE_PROFILE = "claude-profile2"
@@ -271,7 +279,8 @@ def model_auto(out: Path, credential_file: Path, model: str, effort: str, second
     return 0 if manifest is not None else 1
 
 
-COLLECT_CASES = ("normal", "drop-tz", "drop-collector", "upstream-missing", "upstream-hang")
+COLLECT_CASES = ("normal", "drop-tz", "drop-collector", "upstream-missing", "upstream-hang",
+                 "docs-only-title", "docs-only-label", "cap-five", "unmerged", "empty", "quota")
 
 
 def load_collect_entry():
@@ -282,7 +291,19 @@ def load_collect_entry():
     return module
 
 
-def collect(out: Path, case: str = "normal") -> int:
+def token_counts(upstream, token_file) -> dict:
+    """On the mock upstream, how many requests carried exactly the fixture token (never the value)."""
+    checked = [r for r in upstream.requests if "headers" in r]
+    if token_file is None:
+        return {"upstream_checked": len(checked), "upstream_with_bearer": 0,
+                "upstream_with_any_authorization": sum("authorization" in r["headers"] for r in checked)}
+    wanted = "Bearer " + Path(token_file).read_text().strip()
+    good = sum(r["headers"].get("authorization") == wanted for r in checked)
+    return {"upstream_checked": len(checked), "upstream_with_bearer": good,
+            "upstream_without_the_bearer": len(checked) - good}
+
+
+def collect(out: Path, case: str = "normal", token_file: Path | None = None) -> int:
     """The production collection entry's run_collection, with local fixtures.
 
     What runs is executable_oss-research-collect's own code: its limits, its
@@ -298,13 +319,32 @@ def collect(out: Path, case: str = "normal") -> int:
     "normal" adds the direct-connect regression: the same collection policy,
     the adapter run once more by collect_probe.py without srt's proxy, which
     srt's network namespace must refuse.
+
+    The #192 follow-up cases (all through the production entry and relay, mock upstream only):
+    docs-only-title / docs-only-label: --docs-only MODE (the docs search form is sent, the rule keeps
+    pull request 2 of four); cap-five: six pull requests, cap 5; unmerged: --outcome closed-unmerged
+    (the search carries is:unmerged, no negated token); empty: the search matches nothing (a complete,
+    empty collection); quota: every upstream answer carries the x-ratelimit-* headers, which the
+    transport record keeps.
     """
     import threading
     import tests.test_oss_research_relay_collect as fixture
     if case not in COLLECT_CASES:
         raise SystemExit("collect case must be one of " + ", ".join(COLLECT_CASES))
     entry = load_collect_entry()
-    routes = fixture.world()
+    docs_only = {"docs-only-title": "title", "docs-only-label": "label"}.get(case)
+    outcome = "closed-unmerged" if case == "unmerged" else "all"
+    routes = {"cap-five": lambda: fixture.world(pulls=(1, 2, 3, 4, 5, 6)),
+              "unmerged": fixture.unmerged_world,
+              "docs-only-title": lambda: fixture.docs_world("title"),
+              "docs-only-label": lambda: fixture.docs_world("label")}.get(case, fixture.world)()
+    if case == "empty":
+        search = [key for key in routes if key[0] == "/search/issues"]
+        for key in search:
+            routes[key] = dict(payload={"total_count": 0, "incomplete_results": False, "items": []})
+    if case == "quota":
+        for route in routes.values():
+            route.setdefault("headers", {}).update(fixture.QUOTA)
     if case == "upstream-missing":
         del routes[("/repos/%s/pulls/2/files" % fixture.REPO, (("page", "1"),))]
     if case == "upstream-hang":
@@ -315,8 +355,8 @@ def collect(out: Path, case: str = "normal") -> int:
     prefix = Path(os.environ["OSS_RESEARCH_SRT_PREFIX"])
     runtime = worker.verify_runtime(prefix, os.environ["PATH"])
     root = Path.cwd().resolve()
-    collection = entry.checked_collection(worker, [fixture.REPO], *fixture.INTERVAL, "all",
-                                          entry.MAX_PER_REPO, entry.MAX_REQUEST_BUDGET)
+    collection = entry.checked_collection(worker, [fixture.REPO], *fixture.INTERVAL, outcome,
+                                          entry.MAX_PER_REPO, entry.MAX_REQUEST_BUDGET, docs_only)
 
     def fixture_launch():
         request = worker.checked_relay_request(list(collection.repositories), collection.request_budget,
@@ -331,8 +371,12 @@ def collect(out: Path, case: str = "normal") -> int:
     drop = {"drop-tz": entry.TZ_READ,
             "drop-collector": (str(entry.collector_file(worker)),)}.get(case, ())
     seconds = 40.0 if case == "upstream-hang" else 150.0
-    succeeded = entry.run_collection(worker, runtime, out, collection, seconds, fixture_launch(),
-                                     upstream="loopback-mock", drop_read=drop)
+    token_path, marker = entry.checked_github_token(
+        worker, None if token_file is None else str(token_file), forbidden=(out.resolve(),))
+    succeeded = entry.run_collection(worker, runtime, out, collection, seconds,
+                                     entry.launch_with_token(fixture_launch(), token_path),
+                                     upstream="loopback-mock", drop_read=drop,
+                                     github_token=marker, github_token_file=token_path)
     run_dir = out / "run"
     manifest = json.loads((run_dir / "result/manifest.json").read_text())
     summary = {
@@ -349,6 +393,25 @@ def collect(out: Path, case: str = "normal") -> int:
                                             for r in upstream.requests),
         "output_files": sorted(p.name for p in (run_dir / "output").iterdir()),
         "stderr_tail": (run_dir / "result/stderr.log").read_text()[-600:]}
+    summary["github_token"] = marker
+    summary.update(token_counts(upstream, token_file))
+    output = run_dir / "output"
+    if (output / "corpus.json").exists() and (output / "collection-manifest.json").exists():
+        corpus = json.loads((output / "corpus.json").read_text())
+        record = json.loads((output / "collection-manifest.json").read_text())["records"][-1]
+        repository = (record.get("repositories") or [{}])[0]
+        searches = [r["path"] for r in upstream.requests if r["path"].startswith("/search/issues")]
+        transport = json.loads((output / "transport.json").read_text()) if (output / "transport.json").exists() else {}
+        summary.update(
+            corpus_records=len(corpus.get("records", [])), collection_status=record.get("collection_status"),
+            repository_status=repository.get("collection_status"), outcome=record.get("outcome"),
+            docs_only=record.get("docs_only"), docs_filter=repository.get("docs_filter"),
+            matched_count=repository.get("matched_count"), request_count=record.get("request_count"),
+            search_queries=[urllib.parse.parse_qs(urllib.parse.urlsplit(path).query).get("q", [""])[0]
+                            for path in searches],
+            transport_rate_limits=sum("rate_limit" in r for r in transport.get("requests", [])),
+            transport_credential_scope=transport.get("credential_scope"),
+            transport_requests=len(transport.get("requests", [])))
     if case == "normal":
         summary["direct_regression"] = direct_regression(entry, out / "direct", runtime, collection,
                                                          fixture_launch())
@@ -386,7 +449,8 @@ def direct_regression(entry, out: Path, runtime, collection, launch) -> dict:
 
 
 ISSUE_CASES = ("normal", "complete", "drop-tz", "drop-collector", "drop-sibling", "drop-relay-collect",
-               "upstream-missing", "upstream-hang", "rate-limit-429", "graphql-zero-quota")
+               "upstream-missing", "upstream-hang", "rate-limit-429", "graphql-zero-quota",
+               "closed", "cap-15")
 # rate-limit-429: GraphQL answers 429 with this Retry-After, just past the relay's
 # 30 s request deadline, so the relay passes the answer on and the collector waits.
 RATE_LIMIT_RETRY_AFTER = "31"
@@ -400,7 +464,7 @@ def load_issue_entry():
     return module
 
 
-def collect_issues(out: Path, case: str = "normal") -> int:
+def collect_issues(out: Path, case: str = "normal", token_file: Path | None = None) -> int:
     """The Issue collection entry's run_collection, with local fixtures.
 
     As collect(): what runs is executable_oss-research-collect-issues's own
@@ -421,6 +485,8 @@ def collect_issues(out: Path, case: str = "normal") -> int:
     graphql-zero-quota: every GraphQL query answers the measured anonymous 403
     (resource graphql, limit 0, remaining 0, reset an hour away): one request per
     Issue, no wait, the REST evidence kept.
+    closed: --state closed --date-field closed (GraphQL 200): the closed Issues of the mock, state recorded.
+    cap-15: cap 15 with budget 70 (the ceiling is 90 since #192's follow-up), GraphQL 200.
     """
     import threading
     import tests.test_oss_research_relay_issues as fixture
@@ -428,7 +494,8 @@ def collect_issues(out: Path, case: str = "normal") -> int:
         raise SystemExit("collect-issues case must be one of " + ", ".join(ISSUE_CASES))
     entry = load_issue_entry()
     collect_entry = entry.load_collect_entry()
-    routes, graphql = fixture.world(graphql_status=200 if case == "complete" else 401)
+    routes, graphql = fixture.world(graphql_status=200 if case in ("complete", "closed", "cap-15") else 401,
+                                    **({"state": "closed", "date_field": "closed"} if case == "closed" else {}))
     if case == "upstream-missing":
         del routes[("/repos/%s/issues/1/timeline" % fixture.TARGET, fixture._query_key("page=1"))]
     upstream = fixture.MockUpstream(routes, graphql)
@@ -455,8 +522,15 @@ def collect_issues(out: Path, case: str = "normal") -> int:
     threading.Thread(target=upstream.serve_forever, daemon=True).start()
     runtime = worker.verify_runtime(Path(os.environ["OSS_RESEARCH_SRT_PREFIX"]), os.environ["PATH"])
     root = Path.cwd().resolve()
-    collection = entry.checked_collection(worker, [fixture.TARGET], "created", "open", *fixture.INTERVAL,
-                                          1 if case == "rate-limit-429" else 5, entry.MAX_REQUEST_BUDGET)
+    if case == "closed":
+        shape = ("closed", "closed", 5, entry.DEFAULT_REQUEST_BUDGET)
+    elif case == "cap-15":
+        shape = ("created", "open", 15, 70)
+    else:
+        shape = ("created", "open", 1 if case == "rate-limit-429" else 5, entry.MAX_REQUEST_BUDGET)
+    date_field, state, cap, budget = shape
+    collection = entry.checked_collection(worker, [fixture.TARGET], date_field, state, *fixture.INTERVAL,
+                                          cap, budget)
 
     def fixture_launch():
         request = worker.checked_relay_request(list(collection.repositories), collection.request_budget,
@@ -474,8 +548,12 @@ def collect_issues(out: Path, case: str = "normal") -> int:
             "drop-relay-collect": tuple(str(entry.adapter_file(worker).with_name(name))
                                         for name in entry.ADAPTER_DEPENDENCIES)}.get(case, ())
     seconds = 40.0 if case == "upstream-hang" else 150.0
-    kept = entry.run_collection(worker, collect_entry, runtime, out, collection, seconds, fixture_launch(),
-                                upstream="loopback-mock", drop_read=drop)
+    token_path, marker = collect_entry.checked_github_token(
+        worker, None if token_file is None else str(token_file), forbidden=(out.resolve(),))
+    kept = entry.run_collection(worker, collect_entry, runtime, out, collection, seconds,
+                                collect_entry.launch_with_token(fixture_launch(), token_path),
+                                upstream="loopback-mock", drop_read=drop,
+                                github_token=marker, github_token_file=token_path)
     run_dir = out / "run"
     manifest = json.loads((run_dir / "result/manifest.json").read_text())
     summary = {
@@ -505,6 +583,8 @@ def collect_issues(out: Path, case: str = "normal") -> int:
                                         for r in transport.get("requests", []) if r.get("method") == "POST"]
         summary["graphql_events"] = [(e.get("attempt"), e.get("status"), e.get("retry_delay"))
                                      for e in events if e.get("endpoint") == "/graphql"]
+    summary["github_token"] = marker
+    summary.update(token_counts(upstream, token_file))
     upstream.shutdown()
     print(json.dumps(summary))
     # The entry's own exit codes, so a host pickup judges this record as the entry's.
@@ -585,7 +665,7 @@ def candidate_inputs(directory: Path, files: dict) -> Path:
     return directory
 
 
-def candidate_reads(out: Path, case: str = "normal") -> int:
+def candidate_reads(out: Path, case: str = "normal", token_file: Path | None = None) -> int:
     """The candidate-reads entry's run_reads, with local fixtures.
 
     As collect_issues(): what runs is executable_oss-research-candidate-reads's own code
@@ -675,9 +755,14 @@ def candidate_reads(out: Path, case: str = "normal") -> int:
         print(json.dumps(summary))
         return 0
     inputs = entry.checked_inputs(discover, analysis_dir)
+    token_path, marker = collect_entry.checked_github_token(
+        worker, None if token_file is None else str(token_file),
+        forbidden=(out.resolve(), analysis_dir.resolve()))
     (out / "discover").mkdir()
     kept = entry.run_reads(worker, collect_entry, runtime, out / "discover", analysis_dir, discover, inputs,
-                           seconds, fixture_launch(discover), upstream="loopback-mock", drop_read=drop)
+                           seconds, collect_entry.launch_with_token(fixture_launch(discover), token_path),
+                           upstream="loopback-mock", drop_read=drop,
+                           github_token=marker, github_token_file=token_path)
     summary = summary_of(out / "discover/run", "discover", kept, discover)
     if case == "locus-search":
         # The discovery the first step wrote, a synthetic assessment of it, then the second step.
@@ -688,10 +773,13 @@ def candidate_reads(out: Path, case: str = "normal") -> int:
                                     None, 3, 60)
         (out / "locus").mkdir()
         kept = entry.run_reads(worker, collect_entry, runtime, out / "locus", locus_dir, locus,
-                               entry.checked_inputs(locus, locus_dir), 150.0, fixture_launch(locus),
-                               upstream="loopback-mock")
+                               entry.checked_inputs(locus, locus_dir), 150.0,
+                               collect_entry.launch_with_token(fixture_launch(locus), token_path),
+                               upstream="loopback-mock", github_token=marker, github_token_file=token_path)
         summary = summary_of(out / "locus/run", "locus-search", kept, locus)
     summary.update(counts())
+    summary["github_token"] = marker
+    summary.update(token_counts(upstream, token_file))
     upstream.shutdown()
     print(json.dumps(summary))
     # The entry's own exit codes, so a host pickup judges this record as the entry's.
@@ -731,12 +819,72 @@ def candidate_probe(entry, out: Path, runtime, reads, analysis_dir: Path, launch
     return json.loads(report.read_text()) if report.exists() else {"report": "missing"}
 
 
+def token_probe(out: Path, token_file: Path) -> int:
+    """What an srt child can read of the token file, with the relay holding the token beside it.
+
+    The relay is the real one with the token file; the child runs github_token_probe.py inside the
+    collection policy (no token path in its read set), is even told the path, and tries to read the
+    file, list its directories and find the value in its own environment and argv. It then asks the
+    relay for one repository through srt's proxy. The mock upstream counts the Bearer headers: the
+    relay (and only the relay) used the token. Nothing here prints the value."""
+    import threading
+    import tests.test_oss_research_relay_collect as fixture
+    entry = load_collect_entry()
+    upstream = fixture.MockUpstream(fixture.world())
+    threading.Thread(target=upstream.serve_forever, daemon=True).start()
+    runtime = worker.verify_runtime(Path(os.environ["OSS_RESEARCH_SRT_PREFIX"]), os.environ["PATH"])
+    root = Path.cwd().resolve()
+    collection = entry.checked_collection(worker, [fixture.REPO], *fixture.INTERVAL, "all",
+                                          entry.MAX_PER_REPO, entry.MAX_REQUEST_BUDGET)
+    token_path, marker = entry.checked_github_token(worker, str(token_file), forbidden=(out.resolve(),))
+    request = worker.checked_relay_request(list(collection.repositories), collection.request_budget,
+                                           entry.RELAY_MAX_RESPONSE_BYTES, entry.RELAY_RESPONSE_BYTE_BUDGET,
+                                           entry.RELAY_TIMEOUT_SECONDS)
+    launch = worker.relay_launch(request, dict(os.environ))
+    launch = launch._replace(environment=dict(
+        launch.environment, PYTHONPATH=str(root / "tests/fixtures/oss_research_worker_supervisor"),
+        OSS_SUPERVISOR_UPSTREAM_PORT=str(upstream.server_address[1])))
+    launch = entry.launch_with_token(launch, token_path)
+    inputs = out / "input"
+    inputs.mkdir(parents=True, mode=0o755)
+    shutil.copy(Path(__file__).with_name("github_token_probe.py"), inputs / "github_token_probe.py")
+    run_dir = out / "run"
+    python = os.path.realpath(sys.executable)
+    ports = {}
+
+    def policy_for(port):
+        ports["relay"] = port
+        policy = worker.build_policy(inputs.resolve(), run_dir, entry.adapter_file(worker), port, model=False,
+                                     runtime=runtime)
+        policy["filesystem"]["allowRead"] += entry.collection_read(worker, python)
+        assert not entry.token_path_is_readable_by_child(token_path, policy["filesystem"]["allowRead"])
+        return policy
+
+    def command_for(policy_file):
+        return worker.sandboxed(runtime, policy_file, [python, "-B", str(inputs / "github_token_probe.py"),
+                                                       str(token_path), str(ports["relay"]), fixture.REPO])
+
+    worker.run_supervised(inputs.resolve(), run_dir, worker.PROFILES[0], 90.0, launch, policy_for, command_for,
+                          worker.build_environment({"PATH": os.environ["PATH"]}, run_dir))
+    report = run_dir / "result/report.md"
+    probe = json.loads(report.read_text()) if report.exists() else {"report": "missing"}
+    summary = {"mode": "token-probe", "github_token": marker, "probe": probe,
+               "parent_can_read": bool(token_path.read_text().strip()), **token_counts(upstream, token_file)}
+    upstream.shutdown()
+    print(json.dumps(summary))
+    return 0
+
+
 def main() -> int:
     modes = {"run": 3, "hang": 3, "egress": 4, "model-once": 7, "model-auto": 10, "collect": 3,
              "collect-case": 4, "unit-check": 3, "collect-issues": 3, "collect-issues-case": 4,
              "candidate-reads": 3, "candidate-reads-case": 4}
-    if len(sys.argv) < 2 or modes.get(sys.argv[1]) != len(sys.argv):
+    # Three modes take an optional fixture token file as one more argument.
+    optional_token = {"collect-case": 5, "collect-issues-case": 5, "candidate-reads-case": 5}
+    if len(sys.argv) < 2 or len(sys.argv) not in {modes.get(sys.argv[1]), optional_token.get(sys.argv[1]),
+                                                  4 if sys.argv[1] == "token-probe" else None} - {None}:
         raise SystemExit(__doc__)
+    token_file = Path(sys.argv[4]) if len(sys.argv) == 5 and sys.argv[1] in optional_token else None
     mode, out = sys.argv[1], Path(sys.argv[2]).resolve()
     if not worker.parent_eof_guard(dict(os.environ)):
         raise SystemExit("not inside the unit wrapper (no marker); refusing to run unguarded")
@@ -751,16 +899,18 @@ def main() -> int:
         return 0
     if mode == "collect":
         return collect(out)
+    if mode == "token-probe":
+        return token_probe(out, Path(sys.argv[3]))
     if mode == "collect-case":
-        return collect(out, sys.argv[3])
+        return collect(out, sys.argv[3], token_file)
     if mode == "collect-issues":
         return collect_issues(out)
     if mode == "collect-issues-case":
-        return collect_issues(out, sys.argv[3])
+        return collect_issues(out, sys.argv[3], token_file)
     if mode == "candidate-reads":
         return candidate_reads(out)
     if mode == "candidate-reads-case":
-        return candidate_reads(out, sys.argv[3])
+        return candidate_reads(out, sys.argv[3], token_file)
     if mode == "model-auto":
         return model_auto(out, Path(sys.argv[3]), sys.argv[4], sys.argv[5], float(sys.argv[6]),
                           *(Path(argument) for argument in sys.argv[7:10]))

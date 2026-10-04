@@ -84,24 +84,28 @@ def _connection(nodes=()):
     return {"totalCount": len(nodes), "pageInfo": {"hasNextPage": False}, "nodes": list(nodes)}
 
 
-def issue_payload(number, comments):
+def issue_payload(number, comments, state="open"):
+    closed = state == "closed"
     return {
         "number": number, "node_id": "I_node_%d" % number, "title": "Synthetic issue %d" % number,
-        "state": "open", "state_reason": None, "created_at": "2030-01-1%dT00:00:00Z" % number,
-        "updated_at": "2030-01-2%dT00:00:00Z" % number, "closed_at": None, "labels": [],
+        "state": state, "state_reason": "completed" if closed else None,
+        "created_at": "2030-01-1%dT00:00:00Z" % number,
+        "updated_at": "2030-01-2%dT00:00:00Z" % number,
+        "closed_at": "2030-01-1%dT12:00:00Z" % number if closed else None, "labels": [],
         "url": "%s/repos/%s/issues/%d" % (API, TARGET, number),
         "html_url": "https://github.com/%s/issues/%d" % (TARGET, number),
         "repository_url": "%s/repos/%s" % (API, TARGET),
         "body": "Synthetic body %d." % number, "user": {"login": "fixture-user", "node_id": "U_fixture"},
-        "author_association": "CONTRIBUTOR", "locked": False, "active_lock_reason": None, "closed_by": None,
+        "author_association": "CONTRIBUTOR", "locked": False, "active_lock_reason": None,
+        "closed_by": {"login": "maintainer", "node_id": "U_maint"} if closed else None,
         "type": None, "comments": len(comments)}
 
 
-def world(*, graphql_status=401, issue_status=200):
+def world(*, graphql_status=401, issue_status=200, state="open", date_field="created"):
     """REST routes for two open Issues of TARGET, and what /graphql answers."""
     interval = collector.resolve_interval(start_at=INTERVAL[0], end_at=INTERVAL[1], start_date=None, end_date=None,
                                           recent_days=None, timezone_name="UTC", as_of=None)
-    query = collector.build_issue_query(TARGET, interval, "created", "open", [])
+    query = collector.build_issue_query(TARGET, interval, date_field, state, [])
     comments = {1: [{"id": 101, "body": "A maintainer reply.", "user": {"login": "maintainer"},
                      "author_association": "MEMBER", "created_at": "2030-01-12T00:00:00Z",
                      "updated_at": "2030-01-12T00:00:00Z",
@@ -114,10 +118,10 @@ def world(*, graphql_status=401, issue_status=200):
 
     add("/versions", None, ["2026-03-10"])
     add("/repos/" + TARGET, None, {"full_name": TARGET, "node_id": "R_node"})
-    items = [issue_payload(number, comments[number]) for number in (2, 1)]
+    items = [issue_payload(number, comments[number], state) for number in (2, 1)]
     add("/search/issues", {"q": query, "page": 1}, {"total_count": 2, "incomplete_results": False, "items": items})
     for number in (1, 2):
-        add("/repos/%s/issues/%d" % (TARGET, number), None, issue_payload(number, comments[number]),
+        add("/repos/%s/issues/%d" % (TARGET, number), None, issue_payload(number, comments[number], state),
             status=issue_status if number == 2 else 200)
         add("/repos/%s/issues/%d/comments" % (TARGET, number), {"page": 1}, comments[number])
         add("/repos/%s/issues/%d/timeline" % (TARGET, number), {"page": 1}, [])
@@ -368,6 +372,73 @@ class CompleteTests(Harness):
         manifest = self.load("relayed", "manifest")
         versions = [d for d in _differences(direct.manifest, manifest)]
         self.assertTrue(versions and all(d.endswith(".client_version") for d in versions))
+
+
+class QuotaRecordTests(Harness):
+    """The transport record keeps each answer's quota facts (#192 follow-up)."""
+
+    world_options = {"graphql_status": 200}
+    QUOTA = {"x-ratelimit-limit": "5000", "x-ratelimit-remaining": "4990", "x-ratelimit-reset": "1790000000",
+             "x-ratelimit-used": "10", "x-ratelimit-resource": "core"}
+
+    def setUp(self):
+        super().setUp()
+        for route in self.upstream.routes.values():
+            route["headers"] = dict(self.QUOTA)
+
+    def test_rest_requests_record_limit_remaining_used_and_resource(self):
+        self.assertEqual(self.relayed(), 0)
+        requests = self.load("relayed", "transport")["requests"]
+        rest = [entry for entry in requests if entry.get("method") != "POST"]
+        self.assertTrue(rest)
+        for entry in rest:
+            self.assertEqual(entry["rate_limit"], {"limit": 5000, "remaining": 4990, "resource": "core", "used": 10})
+        self.assertNotIn("1790000000", json.dumps(requests))
+
+
+class ClosedIssuesTests(Harness):
+    """--state closed and --date-field closed take the same contract as open Issues (#192 follow-up)."""
+
+    world_options = {"graphql_status": 200, "state": "closed", "date_field": "closed"}
+
+    def test_closed_issues_are_collected_through_the_relay_with_the_state_recorded(self):
+        code = self.relayed(**{"--state": "closed", "--date-field": "closed"})
+        self.assertEqual(code, 0)
+        manifest = self.load("relayed", "manifest")
+        run = manifest["records"][-1]
+        self.assertEqual((run["filters"]["state"], run["filters"]["date_field"]), ("closed", "closed"))
+        self.assertEqual(run["collection_status"], "complete")
+        corpus = self.load("relayed", "corpus")
+        collector.validate_issue_corpus(corpus, "closed corpus")
+        collector.validate_issue_manifest(manifest, "closed manifest")
+        self.assertEqual({record["issue"]["state"] for record in corpus["records"]}, {"closed"})
+        self.assertTrue(all(record["issue"]["closed_at"] for record in corpus["records"]))
+        searched = [r["path"] for r in self.upstream.requests if r["path"].startswith("/search/issues")]
+        self.assertEqual(len(searched), 1)
+        query = urllib.parse.parse_qs(urllib.parse.urlsplit(searched[0]).query)["q"][0]
+        self.assertIn("is:closed", query)
+        self.assertIn("closed:", query)
+        self.assertFalse([token for token in query.split() if token.startswith("-")])
+
+    def test_the_closed_date_of_open_issues_is_still_refused(self):
+        with mock.patch.object(sys, "stderr"):
+            code = self.relayed(**{"--state": "open", "--date-field": "closed"})
+        self.assertNotEqual(code, 0)
+        self.assertEqual(self.upstream.requests, [])
+
+
+class CredentialScopeTests(Harness):
+    """The transport record's credential field speaks for the child only, and says so (#192 follow-up)."""
+
+    world_options = {"graphql_status": 200}
+
+    def test_the_credential_field_says_it_speaks_for_the_child_only(self):
+        self.assertEqual(self.relayed(), 0)
+        record = self.load("relayed", "transport")
+        self.assertEqual(record["credential_scope"], "child")
+        self.assertIn("github_token.authenticated", record["credential_scope_note"])
+        self.assertTrue(record["credential"].startswith("none: token_provider returned None"))
+        self.assertEqual(self.load("relayed", "manifest")["records"][-1]["preflight"]["login"], "anonymous")
 
 
 class Forbidden403Tests(Harness):

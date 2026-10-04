@@ -234,6 +234,8 @@ def transport_record(opener: Any, source: dict[str, object], exit_code: Optional
         "collector": source,
         "note": TRANSPORT_NOTE,
         "credential": "none: token_provider returned None and no Authorization header was sent",
+        "credential_scope": opener.credential_scope,
+        "credential_scope_note": opener.credential_scope_note,
         "exit_code": exit_code,
         "requests": opener.records,
     }
