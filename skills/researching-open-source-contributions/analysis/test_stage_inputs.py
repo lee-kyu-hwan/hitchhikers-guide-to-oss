@@ -9,6 +9,7 @@ fixture blocks sockets and process spawning on import.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -185,9 +186,14 @@ class StagePipelineTests(unittest.TestCase):
         results, verify, stages = self.run_stages()
         extract, synthesis_stage, verify_stage, final_stage = stages
         self.assertEqual([call["input_dir"] for call in extract["calls"]], ["extract-" + lens for lens in LENSES])
+        build_prompts = self.context.siblings.build_prompts
+        rule = build_prompts.COUNT_RULE.format(patterns=5, observations=20, rejected=20)
         for call in extract["calls"]:
-            task = (self.root / "in-extract" / call["input_dir"] / "task.txt").read_bytes()
-            self.assertEqual(task, (self.context.extract_prompts / (call["input_dir"] + ".md")).read_bytes())
+            task = (self.root / "in-extract" / call["input_dir"] / "task.txt").read_text(encoding="utf-8")
+            plain = (self.context.extract_prompts / (call["input_dir"] + ".md")).read_text(encoding="utf-8")
+            # The digest's prompt (written without limits) plus the count rule of run_limits.json, nothing else.
+            self.assertEqual(task, plain.replace(build_prompts.COUNT_RULE_ANCHOR, build_prompts.COUNT_RULE_ANCHOR + rule))
+            self.assertEqual(task.count(rule), 1)
         self.assertEqual(synthesis_stage["quotes"], {"verified": 3, "total": 3})
         self.assertEqual([call["input_dir"] for call in verify_stage["calls"]], ["verify-C1"])
         tasks = [p for p in self.root.glob("in-*/*/task.txt")]
@@ -719,6 +725,20 @@ class ShardedRunTests(unittest.TestCase):
         missing = args[2:]
         self.assertEqual(2, stage("synthesis-input", "--run-dir", run, *missing, "--out", str(self.root / "s2"))[0])
 
+    def test_the_extract_count_rule_comes_from_the_same_caps_the_answers_are_checked_against(self):
+        run = self.sharded()
+        caps = {"patterns": 3, "observations": 7, "rejected": 9}
+        with mock.patch.dict(stage_inputs.EXTRACT_CAPS, caps):
+            code, summary, stderr = stage("extract-inputs", "--run-dir", run, "--out", str(self.root / "x"))
+        self.assertEqual(0, code, stderr)
+        self.assertEqual(10, len(summary["calls"]))
+        for call in summary["calls"]:
+            text = (self.root / "x" / call["input_dir"] / "task.txt").read_text(encoding="utf-8")
+            self.assertIn("patterns 는 최대 3개, observations 는 최대 7개, rejected 는 최대 9개다.", text)
+        self.assertEqual({"patterns": "max_patterns", "observations": "max_observations", "rejected": "max_rejected"},
+                         {kind: "max_" + kind for kind in stage_inputs.EXTRACT_CAPS})
+        self.assertEqual(stage_inputs.EXTRACT_CAPS, {kind: stage_inputs.LIMITS["max_" + kind] for kind in caps})
+
     def test_a_prompt_over_the_cap_refuses_the_stage_before_anything_is_written(self):
         run = self.sharded()
         with mock.patch.object(stage_inputs, "PROMPT_MAX_BYTES", 5000):
@@ -748,7 +768,20 @@ EVIDENCE_928 = Path("/Users/lee-kyu-hwan/.oss-research-vm/logs/a78-two-repo-2026
                      "the 2026-09-28 run's inputs are only on the machine that made them")
 class Run928InputTests(unittest.TestCase):
     """The six pull request, one shard run of 2026-09-28: every stage input stays byte for byte what the
-    isolated calls were given (the evidence kept their task.txt), however the larger-corpus path changes."""
+    isolated calls were given (the evidence kept their task.txt), however the larger-corpus path changes.
+
+    Except the extract inputs: the bundle now states run_limits.json's count limits in them (#82). The
+    analyzer's prompt without limits (the digest's) is still the evidence's byte for byte, and the bundle's
+    extract inputs are pinned by sha256 below."""
+
+    # sha256 of the bundle's extract inputs for this run, with the count rule of run_limits.json (5/20/20).
+    EXTRACT_SHA256 = {
+        "blind": "b4d018f7327933fedad57152f66fb5fe57c2e308d9379ba810884f78631a3d1c",
+        "correctness": "549728379842667350aa7417da60b3ee7a0f2ff199fa3d45447e4c594cbbc6e9",
+        "maintenance": "341a81180c9818bc4d0fe0231ae44f5884055d72bd1fe0f45ecb2f27319a1eec",
+        "review": "07136757ee204700abacbfdffe93405b58824cda12650352cec7f07abd50f2a7",
+        "structure": "26c3c9e62d97ee463663e32eb6acc3f2a01d8c4aca28b44901b0efac9dae07d5",
+    }
 
     def setUp(self):
         self.root = Path(tempfile.mkdtemp())
@@ -774,9 +807,13 @@ class Run928InputTests(unittest.TestCase):
         code, summary, stderr = stage("extract-inputs", "--run-dir", self.run, "--out", str(self.root / "extract"))
         self.assertEqual(code, 0, stderr)
         self.assertEqual(12, summary["max_model_calls"])
+        digest_prompts = stage_inputs.Context(self.run).extract_prompts
         for lens in LENSES:
-            self.same(self.root / "extract" / ("extract-" + lens) / "task.txt",
-                      self.analysis / "in-extract-2" / ("extract-" + lens) / "task.txt")
+            kept = self.analysis / "in-extract-2" / ("extract-" + lens) / "task.txt"
+            self.same(digest_prompts / ("extract-" + lens + ".md"), kept)
+            built = (self.root / "extract" / ("extract-" + lens) / "task.txt").read_bytes()
+            self.assertNotEqual(kept.read_bytes(), built)
+            self.assertEqual(self.EXTRACT_SHA256[lens], hashlib.sha256(built).hexdigest(), lens)
         code, _, stderr = stage("synthesis-input", "--run-dir", self.run, *extract, "--out", str(self.root / "synthesis"))
         self.assertEqual(code, 0, stderr)
         self.same(self.root / "synthesis/synthesis/task.txt", self.analysis / "in-synthesis/synthesis/task.txt")

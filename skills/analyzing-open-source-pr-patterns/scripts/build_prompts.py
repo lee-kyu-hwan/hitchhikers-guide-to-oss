@@ -2,6 +2,8 @@
 """Write one self-contained prompt file per independent extraction or verification call.
 
   extract  one prompt per digest shard and lens: OUT/prompts/extract-<lens>[-NN].md
+           (--max-patterns/--max-observations/--max-rejected, all three or none, state
+           the answer's count limits in the rules; without them the bytes are as before)
   verify   one prompt per merged candidate: OUT/prompts/verify-<id>.md
 
 A prompt file is the whole input of one call, so any executor can run it: agy
@@ -86,6 +88,14 @@ EXTRACT_TAIL = """패턴의 기준:
     {"idea": "검토했지만 패턴으로 삼지 않은 것", "reason": "이유"}
   ]
 }"""
+
+# The rule the extract tail gains when the caller passes the count limits its checker enforces.
+COUNT_RULE_ANCHOR = "패턴이 0개여도 된다.\n"
+COUNT_RULE = (
+    "- 개수 상한: patterns 는 최대 {patterns}개, observations 는 최대 {observations}개, rejected 는 최대 {rejected}개다. "
+    "넘으면 답 전체가 거부된다. 넘치는 항목은 근거가 약한 것부터 버려라(rejected 나 observations 로 옮기지 마라). "
+    "개수를 맞추려고 근거를 지어내지 마라.\n"
+)
 
 VERIFY_TAIL = """너는 반박 검증자다. 아래 후보 패턴 하나가 다이제스트로 뒷받침되는지 따진다. 후보를 만든 사람의 편을 들지 마라. 근거가 약하면 약하다고 말하는 것이 네 일이다.
 
@@ -182,11 +192,19 @@ def _write(prompts_dir, name, text):
     return {"file": str(path), "bytes": len(text.encode("utf-8"))}
 
 
-def extract(digest_dir, out_dir, lenses):
+def extract_tail(limits=None):
+    """EXTRACT_TAIL, with the count rule after the last criterion when limits {patterns, observations, rejected}."""
+    if limits is None:
+        return EXTRACT_TAIL
+    return EXTRACT_TAIL.replace(COUNT_RULE_ANCHOR, COUNT_RULE_ANCHOR + COUNT_RULE.format(**limits), 1)
+
+
+def extract(digest_dir, out_dir, lenses, limits=None):
     keymap = _load_keymap(digest_dir)
     unknown = [lens for lens in lenses if lens not in LENSES]
     if unknown:
         raise PromptError("unknown lens: " + ", ".join(unknown) + " (choose from " + ", ".join(LENSES) + ")")
+    tail = extract_tail(limits)
     prompts = _prepare(out_dir, "extract")
     shards = keymap["shards"]
     written = []
@@ -213,7 +231,7 @@ def extract(digest_dir, out_dir, lenses):
                 # The answer's "lens" is the machine id alone, never the description above.
                 + '\n출력의 "lens" 값은 정확히 "' + lens + '" 이다(설명 없이 이 식별자 그대로).'
                 + "\n\n"
-                + EXTRACT_TAIL.replace('"<LENS_ID>"', '"' + lens + '"')
+                + tail.replace('"<LENS_ID>"', '"' + lens + '"')
                 + "\n"
             )
             written.append(_write(prompts, "extract-" + lens + suffix + ".md", prompt))
@@ -291,6 +309,12 @@ def verify(digest_dir, candidates_path, out_dir):
     return written
 
 
+def _positive(value):
+    if not re.fullmatch(r"[1-9][0-9]*", value):
+        raise argparse.ArgumentTypeError("must be a positive integer, got " + repr(value))
+    return int(value)
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     commands = parser.add_subparsers(dest="command", required=True)
@@ -300,14 +324,23 @@ def main(argv=None):
     extract_parser.add_argument(
         "--lens", action="append", choices=sorted(LENSES), help="lens to run; repeat. Default: all five"
     )
+    for kind in ("patterns", "observations", "rejected"):
+        extract_parser.add_argument(
+            "--max-" + kind, type=_positive, help="count limit the answer's " + kind + " must keep; give all three or none"
+        )
     verify_parser = commands.add_parser("verify", help="one adversarial prompt per candidate")
     verify_parser.add_argument("--digest-dir", required=True, help="build_digest.py --out directory")
     verify_parser.add_argument("--candidates", required=True, help='JSON array of {"id", "statement", "cited_prs"}')
     verify_parser.add_argument("--out", required=True, help="run directory, not the extract one; prompts/ and results/ go under it")
     args = parser.parse_args(argv)
+    if args.command == "extract":
+        limits = {kind: getattr(args, "max_" + kind) for kind in ("patterns", "observations", "rejected")}
+        given = [value is not None for value in limits.values()]
+        if any(given) and not all(given):
+            extract_parser.error("--max-patterns, --max-observations and --max-rejected go together")
     try:
         if args.command == "extract":
-            written = extract(args.digest_dir, args.out, args.lens or list(LENSES))
+            written = extract(args.digest_dir, args.out, args.lens or list(LENSES), limits if all(given) else None)
         else:
             written = verify(args.digest_dir, args.candidates, args.out)
     except PromptError as error:

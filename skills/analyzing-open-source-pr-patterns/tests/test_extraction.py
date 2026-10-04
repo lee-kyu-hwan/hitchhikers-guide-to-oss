@@ -1,4 +1,5 @@
 import copy
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -294,6 +295,70 @@ class BuildPromptsTests(ExtractionTestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(len(list(prompts.glob("*.md"))), 2 * len(shards))
         self.assertIn("조각", (prompts / "extract-blind-01.md").read_text(encoding="utf-8"))
+
+    # sha256 of the fixture's extract prompts written without count limits: the bytes every earlier run got.
+    DEFAULT_EXTRACT_SHA256 = {
+        "extract-blind.md": "e90a50b58009f9d2609c53c62d7233757ab744a091d679c22b82ff6e8a442a3a",
+        "extract-correctness.md": "14f5f914e099c81fa8a7f2d3f1cd4d0d6b09630e94c602cb5275912f19f4f40a",
+        "extract-maintenance.md": "9c4b7022ea90fb2b0371c013affe2c2aefe59f2966e3c603dd653c5c9a8516d2",
+        "extract-review.md": "60fda56c02c106241d46ebec866c411dc55ae57ba8787b46e243132a7c0ab733",
+        "extract-structure.md": "0159f94977a7deba4b4452ac78d64261282f6281a0f9c6be6f0477b46d01cfa7",
+    }
+    LIMIT_SENTENCE = (
+        "- 개수 상한: patterns 는 최대 5개, observations 는 최대 20개, rejected 는 최대 20개다. "
+        "넘으면 답 전체가 거부된다. 넘치는 항목은 근거가 약한 것부터 버려라(rejected 나 observations 로 옮기지 마라). "
+        "개수를 맞추려고 근거를 지어내지 마라.\n"
+    )
+
+    def extract_prompts(self, *limits):
+        run = self.directory / ("extract" + "-".join(limits))
+        result = run_script("build_prompts.py", "extract", "--digest-dir", self.digest_dir, "--out", run, *limits)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return {path.name: path.read_bytes() for path in sorted((run / "prompts").glob("*.md"))}
+
+    def test_extract_without_count_limits_keeps_the_earlier_bytes(self):
+        self.assertEqual(self.build_digest().returncode, 0)
+        prompts = self.extract_prompts()
+        self.assertEqual({name: hashlib.sha256(text).hexdigest() for name, text in prompts.items()},
+                         self.DEFAULT_EXTRACT_SHA256)
+        self.assertNotIn("개수 상한".encode("utf-8"), b"".join(prompts.values()))
+
+    def test_extract_with_count_limits_states_them_in_the_rules_and_changes_nothing_else(self):
+        self.assertEqual(self.build_digest().returncode, 0)
+        plain = self.extract_prompts()
+        limited = self.extract_prompts("--max-patterns", "5", "--max-observations", "20", "--max-rejected", "20")
+        self.assertEqual(sorted(limited), sorted(plain))
+        rule = "- 억지로 개수를 늘리지 마라. 근거가 약하면 rejected 에 이유와 함께 넣는다. 패턴이 0개여도 된다.\n"
+        for name, text in limited.items():
+            with self.subTest(name):
+                decoded = text.decode("utf-8")
+                self.assertEqual(decoded.count(self.LIMIT_SENTENCE), 1)
+                self.assertIn(rule + self.LIMIT_SENTENCE + "\n출력:", decoded)
+                self.assertEqual(decoded.replace(self.LIMIT_SENTENCE, ""), plain[name].decode("utf-8"))
+        other = self.extract_prompts("--max-patterns", "3", "--max-observations", "7", "--max-rejected", "9")
+        self.assertIn("patterns 는 최대 3개, observations 는 최대 7개, rejected 는 최대 9개다.",
+                      other["extract-blind.md"].decode("utf-8"))
+
+    def test_extract_refuses_partial_or_non_positive_count_limits(self):
+        self.assertEqual(self.build_digest().returncode, 0)
+        cases = [("--max-patterns", "5"), ("--max-patterns", "5", "--max-observations", "20"),
+                 ("--max-rejected", "20"),
+                 ("--max-patterns", "0", "--max-observations", "20", "--max-rejected", "20"),
+                 ("--max-patterns", "-1", "--max-observations", "20", "--max-rejected", "20"),
+                 ("--max-patterns", "five", "--max-observations", "20", "--max-rejected", "20"),
+                 ("--max-patterns", "5", "--max-observations", "2.5", "--max-rejected", "20")]
+        for case in cases:
+            with self.subTest(case):
+                run = self.directory / "refused"
+                result = run_script("build_prompts.py", "extract", "--digest-dir", self.digest_dir, "--out", run, *case)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertNotIn("Traceback", result.stderr)
+                self.assertFalse((run / "prompts").exists())
+
+    def test_verify_takes_no_count_limits(self):
+        result = run_script("build_prompts.py", "verify", "--digest-dir", self.digest_dir, "--candidates", "c.json",
+                            "--out", self.directory / "v", "--max-patterns", "5")
+        self.assertEqual(result.returncode, 2)
 
     def test_verify_rejects_unknown_keys_and_duplicate_ids(self):
         self.assertEqual(self.build_digest().returncode, 0)

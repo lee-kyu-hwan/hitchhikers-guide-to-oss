@@ -45,6 +45,8 @@ One investigation is one corpus. When collection produced several corpora, have 
 
 `build_prompts.py extract --digest-dir DIR --out RUN/extract` writes one prompt per shard and lens into `RUN/extract/prompts/`: `blind` (no restriction), `correctness`, `structure`, `maintenance`, and `review`. Run all five by default. The blind lens catches what the focused lenses miss, and the focused lenses read deeper. Each prompt asks for `patterns` (behavior seen in two or more PRs), `observations` (single-PR behavior), and `rejected` ideas, with a verbatim quote on every piece of evidence.
 
+When the answers are checked against count limits, pass the same numbers to `build_prompts.py extract` as `--max-patterns N --max-observations N --max-rejected N` (positive integers, all three or none). Each extract prompt then states them as one more rule after the pattern criteria: at most that many `patterns`, `observations` and `rejected`, an answer over any of them is refused whole, overflowing items are dropped weakest first rather than moved into `rejected` or `observations`, and no evidence is invented to reach a count. Without the options the prompt bytes are what they always were. `verify` prompts take no count limits.
+
 ## Running prompts
 
 Every prompt file is the whole input of one independent, tool-less call whose answer is one JSON object saved as `<run>/results/<prompt stem>.result.json`. `build_prompts.py` empties `<run>/prompts` and `<run>/results` before writing, and refuses a run directory that holds the other kind of prompt, so extraction and verification never share or reuse stale files. Choose the executor by availability:

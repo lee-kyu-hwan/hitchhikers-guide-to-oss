@@ -274,6 +274,23 @@ class Context:
                              % (", ".join(lenses), self.shards))
         return stems
 
+    def extract_prompt_texts(self) -> dict[str, str]:
+        """The extract prompts of this digest, written again by the analyzer with the count limits the answers are
+        checked against (EXTRACT_CAPS, from run_limits.json), so the prompt and the checks say the same numbers.
+        The digest's own prompts were written without them; only their names are taken from there."""
+        stems = self.extract_stems()
+        with tempfile.TemporaryDirectory(prefix="stage-extract-") as tmp:
+            limits = [item for kind, cap in EXTRACT_CAPS.items() for item in ("--max-" + kind, str(cap))]
+            code, _, stderr = self.wf.run_main(self.siblings.build_prompts.main, [
+                "extract", "--digest-dir", str(self.digest_dir), "--out", tmp, *limits])
+            if code != 0:
+                raise StageError("build_prompts extract failed: " + stderr.strip())
+            built = sorted(path.stem for path in (Path(tmp) / "prompts").glob("*.md"))
+            if built != stems:
+                raise StageError("the analyzer wrote other extract prompts than the digest holds")
+            return {stem: read_bounded(Path(tmp) / "prompts" / (stem + ".md"), 4 * PROMPT_MAX_BYTES,
+                                       "extract prompt").decode("utf-8") for stem in stems}
+
 
 # -- bounded, strict IO ------------------------------------------------------
 
@@ -493,8 +510,7 @@ def cmd_extract_inputs(context: Context, args) -> dict:
     if context.reduced:
         plan["inputs"]["max_synthesis_groups"] = MAX_SYNTHESIS_GROUPS
     # Every prompt is checked before anything is written: one over the cap refuses the whole stage.
-    texts = {stem: read_bounded(context.extract_prompts / (stem + ".md"), 4 * PROMPT_MAX_BYTES,
-                                "extract prompt").decode("utf-8") for stem in context.extract_stems()}
+    texts = context.extract_prompt_texts()
     oversize = ["%s is %d bytes" % (stem, len(text.encode("utf-8"))) for stem, text in sorted(texts.items())
                 if len(text.encode("utf-8")) > PROMPT_MAX_BYTES]
     if oversize:
