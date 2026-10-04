@@ -551,3 +551,36 @@ def read_json(path):
 
 def sha256_file(path):
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+# -- several collections of one request --------------------------------------
+
+REPO_B = OWNER + "/synth-docs-lib"
+REPO_C = OWNER + "/synth-third-lib"
+
+
+def derive_bundle(source_paths, directory, repository, tag):
+    """A second collection by re-labelling a collector run for another repository.
+
+    Every repository name, node id, run id and request fingerprint changes, so
+    the bundle is a distinct synthetic collection that the analyzer's own
+    corpus validation still accepts. Nothing here talks to a collector.
+    """
+    directory = Path(directory)
+    directory.mkdir(parents=True, exist_ok=True)
+    manifest = read_json(source_paths["manifest"])
+    swaps = []
+    for record in manifest["records"]:
+        swaps.append((record["run_id"], "run-" + hashlib.sha256((record["run_id"] + tag).encode()).hexdigest()[:20]))
+        swaps.append((record["request_fingerprint"],
+                      "sha256:" + hashlib.sha256((record["request_fingerprint"] + tag).encode()).hexdigest()))
+    paths = {}
+    for name, filename in (("corpus", "corpus.json"), ("manifest", "manifest.json"), ("inventory", "inventory.md")):
+        text = Path(source_paths[name]).read_text(encoding="utf-8")
+        text = text.replace(REPO, repository).replace(REPO_NAME, repository.split("/")[1])
+        text = text.replace("SYNTH_FIXTURE", "SYNTH_FIXTURE_" + tag.upper())
+        for old, new in swaps:
+            text = text.replace(old, new)
+        paths[name] = directory / filename
+        paths[name].write_text(text, encoding="utf-8")
+    return paths

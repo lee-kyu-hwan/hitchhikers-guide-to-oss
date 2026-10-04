@@ -2033,6 +2033,97 @@ class CollectPickupTests(unittest.TestCase):
         self.assertEqual(code, 1, seen)
         self.assertIn("collection is not complete", seen["problems"])
 
+    PARTIAL = REPO / "tests/fixtures/oss_research_worker/linux/pickup_partial/p4-eslint-markdown"
+    PARTIAL_COLLECTOR = "c0097621bb93ba8ad22f3e21a5f6ef171599518cae7b943ba56561a87e3063dd"
+    PARTIAL_PROBLEM = "collection exit code 3"
+    PARTIAL_INNER = {"succeeded": False, "manifest": {"status": "failed", "exit_code": 3, "failures": [],
+                                                       "problems": [PARTIAL_PROBLEM]}}
+
+    def partial_members(self):
+        """What a collection that stopped partial leaves: the collector's exit 3 and the entry's failed run."""
+        members = self.members()
+        members["collection-manifest.json"]["records"][0]["collection_status"] = "partial"
+        members["envelope"]["adapter_exit"] = 3
+        members["run-manifest.json"].update(status="failed", exit_code=3, problems=[self.PARTIAL_PROBLEM])
+        members["transport.json"]["exit_code"] = 3
+        return members
+
+    def partial_wrapper(self, **changes):
+        return self.wrapper(**dict({"exit_code": 4, "inner": self.PARTIAL_INNER}, **changes))
+
+    def test_a_bound_partial_collection_exits_3_like_a_partial_issue_collection(self):
+        code, seen = self.verify(self.pack("partial", self.partial_members()), wrapper=self.partial_wrapper())
+        self.assertEqual((code, seen["problems"], seen["records"], seen["collection_status"]), (3, [], 2, "partial"), seen)
+        code, seen = self.verify(self.pack("whole", self.members()))
+        self.assertEqual((code, seen["collection_status"]), (0, "complete"), seen)
+
+    def test_a_partial_collection_must_be_partial_in_every_member(self):
+        def changed(path, value):
+            members = json.loads(json.dumps(self.partial_members()))
+            target = members
+            for key in path[:-1]:
+                target = target[key]
+            target[path[-1]] = value
+            return members
+        cases = {
+            "adapter exit 0": (changed(("envelope", "adapter_exit"), 0), None),
+            "adapter exit 4": (changed(("envelope", "adapter_exit"), 4), None),
+            "adapter exit true": (changed(("envelope", "adapter_exit"), True), None),
+            "run succeeded": (changed(("run-manifest.json", "status"), "succeeded"), None),
+            "run exit 4": (changed(("run-manifest.json", "exit_code"), 4), None),
+            "run problem is another": (changed(("run-manifest.json", "problems"), ["timeout"]), None),
+            "run has no problem": (changed(("run-manifest.json", "problems"), []), None),
+            "run has a failure": (changed(("run-manifest.json", "failures"), ["supervisor"]), None),
+            "transport exit 0": (changed(("transport.json", "exit_code"), 0), None),
+            "unrelayed request": (changed(("transport.json", "requests"), [{"outcome": "relay-refused"}] * 3), None),
+            "failed collection": (changed(("collection-manifest.json", "records", 0, "collection_status"), "failed"), None),
+            "wrapper exit 0": (self.partial_members(), {"exit_code": 0}),
+            "wrapper exit 5": (self.partial_members(), {"exit_code": 5}),
+            "wrapper failure": (self.partial_members(), {"failures": ["unit"]}),
+            "wrapper inner succeeded": (self.partial_members(), {"inner": {"succeeded": True}}),
+            "wrapper inner other manifest": (self.partial_members(), {"inner": {"manifest": {
+                "status": "failed", "exit_code": 4, "failures": [], "problems": [self.PARTIAL_PROBLEM]}}}),
+        }
+        for label, (members, wrapper_changes) in cases.items():
+            with self.subTest(label):
+                wrapper = self.partial_wrapper(**(wrapper_changes or {}))
+                code, seen = self.verify(self.pack("partial-" + label.replace(" ", "-"), members), wrapper=wrapper)
+                self.assertEqual(code, 1, seen)
+                self.assertTrue(seen["problems"], seen)
+
+    def test_a_complete_collection_with_a_partial_run_record_is_refused(self):
+        code, seen = self.verify(self.pack("mixed", self.members()), wrapper=self.partial_wrapper())
+        self.assertEqual(code, 1, seen)
+        self.assertTrue(seen["problems"], seen)
+
+    def verify_partial_fixture(self, record=None, collector=None):
+        completed = subprocess.run([sys.executable, "-I", "-B", str(self.VERIFY), str(self.PARTIAL / "collect.tar"),
+                                    str(64 << 20), str(self.root / f"fx-{len(list(self.root.glob('fx-*')))}"),
+                                    "--collect", "--collector-sha256", collector or self.PARTIAL_COLLECTOR,
+                                    "--wrapper-record", str(record or self.PARTIAL / "record.json"),
+                                    "--upstream", "github-rest-via-relay"],
+                                   capture_output=True, text=True, timeout=60)
+        return completed.returncode, json.loads(completed.stdout)
+
+    def test_the_real_partial_run_of_2026_10_04_is_a_partial_pickup(self):
+        """eslint-markdown/eslint-markdown: the collector stopped partial (7 matched, 5 kept, 2 over the cap)."""
+        code, seen = self.verify_partial_fixture()
+        self.assertEqual((code, seen["problems"], seen["records"], seen["authenticated"], seen["collection_status"]),
+                         (3, [], 5, True, "partial"), seen)
+        self.assertEqual("github-rest-via-relay", seen["upstream"])
+
+    def test_the_real_partial_run_is_refused_when_its_record_or_collector_does_not_fit(self):
+        record = json.loads((self.PARTIAL / "record.json").read_text())
+        record["exit_code"] = 0
+        wrong = self.root / "record-exit-0.json"
+        wrong.write_text(json.dumps(record) + "\n")
+        code, seen = self.verify_partial_fixture(record=wrong)
+        self.assertEqual(code, 1, seen)
+        self.assertTrue(seen["problems"], seen)
+        code, seen = self.verify_partial_fixture(collector="0" * 64)
+        self.assertEqual(code, 1, seen)
+        self.assertIn("transport collector is not the collector the host reviewed", seen["problems"])
+
     def test_only_a_whole_bound_collection_passes(self):
         code, seen = self.verify(self.pack("good", self.members()))
         self.assertEqual((code, seen["problems"], seen["records"]), (0, [], 2), seen)

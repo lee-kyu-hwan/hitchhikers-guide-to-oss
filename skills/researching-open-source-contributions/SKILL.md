@@ -73,6 +73,10 @@ reports. It never opens a network connection or starts a process.
    only the curated collector's corpus and manifest (it writes no inventory).
    Its `repositories` list is the caller's allow list: a pull request the
    tracker names outside it is refused, never added.
+   One isolated collection covers one repository, so a request that names
+   several repositories is adopted as one corpus by repeating the three flags
+   once per collection, in the order to merge them. The collections must cover
+   `source.repositories` exactly once each (see the workflow contract).
 4. Run `digest`. It builds the analyzer digest and extraction prompts. The
    extraction and synthesis that answer those prompts are isolated research.
    Adopt their validated result with `adopt-analysis --analysis A --origin ai

@@ -130,6 +130,47 @@ revisions, and, for AI stages, the claimed provenance.
    `content_path` is chosen by result data, it must resolve to a regular file
    inside the evidence JSON's own directory; `..`, symlinks, other absolute
    paths, and URLs are rejected before any byte is read.
+6. Several collections of one request. One isolated collection entry covers one
+   repository, so `adopt-collection` takes `--corpus C --manifest M
+   [--inventory I]` once per collection, repeated, in the order to merge them.
+   Corpus and manifest pair up by position; inventories are given for every
+   collection or for none. One collection behaves exactly as above. Several are
+   adopted as one corpus only when all of these hold, and any failure is a
+   `scope-conflict` that changes nothing:
+   - every manifest is a v2 manifest of the `recent-closed-prs` source; in every
+     run record the interval, `outcome`, `max_per_repository` and per-run
+     `request_budget` equal the request's, `request_count` is within that
+     budget, and `docs_only` is the same value in every run of every collection;
+   - the records of one manifest name the same repositories, those repositories
+     are in `source.repositories`, and every corpus record comes from one of
+     them;
+   - the collections cover `source.repositories` exactly: a repository no
+     collection covers is refused, not adopted as partial, because the report
+     states the request's repositories as its scope and a collection that was
+     never made must not read as complete (collect it, or write a request that
+     names only what was collected); a repository in two collections is refused;
+   - no pull request (node id, else URL) and no `run_id` appears in two
+     collections, and the collectors that produced them are the same;
+   - a corpus record carries no `analysis_history`: only fresh collections merge;
+   - a curated tracker takes one collection.
+
+   The merged corpus is the corpora's records concatenated in order. A `pr_id`
+   is only unique inside one corpus, so resolved records are renumbered `PR-001`
+   upward across the set. The stage stores, next to the originals under
+   `bundles/NN/` (corpus, manifest, inventory, byte for byte), a merged
+   `corpus.json` and a merged `manifest.json` that keeps every run record and
+   adds `workflow_merge`: the collections (repositories, record counts per
+   repository, run ids, request count and budget per collection), the request
+   count and the per-run budgets summed, and the `pr_id` mapping. The checkpoint
+   records each file's SHA-256 under `corpus-NN`, `manifest-NN` and
+   `inventory-NN` in the order given, so another order is a different input and
+   needs `--replace`. Its status is the worst of the collections (`complete`,
+   `partial`, `failed`), with a reason per collection that is not complete. Every
+   run record of every collection enters the ledger once, so `--replace`,
+   revision drift and the budget (`budget.total_api_requests` against the summed
+   requests) work as for one collection. `status` and `report` show the number
+   of collections, the records per repository and the requests per run. `digest`
+   and the analyzer see the merged corpus only.
 
 ## Budget ledger
 

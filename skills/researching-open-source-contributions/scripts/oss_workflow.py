@@ -795,14 +795,17 @@ def _curated_corpus_errors(request: dict, corpus: object, manifest: dict) -> Lis
     return errors
 
 
-def _collection_scope_errors(request: dict, record: dict) -> List[str]:
+def _collection_scope_errors(request: dict, record: dict, repositories: Optional[List[str]] = None) -> List[str]:
+    """One manifest run against the request; ``repositories`` is the subset one of several collections covers."""
     source = request["source"]
     if source["kind"] == "curated-tracker":
         return _curated_scope_errors(request, record)
     errors = []
     requested = record.get("repositories_requested")
-    if not isinstance(requested, list) or sorted(r.lower() for r in requested) != sorted(r.lower() for r in source["repositories"]):
-        errors.append("manifest repositories_requested %r differ from source.repositories" % (requested,))
+    expected = source["repositories"] if repositories is None else repositories
+    if not isinstance(requested, list) or sorted(r.lower() for r in requested) != sorted(r.lower() for r in expected):
+        errors.append("manifest repositories_requested %r differ from %s" % (
+            requested, "source.repositories" if repositories is None else "the collection's repositories"))
     interval = record.get("interval") if isinstance(record.get("interval"), dict) else {}
     if (interval.get("start_at"), interval.get("end_at")) != (source["interval"]["start_at"], source["interval"]["end_at"]):
         errors.append("manifest interval %r differs from source.interval" % ((interval.get("start_at"), interval.get("end_at")),))
@@ -861,18 +864,33 @@ def _curated_collection_status(latest: dict) -> Tuple[str, List[str], dict, List
 def cmd_adopt_collection(args, siblings: Siblings, request: dict, state: dict, run: Run) -> dict:
     _require_supported(request)
     curated = request["source"]["kind"] == "curated-tracker"
-    if curated and args.inventory:
+    corpora, manifests, inventories = args.corpus, args.manifest, args.inventory
+    if len(corpora) != len(manifests):
+        raise WorkflowError("pair every --corpus with one --manifest (got %d --corpus, %d --manifest)"
+                            % (len(corpora), len(manifests)))
+    if len(corpora) > 1:
+        if curated:
+            raise WorkflowError("a curated tracker takes one collection; adopt one --corpus and --manifest")
+        if inventories and len(inventories) != len(corpora):
+            raise WorkflowError("give --inventory for every collection or for none (got %d for %d collections)"
+                                % (len(inventories), len(corpora)))
+        return _adopt_collections(args, siblings, request, state, run)
+    if len(inventories) > 1:
+        raise WorkflowError("--inventory given more than once for one collection")
+    corpus_path, manifest_path = corpora[0], manifests[0]
+    inventory_path = inventories[0] if inventories else None
+    if curated and inventory_path:
         raise WorkflowError("the curated collector writes no inventory; adopt only --corpus and --manifest")
     revisions = siblings.revisions()
     incoming = run.incoming("collect", state)
     try:
-        corpus_bytes, corpus_sha = copy_input(args.corpus, incoming / "corpus.json", "corpus")
-        manifest_bytes, manifest_sha = copy_input(args.manifest, incoming / "manifest.json", "manifest")
-        inputs = {"corpus": {"sha256": corpus_sha, "source_path": os.path.abspath(args.corpus)},
-                  "manifest": {"sha256": manifest_sha, "source_path": os.path.abspath(args.manifest)}}
-        if args.inventory:
-            _, inventory_sha = copy_input(args.inventory, incoming / "inventory.md", "inventory")
-            inputs["inventory"] = {"sha256": inventory_sha, "source_path": os.path.abspath(args.inventory)}
+        corpus_bytes, corpus_sha = copy_input(corpus_path, incoming / "corpus.json", "corpus")
+        manifest_bytes, manifest_sha = copy_input(manifest_path, incoming / "manifest.json", "manifest")
+        inputs = {"corpus": {"sha256": corpus_sha, "source_path": os.path.abspath(corpus_path)},
+                  "manifest": {"sha256": manifest_sha, "source_path": os.path.abspath(manifest_path)}}
+        if inventory_path:
+            _, inventory_sha = copy_input(inventory_path, incoming / "inventory.md", "inventory")
+            inputs["inventory"] = {"sha256": inventory_sha, "source_path": os.path.abspath(inventory_path)}
         reused = reuse_if_same(run, state, "collect", {k: v["sha256"] for k, v in inputs.items()}, revisions)
         if reused is not None:
             code, _, stderr = run_main(siblings.validate_corpus.main, [str(gen_dir(run, "collect", reused) / "corpus.json")])
@@ -937,6 +955,219 @@ def cmd_adopt_collection(args, siblings: Siblings, request: dict, state: dict, r
         commit(run, state, "collect", incoming, generation, args.replace)
         incoming = None
         event(state, "adopt-collection", generation["status"], "gen-%03d ledger+%d total=%d" % (generation["generation"], added, total))
+        return generation
+    finally:
+        if incoming is not None and incoming.exists():
+            shutil.rmtree(incoming)
+
+
+COLLECTION_RANK = {"complete": 0, "partial": 1, "failed": 2}
+
+
+def _bundle_scope(request: dict, siblings: Siblings, index: int, corpus: object, manifest: object) -> Tuple[List[str], dict]:
+    """One of several collections: its manifest runs and corpus records, checked on their own.
+
+    Cross-collection rules (coverage, overlap, duplicates) are checked by the caller.
+    """
+    label = "collection %d" % index
+    if (not isinstance(manifest, dict) or manifest.get("schema_version") != "2.0.0"
+            or not isinstance(manifest.get("records"), list) or not manifest["records"]):
+        raise WorkflowError("%s: collector manifest must be a v2 manifest with records (migrate v1 with the collector)" % label)
+    records = manifest["records"]
+    errors: List[str] = []
+    latest = records[-1]
+    requested = latest.get("repositories_requested") if isinstance(latest, dict) else None
+    if not isinstance(requested, list) or not requested or not all(isinstance(item, str) for item in requested):
+        return [label + ": manifest repositories_requested must list the repositories collected"], {}
+    repositories = sorted(requested, key=str.lower)
+    lowered = {item.lower() for item in repositories}
+    for position, record in enumerate(records):
+        if not isinstance(record, dict):
+            errors.append("%s: manifest record %d is not an object" % (label, position))
+            continue
+        errors.extend("%s: record %d: %s" % (label, position, error)
+                      for error in _collection_scope_errors(request, record, repositories))
+    allowed = {item.lower() for item in request["source"]["repositories"]}
+    outside = sorted(item for item in repositories if item.lower() not in allowed)
+    if outside:
+        errors.append("%s: repositories outside source.repositories: %s" % (label, ", ".join(outside)))
+    corpus_records = corpus.get("records") if isinstance(corpus, dict) else None
+    if not isinstance(corpus_records, list):
+        return errors + [label + ": corpus records must be a list"], {}
+    counts: Dict[str, int] = {}
+    identities = []
+    for record in corpus_records:
+        if not isinstance(record, dict):
+            errors.append("%s: corpus record is not an object" % label)
+            continue
+        name = siblings.collector._record_repository_name(record)
+        if name.lower() not in lowered:
+            errors.append("%s: corpus record from out-of-scope repository %r" % (label, name))
+        counts[name] = counts.get(name, 0) + 1
+        if record.get("analysis_history"):
+            errors.append("%s: corpus record carries analysis_history; adopt fresh collections only" % label)
+        pull = record.get("pull_request") if isinstance(record.get("pull_request"), dict) else {}
+        identity = record.get("pull_request_node_id") if isinstance(record.get("pull_request_node_id"), str) else pull.get("url")
+        if isinstance(identity, str) and identity:
+            identities.append(identity)
+    run_ids = [item["run_id"] for item in records if isinstance(item, dict) and isinstance(item.get("run_id"), str)]
+    return errors, {"index": index, "repositories": repositories, "latest": latest, "records": records,
+                    "corpus_records": corpus_records, "records_by_repository": counts, "identities": identities,
+                    "run_ids": run_ids}
+
+
+def _collections_cross_errors(request: dict, bundles: List[dict]) -> List[str]:
+    """What only the whole set shows: coverage, overlap, repeated pull requests and runs, a single filter."""
+    errors: List[str] = []
+    owner: Dict[str, int] = {}
+    for bundle in bundles:
+        for repository in bundle["repositories"]:
+            if repository.lower() in owner:
+                errors.append("repository %s is in more than one collection (%d and %d)"
+                              % (repository, owner[repository.lower()], bundle["index"]))
+            owner.setdefault(repository.lower(), bundle["index"])
+    missing = [item for item in request["source"]["repositories"] if item.lower() not in owner]
+    if missing:
+        errors.append("source.repositories not covered by any collection: " + ", ".join(missing))
+    for key, noun in (("identities", "pull request"), ("run_ids", "run_id")):
+        seen: Dict[str, int] = {}
+        for bundle in bundles:
+            for value in sorted(set(bundle[key])):
+                if value in seen:
+                    errors.append("duplicate %s %s is in more than one collection (%d and %d)"
+                                  % (noun, value, seen[value], bundle["index"]))
+                seen.setdefault(value, bundle["index"])
+    filters = sorted({json.dumps(record.get("docs_only")) for bundle in bundles for record in bundle["records"]
+                      if isinstance(record, dict)})
+    if len(filters) > 1:
+        errors.append("manifests disagree on docs_only: " + ", ".join(filters))
+    return errors
+
+
+def _adopt_collections(args, siblings: Siblings, request: dict, state: dict, run: Run) -> dict:
+    """Adopt several collections of one request as one corpus.
+
+    Each collection is one isolated run over some of ``source.repositories``.
+    The collections must cover the whole set, once each, under the request's own
+    interval, outcome and caps. Pull request identifiers (``pr_id``) are only
+    unique inside one corpus, so the merged corpus renumbers them in order and
+    records the mapping in the merged manifest.
+    """
+    corpora, manifests = args.corpus, args.manifest
+    inventories = args.inventory or [None] * len(corpora)
+    revisions = siblings.revisions()
+    incoming = run.incoming("collect", state)
+    try:
+        inputs, raw = {}, []
+        for index, (corpus_path, manifest_path, inventory_path) in enumerate(zip(corpora, manifests, inventories), 1):
+            folder = incoming / "bundles" / ("%02d" % index)
+            folder.mkdir(parents=True)
+            corpus_bytes, corpus_sha = copy_input(corpus_path, folder / "corpus.json", "corpus %d" % index)
+            manifest_bytes, manifest_sha = copy_input(manifest_path, folder / "manifest.json", "manifest %d" % index)
+            inputs["corpus-%02d" % index] = {"sha256": corpus_sha, "source_path": os.path.abspath(corpus_path)}
+            inputs["manifest-%02d" % index] = {"sha256": manifest_sha, "source_path": os.path.abspath(manifest_path)}
+            if inventory_path:
+                _, inventory_sha = copy_input(inventory_path, folder / "inventory.md", "inventory %d" % index)
+                inputs["inventory-%02d" % index] = {"sha256": inventory_sha, "source_path": os.path.abspath(inventory_path)}
+            raw.append((corpus_bytes, manifest_bytes))
+        reused = reuse_if_same(run, state, "collect", {k: v["sha256"] for k, v in inputs.items()}, revisions)
+        if reused is not None:
+            code, _, stderr = run_main(siblings.validate_corpus.main, [str(gen_dir(run, "collect", reused) / "corpus.json")])
+            if code != 0:
+                raise WorkflowError("reused corpus no longer validates: " + stderr.strip())
+            event(state, "adopt-collection", "reused", "gen-%03d revalidated" % reused["generation"])
+            return reused
+        guard_replace(state, "collect", args.replace)
+
+        bundles, corpus_docs, errors = [], [], []
+        for index, (corpus_bytes, manifest_bytes) in enumerate(raw, 1):
+            corpus = read_json_bytes(corpus_bytes, "corpus %d" % index)
+            manifest = read_json_bytes(manifest_bytes, "manifest %d" % index)
+            found, bundle = _bundle_scope(request, siblings, index, corpus, manifest)
+            errors.extend(found)
+            if bundle:
+                bundle["manifest"] = manifest
+                bundles.append(bundle)
+                corpus_docs.append(corpus)
+        if len(bundles) == len(raw):
+            errors.extend(_collections_cross_errors(request, bundles))
+            for key, label in (("schema_version", "corpus schema_version"), ("generated_by", "corpus generated_by")):
+                if len({json.dumps(doc.get(key), sort_keys=True) for doc in corpus_docs}) > 1:
+                    errors.append("collections differ in %s" % label)
+            if len({json.dumps(b["manifest"].get("generated_by"), sort_keys=True) for b in bundles}) > 1:
+                errors.append("collections differ in manifest generated_by")
+        if errors:
+            raise WorkflowError("scope-conflict: " + "; ".join(errors))
+        for index in range(1, len(bundles) + 1):
+            code, _, stderr = run_main(siblings.validate_corpus.main, [str(incoming / "bundles" / ("%02d" % index) / "corpus.json")])
+            if code != 0:
+                raise WorkflowError("analyzer validate_corpus rejected collection %d corpus: %s" % (index, stderr.strip()))
+
+        merged_records, pr_id_map = [], []
+        for bundle in bundles:
+            for record in bundle["corpus_records"]:
+                record = json.loads(json.dumps(record))
+                if record.get("pr_id") not in (None, ""):
+                    renumbered = "PR-%03d" % (len(pr_id_map) + 1)
+                    pr_id_map.append({"collection": bundle["index"], "from": record["pr_id"], "to": renumbered,
+                                      "record_key": record.get("record_key")})
+                    record["pr_id"] = renumbered
+                merged_records.append(record)
+        merged_corpus = dict(corpus_docs[0], records=merged_records)
+        write_json_atomic(incoming / "corpus.json", merged_corpus)
+        code, stdout, stderr = run_main(siblings.validate_corpus.main, [str(incoming / "corpus.json")])
+        if code != 0:
+            raise WorkflowError("analyzer validate_corpus rejected the merged corpus: " + stderr.strip())
+
+        states, capped, reasons, collections, ledger = {}, set(), [], [], []
+        overall = "complete"
+        for bundle in bundles:
+            where = "collection %d (%s)" % (bundle["index"], ", ".join(bundle["repositories"]))
+            status, why, per_repository, over_cap = _recent_collection_status(
+                {"source": {"repositories": bundle["repositories"]}}, bundle["latest"])
+            if COLLECTION_RANK[status] > COLLECTION_RANK[overall]:
+                overall = status
+            if status != "complete" or why:
+                reasons.append("%s: %s" % (where, status))
+                reasons.extend("%s: %s" % (where, item) for item in why)
+            states.update(per_repository)
+            capped.update(over_cap)
+            for record in bundle["records"]:
+                identity = {key: record.get(key) for key in ("run_id", "started_at", "completed_at", "request_fingerprint")}
+                ledger.append(ledger_entry(request, "collector", "collect", record.get("run_id"), record.get("request_count"),
+                                           record.get("started_at"), record.get("completed_at"), identity, False))
+            collections.append({
+                "index": bundle["index"], "repositories": bundle["repositories"], "status": status,
+                "records": len(bundle["corpus_records"]), "records_by_repository": bundle["records_by_repository"],
+                "run_ids": bundle["run_ids"],
+                "request_count": sum(item["request_count"] for item in bundle["records"]),
+                "request_budget": bundle["latest"]["request_budget"],
+            })
+        merged_manifest = {
+            "schema_version": "2.0.0", "generated_by": bundles[0]["manifest"].get("generated_by"),
+            "records": [record for bundle in bundles for record in bundle["records"]],
+            "workflow_merge": {
+                "collections": len(bundles), "bundles": collections, "pr_id_map": pr_id_map,
+                "request_count_total": sum(item["request_count"] for item in collections),
+                "request_budget_total": sum(item["request_budget"] for item in collections),
+            },
+        }
+        write_json_atomic(incoming / "manifest.json", merged_manifest)
+        generation = {
+            "status": overall, "reasons": reasons, "inputs": inputs, "tool_revisions": revisions,
+            "producer": {"generated_by": merged_manifest["generated_by"],
+                         "run_ids": [item["latest"].get("run_id") for item in bundles]},
+            "details": {"records": len(merged_records), "repository_status": states,
+                        "capped_repositories": sorted(capped), "validator": stdout.strip(), "collections": collections},
+        }
+        added, total = record_ledger(state, "collect", ledger)
+        violations = budget_violations(request, state)
+        if violations:
+            generation["status"], generation["reasons"] = "blocked", generation["reasons"] + violations
+        commit(run, state, "collect", incoming, generation, args.replace)
+        incoming = None
+        event(state, "adopt-collection", generation["status"],
+              "gen-%03d from %d collections ledger+%d total=%d" % (generation["generation"], len(bundles), added, total))
         return generation
     finally:
         if incoming is not None and incoming.exists():
@@ -1463,6 +1694,9 @@ def status_document(run: Run, request: dict, state: dict) -> dict:
             "generations": len(history),
             "invalidated": [g["invalidated"] for g in history if g.get("invalidated")],
         }
+    collected = active(state, "collect")
+    if collected is not None and collected.get("details", {}).get("collections"):
+        stages["collect"]["collections"] = collected["details"]["collections"]
     ledger_total = sum(e["requests"] for e in state["ledger"])
     return {
         "run_id": state["run_id"], "mode": request["mode"], "outcome": outcome, "completeness": completeness,
@@ -1522,6 +1756,20 @@ def render_report(run: Run, request: dict, state: dict) -> str:
         lines.append("| %s | %s | %s | %s | %s |" % (stage, entry["status"], entry["active"] or "-", inputs or "-", reasons.replace("|", "/")))
     if status["integrity_failures"]:
         lines += ["", "Blocked: modified checkpoint outputs %s" % json.dumps(status["integrity_failures"], sort_keys=True)]
+    collections = status["stages"]["collect"].get("collections")
+    if collections:
+        lines += ["", "## Collections", "",
+                  "The collect stage was adopted from %d collections (%d records)."
+                  % (len(collections), sum(item["records"] for item in collections)), "",
+                  "| # | Repositories | Records | Run | Requests / budget | Status |", "| --- | --- | --- | --- | --- | --- |"]
+        for item in collections:
+            by_repository = ", ".join("`%s` %d" % (name, count) for name, count in sorted(item["records_by_repository"].items()))
+            lines.append("| %d | %s | %s | %s | %d / %d | %s |" % (
+                item["index"], ", ".join("`%s`" % r for r in item["repositories"]), by_repository or "0",
+                ", ".join("`%s`" % r for r in item["run_ids"]), item["request_count"], item["request_budget"], item["status"]))
+        lines.append("")
+        lines.append("Requests across the collections: %d of a summed per-run budget of %d."
+                     % (sum(item["request_count"] for item in collections), sum(item["request_budget"] for item in collections)))
     lines += ["", "Tool revisions: " + ", ".join("%s `%s`" % (k, _short(v)) for k, v in sorted(state["skills"]["revisions"].items())), ""]
     lines += ["## AI judgment provenance", "",
               "Origin, model, and effort are caller claims bound to input hashes. They do not prove that a model ran.", ""]
@@ -1631,9 +1879,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     command("init").add_argument("--request", required=True)
     adopt = command("adopt-collection")
-    adopt.add_argument("--corpus", required=True)
-    adopt.add_argument("--manifest", required=True)
-    adopt.add_argument("--inventory")
+    # Repeat the three flags for each collection of one request, in the order to merge them.
+    adopt.add_argument("--corpus", required=True, action="append")
+    adopt.add_argument("--manifest", required=True, action="append")
+    adopt.add_argument("--inventory", action="append", default=[])
     adopt.add_argument("--replace", action="store_true")
     command("digest")
     analysis = command("adopt-analysis")

@@ -46,6 +46,8 @@ JSON file must be one object (no duplicate keys, no NaN/Infinity) and all of:
 - the envelope lists every other member with its exact size and sha256;
 - run-manifest: succeeded, exit code 0, no failures or problems, the same
   relay sources and relay sha256 as the envelope; the adapter exit is 0;
+  (a partial collection, below, leaves the entry's run record failed with the
+  collector's exit 3 and the one problem "collection exit code 3");
 - transport: srt-proxy, exit code 0, every request relayed, its count equal
   to the collection manifest's request_count, the collector path and sha256
   equal to the relay's ready "sibling" source, the relay port the envelope's;
@@ -64,6 +66,15 @@ JSON file must be one object (no duplicate keys, no NaN/Infinity) and all of:
   github-rest-via-relay, so a mock result is never taken as live. It is a
   statement, printed, never evidence of a real GitHub request.
 Exit codes and counts must be JSON integers (not booleans or floats).
+A collection the collector stopped partial (collection_status partial) is
+accepted as a bound partial one only when every member says so: the adapter
+exit 3, the run record failed with exit 3 and the single problem "collection
+exit code 3", the transport exit 3, the unit wrapper exit 4 with no failures
+and an inner summary that is not succeeded and carries that same run record.
+Exit 0 only for a bound complete collection, 3 for a bound partial one, 1 for
+anything else (an adapter or run failure included). Exit 0 or 3 says the
+pickup checks held; it is not evidence that every matching PR was collected
+(the cap, the budget and search limits stay).
 
 --issues is the non-AI Issue collection step's contract (produced by
 dot_local/bin/executable_oss-research-collect-issues and its adapter
@@ -195,6 +206,10 @@ def _zero(value) -> bool:
     return type(value) is int and value == 0
 
 
+def _exit(value, expected: int) -> bool:
+    return type(value) is int and value == expected
+
+
 def _count(value) -> bool:
     return type(value) is int and value > 0
 
@@ -202,6 +217,11 @@ def _count(value) -> bool:
 # The upstream the envelope states: the production entry's relay to GitHub, or a
 # test's loopback mock. A statement only: printed, never evidence of a request.
 UPSTREAMS = ("github-rest-via-relay", "loopback-mock")
+
+# A collection that stopped partial (the collector's exit 3) leaves the entry's own run
+# record "failed" with that exit and this one problem, and the unit wrapper exits 4.
+PARTIAL_COLLECT_PROBLEM = "collection exit code 3"
+PARTIAL_COLLECT_WRAPPER_EXIT = 4
 
 
 def collect_problems(dest: Path, result: dict, host: dict) -> list:
@@ -223,6 +243,11 @@ def collect_problems(dest: Path, result: dict, host: dict) -> list:
     envelope, run, transport = (docs["collection-envelope.json"], docs["run-manifest.json"],
                                 docs["transport.json"])
     collection, corpus = docs["collection-manifest.json"], docs["corpus.json"]
+    runs = collection.get("records")
+    partial = (isinstance(runs, list) and len(runs) == 1 and isinstance(runs[0], dict)
+               and runs[0].get("collection_status") == "partial")
+    result["collection_status"] = "partial" if partial else "complete"
+    status_exit = 3 if partial else 0
 
     def check(ok, message):
         if not ok:
@@ -242,14 +267,20 @@ def collect_problems(dest: Path, result: dict, host: dict) -> list:
     repositories = request.get("repositories")
     check(isinstance(repositories, list) and repositories and all(isinstance(r, str) for r in repositories),
           "envelope request has no repositories")
-    check(_zero(envelope.get("adapter_exit")), "adapter exit is not the integer 0")
+    check(_exit(envelope.get("adapter_exit"), status_exit),
+          "adapter exit is not the integer %d" % status_exit)
     upstream = envelope.get("upstream")
     check(upstream in UPSTREAMS, "envelope does not state a known upstream")
     check(upstream == host["upstream"], "envelope upstream is not the one the host asked for")
     result["upstream"] = upstream if isinstance(upstream, str) else None
     run_relay = run.get("relay") if isinstance(run.get("relay"), dict) else {}
-    check(run.get("status") == "succeeded" and _zero(run.get("exit_code")) and run.get("failures") == []
-          and run.get("problems") == [], "run manifest did not succeed")
+    if partial:
+        check(run.get("status") == "failed" and _exit(run.get("exit_code"), 3) and run.get("failures") == []
+              and run.get("problems") == [PARTIAL_COLLECT_PROBLEM],
+              "run manifest is not the partial collection's (failed, exit 3, one problem)")
+    else:
+        check(run.get("status") == "succeeded" and _zero(run.get("exit_code")) and run.get("failures") == []
+              and run.get("problems") == [], "run manifest did not succeed")
     check(run_relay.get("sources") == relay.get("sources") and run_relay.get("relay_sha256")
           == relay.get("relay_sha256") and run_relay.get("port") == relay.get("port"),
           "run manifest relay differs from the envelope")
@@ -260,7 +291,8 @@ def collect_problems(dest: Path, result: dict, host: dict) -> list:
           "transport collector is not the relay's ready sibling source")
     requests = transport.get("requests")
     check(transport.get("transport") == "srt-proxy", "transport record does not say srt-proxy")
-    check(_zero(transport.get("exit_code")), "transport exit code is not the integer 0")
+    check(_exit(transport.get("exit_code"), status_exit),
+          "transport exit code is not the integer %d" % status_exit)
     check(collector.get("sha256") == host["collector_sha256"],
           "transport collector is not the collector the host reviewed")
     try:
@@ -272,12 +304,19 @@ def collect_problems(dest: Path, result: dict, host: dict) -> list:
         wrapper, inner = None, None
     check(isinstance(wrapper, dict) and isinstance(inner, dict), "wrapper record is unreadable")
     wrapper, inner = wrapper or {}, inner or {}
-    check(_zero(wrapper.get("exit_code")) and wrapper.get("failures") == [],
-          "the unit wrapper did not end with exit code 0 and no failures")
+    wrapper_exit = PARTIAL_COLLECT_WRAPPER_EXIT if partial else 0
+    check(_exit(wrapper.get("exit_code"), wrapper_exit) and wrapper.get("failures") == [],
+          "the unit wrapper did not end with exit code %d and no failures" % wrapper_exit)
     check(isinstance(wrapper.get("unit"), str) and wrapper.get("unit") == envelope.get("unit"),
           "wrapper unit is not the envelope's unit")
-    check(inner.get("mode") == "collect" and inner.get("succeeded") is True,
-          "wrapper inner summary is not a succeeded collect")
+    if partial:
+        check(inner.get("mode") == "collect" and inner.get("succeeded") is False
+              and inner.get("manifest") == {"status": "failed", "exit_code": 3, "failures": [],
+                                            "problems": [PARTIAL_COLLECT_PROBLEM]},
+              "wrapper inner summary is not a partial collect")
+    else:
+        check(inner.get("mode") == "collect" and inner.get("succeeded") is True,
+              "wrapper inner summary is not a succeeded collect")
     check(transport.get("relay_base_url") == f"http://127.0.0.1:{relay.get('port')}",
           "transport relay URL is not the envelope's relay")
     check(isinstance(requests, list) and requests
@@ -290,7 +329,7 @@ def collect_problems(dest: Path, result: dict, host: dict) -> list:
         record = records[0]
         interval = record.get("interval") if isinstance(record.get("interval"), dict) else {}
         count = record.get("request_count")
-        check(record.get("collection_status") == "complete", "collection is not complete")
+        check(record.get("collection_status") in ("complete", "partial"), "collection is not complete")
         check(record.get("repositories_requested") == repositories, "requested repositories differ")
         check(interval.get("start_at") == request.get("start_at") and interval.get("end_at")
               == request.get("end_at"), "collection interval differs from the request")
@@ -1097,7 +1136,9 @@ def main() -> int:
         problems += token_problems(dest, result, "collection-envelope.json", forbid)
         result["problems"] = problems
         print(json.dumps(result))
-        return 0 if not problems else 1
+        if problems:
+            return 1
+        return 0 if result["collection_status"] == "complete" else ISSUE_EXIT_PARTIAL
     if not problems:
         result["files"] = sorted(p.name for p in dest.iterdir())
         manifest = json.loads((dest / "manifest.json").read_text(encoding="utf-8"))
