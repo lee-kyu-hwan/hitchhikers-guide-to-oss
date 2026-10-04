@@ -26,7 +26,12 @@ them is refused. Nothing here opens the network, starts a model, or reads a cred
 Counts follow run_limits.json and are refused, never truncated: at most
 ``max_patterns`` candidates (so at most that many verify calls) and final
 patterns, ``max_rejected`` dropped ideas, and the extract caps per lens result.
-The model calls of one run are therefore at most 5 + 1 + 5 + 1 = 12.
+The model calls of one run are therefore at most
+``shards x lenses + 1 (synthesis) + max_candidates (verify) + 1 (final)``: 12
+for one shard (5 + 1 + 5 + 1), 17 for two. The digest is sharded by
+``oss_workflow.py digest --max-bytes`` so that each lens prompt stays under the
+worker's input limit; every lens runs on every shard, and a prompt over
+PROMPT_MAX_BYTES is refused before anything is written, never cut.
 
 Prompt budget: the final prompt holds the digest, candidates, verify answers
 and a deduplicated quote report, so it is the one most likely to pass 64 KiB.
@@ -69,7 +74,22 @@ MAX_DROPPED = LIMITS["max_rejected"]
 EXTRACT_CAPS = {"patterns": LIMITS["max_patterns"], "observations": LIMITS["max_observations"],
                 "rejected": LIMITS["max_rejected"]}
 EXTRACT_CALLS = 5
-MAX_MODEL_CALLS = EXTRACT_CALLS + 1 + MAX_CANDIDATES + 1
+
+
+def model_call_plan(shards: int, lenses: int, max_candidates: int) -> dict:
+    """The most model calls one run can make, from the corpus-dependent shard count.
+
+    Every lens reads every shard (extract), then one synthesis, at most one verify per
+    candidate, and one final. The limit is recorded in the extract stage's manifest.
+    """
+    total = shards * lenses + 1 + max_candidates + 1
+    return {"shards": shards, "lenses": lenses, "extract": shards * lenses, "synthesis": 1,
+            "verify": max_candidates, "final": 1, "max_model_calls": total,
+            "formula": "%d shards x %d lenses + 1 (synthesis) + %d (verify, at most max_candidates) + 1 (final) = %d"
+                       % (shards, lenses, max_candidates, total)}
+
+
+MAX_MODEL_CALLS = model_call_plan(1, EXTRACT_CALLS, MAX_CANDIDATES)["max_model_calls"]
 # Final-prompt budget (the final prompt is the largest: digest + candidates +
 # verify answers + quote report). Checked at every stage before the next model
 # call; a prompt over PROMPT_MAX_BYTES is refused, never cut.
@@ -80,11 +100,9 @@ FINAL_RESERVE_BYTES = LIMITS["final_dynamic_reserve_bytes"]
 # report; the smallest block a verify answer can leave is about this size.
 VERIFY_FLOOR_BYTES = 512
 
-# Small-run limits from run_limits.json: at most max_per_repository PRs from each
-# source repository and max_prs in all (two sources x 3 = 6). One mixed-repository
-# corpus is analyzed as one digest.
-MAX_PER_REPOSITORY = LIMITS["max_per_repository"]
-MAX_RECORDS = LIMITS["max_prs"]
+# The corpus size is bounded by the request, not by this bundle: each collection run holds at most
+# source.max_per_repository pull requests per repository, so a corpus holds at most that times the
+# repositories of every collection adopted. The digest is sharded to keep each prompt in bounds.
 PROMPT_MAX_BYTES = 64 * 1024
 ANSWER_MAX_BYTES = 256 * 1024
 CORPUS_MAX_BYTES = 4 * 1024 * 1024
@@ -146,24 +164,27 @@ class Context:
         records = self.corpus.get("records") if isinstance(self.corpus, dict) else None
         if not isinstance(records, list) or not records:
             raise StageError("corpus has no records")
+        self.collections = self.state["stages"]["collect"]["generations"][stages["collect"]["generation"] - 1] \
+            .get("details", {}).get("collections")
         self._check_scope(records)
         self.records = records
         self.keymap = read_json(self.digest_dir / "keymap.json", PROMPT_MAX_BYTES, "keymap")
+        self.shards = len(self.keymap["shards"])
         self.references = list(self.request["source"].get("reference_repositories") or [])
 
     def _check_scope(self, records: list) -> None:
-        """The request's caps must fit this bundle, and the corpus must fit the request."""
+        """The corpus must fit the request's own caps (per repository, per collection run)."""
         source = self.request["source"]
         per_repository = source.get("max_per_repository")
         repositories = source.get("repositories") or []
-        if type(per_repository) is not int or per_repository > MAX_PER_REPOSITORY \
-                or per_repository * len(repositories) > MAX_RECORDS:
-            raise StageError("request asks for %r PRs from each of %d repositories; this bundle is sized for at "
-                             "most %d each and %d in all" % (per_repository, len(repositories),
-                                                              MAX_PER_REPOSITORY, MAX_RECORDS))
-        if len(records) > per_repository * len(repositories):
-            raise StageError("corpus has %d records; the request allows at most %d"
-                             % (len(records), per_repository * len(repositories)))
+        if type(per_repository) is not int or per_repository < 1:
+            raise StageError("request max_per_repository must be a positive integer, got %r" % (per_repository,))
+        collections = getattr(self, "collections", None)
+        runs = sum(len(item.get("repositories") or []) for item in collections) if collections else len(repositories)
+        allowed = per_repository * runs
+        if len(records) > allowed:
+            raise StageError("corpus has %d records; the request allows at most %d (%d per repository per collection "
+                             "run, %d repository runs)" % (len(records), allowed, per_repository, runs))
 
     def reference_args(self) -> list[str]:
         args = []
@@ -185,10 +206,14 @@ class Context:
         return rows
 
     def extract_stems(self) -> list[str]:
+        """One extract prompt per lens, and per shard when the digest was sharded (``extract-<lens>-NN``)."""
         stems = sorted(path.stem for path in self.extract_prompts.glob("*.md"))
-        lenses = sorted({EXTRACT_STEM.fullmatch(stem).group(1) for stem in stems if EXTRACT_STEM.fullmatch(stem)})
-        if len(lenses) != len(stems) or lenses != sorted(self.siblings.build_prompts.LENSES):
-            raise StageError("digest must hold one extract prompt per lens (%s)" % ", ".join(sorted(self.siblings.build_prompts.LENSES)))
+        lenses = sorted(self.siblings.build_prompts.LENSES)
+        suffixes = [""] if self.shards == 1 else ["-%02d" % number for number in range(1, self.shards + 1)]
+        expected = sorted("extract-%s%s" % (lens, suffix) for lens in lenses for suffix in suffixes)
+        if stems != expected:
+            raise StageError("digest must hold one extract prompt per lens (%s) and shard (%d)"
+                             % (", ".join(lenses), self.shards))
         return stems
 
 
@@ -383,21 +408,42 @@ def parse_synthesis(context: Context, path: str) -> list[dict]:
 
 
 def cmd_extract_inputs(context: Context, args) -> dict:
+    lenses = len(context.siblings.build_prompts.LENSES)
+    plan = model_call_plan(context.shards, lenses, MAX_CANDIDATES)
+    plan["inputs"] = {"max_candidates": MAX_CANDIDATES, "shards": context.shards, "lenses": lenses}
+    # Every prompt is checked before anything is written: one over the cap refuses the whole stage.
+    texts = {stem: read_bounded(context.extract_prompts / (stem + ".md"), 4 * PROMPT_MAX_BYTES,
+                                "extract prompt").decode("utf-8") for stem in context.extract_stems()}
+    oversize = ["%s is %d bytes" % (stem, len(text.encode("utf-8"))) for stem, text in sorted(texts.items())
+                if len(text.encode("utf-8")) > PROMPT_MAX_BYTES]
+    if oversize:
+        raise StageError("extract prompts over %d bytes, refused before anything is written (lower digest "
+                         "--max-bytes): %s" % (PROMPT_MAX_BYTES, "; ".join(oversize)))
     fixed = len(final_prompt_text(context, [], {}, EMPTY_REPORT).encode("utf-8"))
+    final_budget = {"fixed_bytes": fixed, "reserve_bytes": FINAL_RESERVE_BYTES, "cap": PROMPT_MAX_BYTES,
+                    "note": "the reserve is a policy floor, not a worst-case guarantee"}
     if fixed + FINAL_RESERVE_BYTES > PROMPT_MAX_BYTES:
-        raise budget_refusal("extract-inputs", fixed + FINAL_RESERVE_BYTES,
-                             "fixed part %d + reserve %d for candidates, verify answers and quotes"
-                             % (fixed, FINAL_RESERVE_BYTES))
+        what = ("fixed part %d + reserve %d for candidates, verify answers and quotes"
+                % (fixed, FINAL_RESERVE_BYTES))
+        if context.shards == 1 or not args.allow_final_overflow:
+            error = budget_refusal("extract-inputs", fixed + FINAL_RESERVE_BYTES, what)
+            if context.shards > 1:
+                error = StageError("%s; the digest has %d shards and the final prompt carries all of them. Pass "
+                                   "--allow-final-overflow to write the extract prompts anyway (every prompt is "
+                                   "still checked; synthesis-input and final-input will still refuse an oversize "
+                                   "prompt)" % (error, context.shards))
+            raise error
+        final_budget.update(status="over-cap", note="the final prompt carries the whole sharded digest and cannot "
+                            "fit one call: final-input will refuse (nothing is cut); a final stage for sharded "
+                            "digests is needed before the model run reaches it")
     out = new_directory(args.out)
     written = []
-    for stem in context.extract_stems():
-        text = read_bounded(context.extract_prompts / (stem + ".md"), PROMPT_MAX_BYTES, "extract prompt").decode("utf-8")
+    for stem, text in sorted(texts.items()):
         entry = write_prompt(out / stem, text)
         entry["result_name"] = stem + ".result.json"
         written.append(entry)
-    summary = {"stage": "extract", "calls": written, "max_model_calls": MAX_MODEL_CALLS,
-               "final_budget": {"fixed_bytes": fixed, "reserve_bytes": FINAL_RESERVE_BYTES, "cap": PROMPT_MAX_BYTES,
-                                "note": "the reserve is a policy floor, not a worst-case guarantee"}}
+    summary = {"stage": "extract", "calls": written, "max_model_calls": plan["max_model_calls"], "call_plan": plan,
+               "final_budget": final_budget}
     write_json(out / "stage.json", summary)
     return summary
 
@@ -683,7 +729,11 @@ def build_parser() -> argparse.ArgumentParser:
         sub.add_argument("--skills-root")
         return sub
 
-    command("extract-inputs").add_argument("--out", required=True)
+    extract = command("extract-inputs")
+    extract.add_argument("--out", required=True)
+    extract.add_argument("--allow-final-overflow", action="store_true",
+                         help="sharded digest only: write the extract prompts although the final prompt "
+                              "(which carries every shard) cannot fit one call")
     synthesis = command("synthesis-input")
     synthesis.add_argument("--extract-result", action="append", required=True)
     synthesis.add_argument("--out", required=True)

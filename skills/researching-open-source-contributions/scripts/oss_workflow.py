@@ -82,6 +82,16 @@ USABLE = {
 }
 ACTIONABLE_STATUSES = ("reproduced", "issue-ready", "pr-ready", "private-report-ready")
 DECISIVE_NON_ACTIONABLE = ("duplicate", "not-applicable", "stale")
+# One lens prompt is the analyzer's instructions around one digest shard. A worker takes a prompt of at
+# most 65,536 bytes, so the target leaves room under it, and the digest shard size is the target minus a
+# reserve for those instructions (measured 4,193 bytes around a shard of a four-repository corpus; the
+# reserve also covers a longer repository list). The analyzer's own default (160,000) is for readers
+# without that limit and never fits one worker call.
+DIGEST_PROMPT_TARGET_BYTES = 60_000
+DIGEST_PROMPT_RESERVE_BYTES = 6_000
+DIGEST_MAX_BYTES = DIGEST_PROMPT_TARGET_BYTES - DIGEST_PROMPT_RESERVE_BYTES
+OUTCOME_KINDS = ("merged", "closed-unmerged")
+COLLECTOR_WINDOW_DAYS = 31
 REPOSITORY = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9_.-]+")
 TIMESTAMP = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z")
 RUN_MARKER = "workflow-run.json"
@@ -338,8 +348,9 @@ def validate_request(request: object) -> List[str]:
                         errors.append("source.interval values must be YYYY-MM-DDTHH:MM:SSZ")
                     elif start >= end:
                         errors.append("source.interval must end after it starts")
-                if source["outcome"] not in ("all", "merged", "closed-unmerged"):
-                    errors.append("source.outcome must be all, merged, or closed-unmerged")
+                if request_outcomes(source["outcome"]) is None:
+                    errors.append("source.outcome must be all, merged, closed-unmerged, or the list "
+                                  "[\"merged\", \"closed-unmerged\"]")
                 _positive_int(source["max_per_repository"], "source.max_per_repository", errors)
                 _positive_int(source["request_budget"], "source.request_budget", errors)
                 references = source["reference_repositories"]
@@ -700,6 +711,28 @@ def _require_target(request: dict, command: str) -> dict:
     return request["target"]
 
 
+def request_outcomes(outcome: object) -> Optional[Tuple[str, ...]]:
+    """The outcomes a request names: one of all/merged/closed-unmerged, or the list of both kinds.
+
+    ``all`` stays one collector mode (both kinds in one run). The list form is for a
+    request whose collections are made per outcome, one run for each kind.
+    """
+    if isinstance(outcome, str):
+        return (outcome,) if outcome in ("all",) + OUTCOME_KINDS else None
+    if (isinstance(outcome, list) and len(outcome) == 2 and all(isinstance(item, str) for item in outcome)
+            and sorted(outcome) == sorted(OUTCOME_KINDS)):
+        return tuple(outcome)
+    return None
+
+
+def outcome_label(outcome: object) -> str:
+    return outcome if isinstance(outcome, str) else " + ".join(str(item) for item in outcome)
+
+
+def format_utc(moment: datetime) -> str:
+    return moment.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
 def _same_int(value: object, expected: int) -> bool:
     """Exact integer equality: a JSON boolean never stands in for a number."""
     return type(value) is int and value == expected
@@ -807,10 +840,20 @@ def _collection_scope_errors(request: dict, record: dict, repositories: Optional
         errors.append("manifest repositories_requested %r differ from %s" % (
             requested, "source.repositories" if repositories is None else "the collection's repositories"))
     interval = record.get("interval") if isinstance(record.get("interval"), dict) else {}
-    if (interval.get("start_at"), interval.get("end_at")) != (source["interval"]["start_at"], source["interval"]["end_at"]):
-        errors.append("manifest interval %r differs from source.interval" % ((interval.get("start_at"), interval.get("end_at")),))
-    if record.get("outcome") != source["outcome"]:
-        errors.append("manifest outcome differs from source.outcome")
+    if repositories is None:
+        if (interval.get("start_at"), interval.get("end_at")) != (source["interval"]["start_at"], source["interval"]["end_at"]):
+            errors.append("manifest interval %r differs from source.interval" % ((interval.get("start_at"), interval.get("end_at")),))
+        if record.get("outcome") != source["outcome"]:
+            errors.append("manifest outcome differs from source.outcome")
+    else:
+        # One of several collections: its window lies inside the request's interval (the whole set is
+        # checked to tile it), and its outcome is one the request names.
+        start, end = parse_utc(interval.get("start_at")), parse_utc(interval.get("end_at"))
+        if (start is None or end is None or start >= end or start < parse_utc(source["interval"]["start_at"])
+                or end > parse_utc(source["interval"]["end_at"])):
+            errors.append("manifest interval %r is outside source.interval" % ((interval.get("start_at"), interval.get("end_at")),))
+        if record.get("outcome") not in request_outcomes(source["outcome"]):
+            errors.append("manifest outcome %r is not in source.outcome %r" % (record.get("outcome"), source["outcome"]))
     if record.get("max_per_repository") != source["max_per_repository"]:
         errors.append("manifest max_per_repository differs from source.max_per_repository")
     if record.get("request_budget") != source["request_budget"]:
@@ -981,12 +1024,18 @@ def _bundle_scope(request: dict, siblings: Siblings, index: int, corpus: object,
         return [label + ": manifest repositories_requested must list the repositories collected"], {}
     repositories = sorted(requested, key=str.lower)
     lowered = {item.lower() for item in repositories}
+    interval = latest.get("interval") if isinstance(latest.get("interval"), dict) else {}
     for position, record in enumerate(records):
         if not isinstance(record, dict):
             errors.append("%s: manifest record %d is not an object" % (label, position))
             continue
         errors.extend("%s: record %d: %s" % (label, position, error)
                       for error in _collection_scope_errors(request, record, repositories))
+        same_window = record.get("interval") if isinstance(record.get("interval"), dict) else {}
+        if (same_window.get("start_at"), same_window.get("end_at")) != (interval.get("start_at"), interval.get("end_at")):
+            errors.append("%s: record %d: interval differs from the collection's" % (label, position))
+        if record.get("outcome") != latest.get("outcome"):
+            errors.append("%s: record %d: outcome differs from the collection's" % (label, position))
     allowed = {item.lower() for item in request["source"]["repositories"]}
     outside = sorted(item for item in repositories if item.lower() not in allowed)
     if outside:
@@ -1007,11 +1056,20 @@ def _bundle_scope(request: dict, siblings: Siblings, index: int, corpus: object,
         if record.get("analysis_history"):
             errors.append("%s: corpus record carries analysis_history; adopt fresh collections only" % label)
         pull = record.get("pull_request") if isinstance(record.get("pull_request"), dict) else {}
+        # A record keeps its own outcome in normalized_state; it must not contradict its collection's.
+        wanted = {"merged": ("merged",), "closed-unmerged": ("closed-unmerged",),
+                  "all": OUTCOME_KINDS}.get(latest.get("outcome") if isinstance(latest.get("outcome"), str) else "")
+        if wanted and pull.get("normalized_state") in OUTCOME_KINDS and pull["normalized_state"] not in wanted:
+            errors.append("%s: corpus record state %s does not fit its collection's outcome %s"
+                          % (label, pull["normalized_state"], latest["outcome"]))
         identity = record.get("pull_request_node_id") if isinstance(record.get("pull_request_node_id"), str) else pull.get("url")
         if isinstance(identity, str) and identity:
             identities.append(identity)
     run_ids = [item["run_id"] for item in records if isinstance(item, dict) and isinstance(item.get("run_id"), str)]
     return errors, {"index": index, "repositories": repositories, "latest": latest, "records": records,
+                    "interval": {"start_at": interval.get("start_at"), "end_at": interval.get("end_at")},
+                    "window": (parse_utc(interval.get("start_at")), parse_utc(interval.get("end_at"))),
+                    "outcome": latest.get("outcome"),
                     "corpus_records": corpus_records, "records_by_repository": counts, "identities": identities,
                     "run_ids": run_ids}
 
@@ -1019,16 +1077,40 @@ def _bundle_scope(request: dict, siblings: Siblings, index: int, corpus: object,
 def _collections_cross_errors(request: dict, bundles: List[dict]) -> List[str]:
     """What only the whole set shows: coverage, overlap, repeated pull requests and runs, a single filter."""
     errors: List[str] = []
-    owner: Dict[str, int] = {}
+    source = request["source"]
+    windows: Dict[Tuple[str, str], List[tuple]] = {}
     for bundle in bundles:
+        start, end = bundle["window"]
+        if start is None or end is None:
+            continue  # its own scope check already refused the interval
         for repository in bundle["repositories"]:
-            if repository.lower() in owner:
-                errors.append("repository %s is in more than one collection (%d and %d)"
-                              % (repository, owner[repository.lower()], bundle["index"]))
-            owner.setdefault(repository.lower(), bundle["index"])
-    missing = [item for item in request["source"]["repositories"] if item.lower() not in owner]
+            windows.setdefault((repository.lower(), bundle["outcome"]), []).append((start, end, bundle["index"]))
+    covered = {repository for repository, _ in windows}
+    missing = [item for item in source["repositories"] if item.lower() not in covered]
     if missing:
         errors.append("source.repositories not covered by any collection: " + ", ".join(missing))
+    request_start, request_end = parse_utc(source["interval"]["start_at"]), parse_utc(source["interval"]["end_at"])
+    for repository in source["repositories"]:
+        if repository.lower() not in covered:
+            continue
+        for outcome in request_outcomes(source["outcome"]):
+            spans = sorted(windows.get((repository.lower(), outcome), []))
+            if not spans:
+                errors.append("repository %s is not covered for outcome %s by any collection" % (repository, outcome))
+                continue
+            position, last = request_start, None
+            for start, end, index in spans:
+                if start < position and last is not None:
+                    errors.append("repository %s is in more than one collection for outcome %s over overlapping "
+                                  "intervals (%d and %d)" % (repository, outcome, last, index))
+                elif start > position:
+                    errors.append("repository %s outcome %s: interval not covered from %s to %s"
+                                  % (repository, outcome, format_utc(position), format_utc(start)))
+                if end > position:
+                    position, last = end, index
+            if position < request_end:
+                errors.append("repository %s outcome %s: interval not covered from %s to %s"
+                              % (repository, outcome, format_utc(position), format_utc(request_end)))
     for key, noun in (("identities", "pull request"), ("run_ids", "run_id")):
         seen: Dict[str, int] = {}
         for bundle in bundles:
@@ -1121,6 +1203,11 @@ def _adopt_collections(args, siblings: Siblings, request: dict, state: dict, run
 
         states, capped, reasons, collections, ledger = {}, set(), [], [], []
         overall = "complete"
+        # Windows and outcomes are shown only when the set is not just one interval and outcome per repository.
+        source_interval = request["source"]["interval"]
+        periodic = isinstance(request["source"]["outcome"], list) or any(
+            (b["interval"]["start_at"], b["interval"]["end_at"]) != (source_interval["start_at"], source_interval["end_at"])
+            for b in bundles)
         for bundle in bundles:
             where = "collection %d (%s)" % (bundle["index"], ", ".join(bundle["repositories"]))
             status, why, per_repository, over_cap = _recent_collection_status(
@@ -1143,6 +1230,8 @@ def _adopt_collections(args, siblings: Siblings, request: dict, state: dict, run
                 "request_count": sum(item["request_count"] for item in bundle["records"]),
                 "request_budget": bundle["latest"]["request_budget"],
             })
+            if periodic:
+                collections[-1].update(interval=bundle["interval"], outcome=bundle["outcome"])
         merged_manifest = {
             "schema_version": "2.0.0", "generated_by": bundles[0]["manifest"].get("generated_by"),
             "records": [record for bundle in bundles for record in bundle["records"]],
@@ -1181,7 +1270,10 @@ def cmd_digest(args, siblings: Siblings, request: dict, state: dict, run: Run) -
     revisions = siblings.revisions()
     corpus = gen_dir(run, "collect", collect) / "corpus.json"
     inputs = {"corpus": {"sha256": collect["outputs"]["corpus.json"], "source_path": "stages/collect/gen-%03d/corpus.json" % collect["generation"]}}
-    reused = reuse_if_same(run, state, "digest", {"corpus": inputs["corpus"]["sha256"]}, revisions)
+    max_bytes = DIGEST_MAX_BYTES if args.max_bytes is None else args.max_bytes
+    # The shard size changes the digest, so it is an input: another size is never a reuse.
+    inputs["max_bytes"] = {"sha256": sha256_bytes(str(max_bytes).encode("ascii")), "source_path": "--max-bytes %d" % max_bytes}
+    reused = reuse_if_same(run, state, "digest", {k: v["sha256"] for k, v in inputs.items()}, revisions)
     if reused is not None:
         event(state, "digest", "reused", "gen-%03d" % reused["generation"])
         return reused
@@ -1190,15 +1282,26 @@ def cmd_digest(args, siblings: Siblings, request: dict, state: dict, run: Run) -
         references += ["--reference-repo", repository]
     incoming = run.incoming("digest", state)
     try:
-        code, _, stderr = run_main(siblings.build_digest.main, [str(corpus), "--out", str(incoming / "extraction")] + references)
+        code, _, stderr = run_main(siblings.build_digest.main, [str(corpus), "--out", str(incoming / "extraction"),
+                                                                 "--max-bytes", str(max_bytes)] + references)
         if code != 0:
             raise WorkflowError("build_digest failed: " + stderr.strip())
         code, _, stderr = run_main(siblings.build_prompts.main, ["extract", "--digest-dir", str(incoming / "extraction"), "--out", str(incoming / "extract")])
         if code != 0:
             raise WorkflowError("build_prompts extract failed: " + stderr.strip())
-        prompts = sorted(p.name for p in (incoming / "extract" / "prompts").glob("*.md"))
-        generation = {"status": "complete", "reasons": [], "inputs": inputs, "tool_revisions": revisions,
-                      "details": {"prompts": prompts, "reference_repositories": list(request["source"]["reference_repositories"])}}
+        prompt_files = sorted((incoming / "extract" / "prompts").glob("*.md"))
+        prompts = [p.name for p in prompt_files]
+        prompt_bytes = {p.name: p.stat().st_size for p in prompt_files}
+        largest = max(prompt_bytes.values()) if prompt_bytes else 0
+        keymap = read_json_bytes((incoming / "extraction" / "keymap.json").read_bytes(), "digest keymap")
+        reasons = []
+        if largest > DIGEST_PROMPT_TARGET_BYTES:
+            reasons.append("largest lens prompt is %d bytes, over the %d byte target (a worker takes at most 65536)"
+                           % (largest, DIGEST_PROMPT_TARGET_BYTES))
+        generation = {"status": "complete", "reasons": reasons, "inputs": inputs, "tool_revisions": revisions,
+                      "details": {"prompts": prompts, "reference_repositories": list(request["source"]["reference_repositories"]),
+                                  "max_bytes": max_bytes, "shards": len(keymap["shards"]),
+                                  "prompt_bytes": prompt_bytes, "largest_prompt_bytes": largest}}
         commit(run, state, "digest", incoming, generation, True)
         incoming = None
         event(state, "digest", "complete", "gen-%03d prompts=%d" % (generation["generation"], len(prompts)))
@@ -1593,12 +1696,19 @@ def next_steps(run: Run, request: dict, state: dict) -> List[dict]:
         for repository in source["repositories"]:
             argv += ["--repo", repository]
         argv += ["--start-at", source["interval"]["start_at"], "--end-at", source["interval"]["end_at"],
-                 "--outcome", source["outcome"], "--max-per-repo", str(source["max_per_repository"]),
+                 "--outcome", source["outcome"] if isinstance(source["outcome"], str) else "<merged|closed-unmerged>",
+                 "--max-per-repo", str(source["max_per_repository"]),
                  "--request-budget", str(source["request_budget"]),
                  "--output", "<ISOLATED_OUTPUT>/corpus.json", "--manifest", "<ISOLATED_OUTPUT>/manifest.json",
                  "--markdown-output", "<ISOLATED_OUTPUT>/inventory.md"]
+        start, end = parse_utc(source["interval"]["start_at"]), parse_utc(source["interval"]["end_at"])
+        then = "adopt-collection --corpus ... --manifest ... (or adopt an existing corpus explicitly)"
+        if isinstance(source["outcome"], list) or (end - start).days > COLLECTOR_WINDOW_DAYS:
+            then = ("one run per repository, outcome and window of at most %d days (the collector's limit), then "
+                    "adopt-collection with --corpus ... --manifest ... repeated once per run; the runs must tile "
+                    "source.interval for each repository and outcome" % COLLECTOR_WINDOW_DAYS)
         return [{"stage": "collect", "kind": "external-network-step", "executed": False, "argv": argv, "note": plan_note,
-                 "then": "adopt-collection --corpus ... --manifest ... (or adopt an existing corpus explicitly)"}]
+                 "then": then}]
     analysis = active(state, "analysis")
     if analysis is None and active(state, "digest") is None:
         return [{"stage": "digest", "kind": "local", "executed": False, "command": "digest"}]
@@ -1736,7 +1846,7 @@ def render_report(run: Run, request: dict, state: dict) -> str:
         lines.append("| Source repositories | %s |" % ", ".join("`%s`" % r for r in source["repositories"]))
     if source["kind"] == "recent-closed-prs":
         lines += ["| Interval (UTC) | %s → %s |" % (source["interval"]["start_at"], source["interval"]["end_at"]),
-                  "| Outcome / cap per repository | %s / %d |" % (source["outcome"], source["max_per_repository"]),
+                  "| Outcome / cap per repository | %s / %d |" % (outcome_label(source["outcome"]), source["max_per_repository"]),
                   "| Reference repositories | %s |" % (", ".join(source["reference_repositories"]) or "none")]
     if target is None:
         lines += ["| Target repositories | unspecified (candidate verification skipped) |",
@@ -1758,14 +1868,19 @@ def render_report(run: Run, request: dict, state: dict) -> str:
         lines += ["", "Blocked: modified checkpoint outputs %s" % json.dumps(status["integrity_failures"], sort_keys=True)]
     collections = status["stages"]["collect"].get("collections")
     if collections:
+        windowed = any("interval" in item for item in collections)
         lines += ["", "## Collections", "",
                   "The collect stage was adopted from %d collections (%d records)."
                   % (len(collections), sum(item["records"] for item in collections)), "",
-                  "| # | Repositories | Records | Run | Requests / budget | Status |", "| --- | --- | --- | --- | --- | --- |"]
+                  "| # | Repositories | " + ("Interval (UTC) | Outcome | " if windowed else "")
+                  + "Records | Run | Requests / budget | Status |",
+                  "| --- | --- | " + ("--- | --- | " if windowed else "") + "--- | --- | --- | --- |"]
         for item in collections:
             by_repository = ", ".join("`%s` %d" % (name, count) for name, count in sorted(item["records_by_repository"].items()))
-            lines.append("| %d | %s | %s | %s | %d / %d | %s |" % (
-                item["index"], ", ".join("`%s`" % r for r in item["repositories"]), by_repository or "0",
+            window = ("%s → %s | %s | " % (item["interval"]["start_at"], item["interval"]["end_at"], item["outcome"])
+                      if windowed else "")
+            lines.append("| %d | %s | %s%s | %s | %d / %d | %s |" % (
+                item["index"], ", ".join("`%s`" % r for r in item["repositories"]), window, by_repository or "0",
                 ", ".join("`%s`" % r for r in item["run_ids"]), item["request_count"], item["request_budget"], item["status"]))
         lines.append("")
         lines.append("Requests across the collections: %d of a summed per-run budget of %d."
@@ -1866,6 +1981,16 @@ def _case_section(run: Run, state: dict) -> List[str]:
 # ---------------------------------------------------------------------------
 
 
+def _positive_option(value: str) -> int:
+    try:
+        number = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError("must be a positive integer: %r" % value)
+    if number <= 0:
+        raise argparse.ArgumentTypeError("must be a positive integer: %r" % value)
+    return number
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
     parser.add_argument("--print-revision", action="store_true")
@@ -1884,7 +2009,10 @@ def build_parser() -> argparse.ArgumentParser:
     adopt.add_argument("--manifest", required=True, action="append")
     adopt.add_argument("--inventory", action="append", default=[])
     adopt.add_argument("--replace", action="store_true")
-    command("digest")
+    digest = command("digest")
+    digest.add_argument("--max-bytes", type=_positive_option, default=None,
+                        help="largest digest shard in bytes (default %d, so one lens prompt stays under %d)"
+                        % (DIGEST_MAX_BYTES, DIGEST_PROMPT_TARGET_BYTES))
     analysis = command("adopt-analysis")
     analysis.add_argument("--analysis", required=True)
     analysis.add_argument("--extraction-result", action="append", default=[])

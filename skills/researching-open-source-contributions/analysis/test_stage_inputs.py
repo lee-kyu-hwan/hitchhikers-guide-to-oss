@@ -579,7 +579,7 @@ class MixedSourceTargetTests(unittest.TestCase):
         repositories = sorted({record["repository"]["full_name"] for record in records})
         self.assertEqual(repositories, sorted([fx.REPO, OTHER]))
         self.assertGreater(len(records), 3)  # the old single-repository cap of 3 would refuse this corpus
-        self.assertLessEqual(len(records), stage_inputs.MAX_RECORDS)
+        self.assertLessEqual(len(records), 2 * self.context.request["source"]["max_per_repository"])
         self.assertEqual(len(self.context.keymap["shards"]), 1)
         self.assertEqual(len(self.context.extract_stems()), 5)
 
@@ -600,16 +600,138 @@ class MixedSourceTargetTests(unittest.TestCase):
         self.assertEqual(status["outcome"], "insufficient")
         self.assertEqual(status["next"], [])
 
-    def test_a_request_over_the_bundle_caps_is_refused(self):
+    def test_the_caps_come_from_the_request_not_from_the_bundle(self):
         request = json.loads((Path(self.run) / "request.json").read_text(encoding="utf-8"))
-        for per_repository, repositories in ((4, [fx.REPO]), (3, [fx.REPO, OTHER, "synth-fixture-org/third"])):
-            with self.subTest(per_repository=per_repository, repositories=len(repositories)):
-                changed = json.loads(json.dumps(request))
-                changed["source"].update(max_per_repository=per_repository, repositories=repositories)
-                context = stage_inputs.Context.__new__(stage_inputs.Context)
-                context.request = changed
-                with self.assertRaises(stage_inputs.StageError):
-                    stage_inputs.Context._check_scope(context, self.context.records)
+
+        def check(per_repository=3, repositories=(fx.REPO,), collections=None):
+            changed = json.loads(json.dumps(request))
+            changed["source"].update(max_per_repository=per_repository, repositories=list(repositories))
+            context = stage_inputs.Context.__new__(stage_inputs.Context)
+            context.request, context.collections = changed, collections
+            stage_inputs.Context._check_scope(context, self.context.records)
+
+        count = len(self.context.records)
+        two = [fx.REPO, OTHER]
+        # A corpus fits a request that allows it, however large the request's caps are.
+        check(per_repository=count, repositories=[fx.REPO])
+        check(per_repository=count // 2, repositories=two)
+        check(per_repository=50, repositories=two + ["synth-fixture-org/third"])
+        # A corpus beyond what the request allows is refused, and so is a cap that is not a positive integer.
+        with self.assertRaises(stage_inputs.StageError):
+            check(per_repository=1, repositories=two)
+        for bad in (0, -1, True, "3", None):
+            with self.subTest(bad=bad), self.assertRaises(stage_inputs.StageError):
+                check(per_repository=bad, repositories=two)
+        # Several collection runs add up: two runs over both repositories allow twice the cap per repository.
+        check(per_repository=1, repositories=two, collections=[{"repositories": two}] * 2)
+        with self.assertRaises(stage_inputs.StageError):
+            check(per_repository=1, repositories=two, collections=[{"repositories": two}])
+
+
+def make_run(test, root: Path, digest_args=()) -> str:
+    paths = collect(root / "collected")
+    request = fx.base_request(target=None)
+    request["source"].update(max_per_repository=3, request_budget=60)
+    request["budget"]["total_api_requests"] = 60
+    (root / "request.json").write_text(json.dumps(request), encoding="utf-8")
+    run = str(root / "run")
+    for argv in (("init", "--request", str(root / "request.json")),
+                 ("adopt-collection", "--corpus", str(paths["corpus"]), "--manifest", str(paths["manifest"]),
+                  "--inventory", str(paths["inventory"])),
+                 ("digest", *digest_args)):
+        code, _, stderr = workflow(argv[0], "--run-dir", run, *argv[1:])
+        test.assertEqual(code, 0, stderr)
+    return run
+
+
+class ShardedRunTests(unittest.TestCase):
+    """The fixture digest is about 1,700 bytes in two sections: --max-bytes 1200 makes two shards."""
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
+
+    def sharded(self):
+        return make_run(self, self.root, ("--max-bytes", "1200"))
+
+    def test_the_call_limit_is_shards_times_lenses_plus_synthesis_verify_and_final(self):
+        self.assertEqual(12, stage_inputs.MAX_MODEL_CALLS)
+        self.assertEqual({"shards": 1, "lenses": 5, "extract": 5, "synthesis": 1, "verify": 5, "final": 1,
+                          "max_model_calls": 12}, {k: v for k, v in stage_inputs.model_call_plan(1, 5, 5).items()
+                                                   if k != "formula"})
+        self.assertEqual(17, stage_inputs.model_call_plan(2, 5, 5)["max_model_calls"])
+        self.assertEqual(15, stage_inputs.model_call_plan(2, 5, 3)["max_model_calls"])
+        plan = stage_inputs.model_call_plan(2, 5, 3)
+        self.assertEqual("2 shards x 5 lenses + 1 (synthesis) + 3 (verify, at most max_candidates) + 1 (final) = 15",
+                         plan["formula"])
+
+    def test_a_single_shard_run_records_the_twelve_call_plan(self):
+        run = make_run(self, self.root)
+        code, summary, stderr = stage("extract-inputs", "--run-dir", run, "--out", str(self.root / "x"))
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(12, summary["max_model_calls"])
+        self.assertEqual(5, len(summary["calls"]))
+        self.assertEqual(1, summary["call_plan"]["shards"])
+        self.assertEqual(summary, json.loads((self.root / "x" / "stage.json").read_text(encoding="utf-8")))
+
+    def test_a_sharded_run_gets_one_prompt_per_shard_and_lens_and_a_larger_limit(self):
+        code, summary, stderr = stage("extract-inputs", "--run-dir", self.sharded(), "--out", str(self.root / "x"))
+        self.assertEqual(code, 0, stderr)
+        names = sorted(call["input_dir"] for call in summary["calls"])
+        self.assertEqual(sorted("extract-%s-%02d" % (lens, n) for lens in LENSES for n in (1, 2)), names)
+        self.assertEqual(17, summary["max_model_calls"])
+        self.assertEqual({"shards": 2, "lenses": 5, "extract": 10, "synthesis": 1, "verify": 5, "final": 1,
+                          "max_model_calls": 17}, {k: v for k, v in summary["call_plan"].items() if k != "formula"
+                                                   and k != "inputs"})
+        self.assertEqual({"max_candidates": 5, "shards": 2, "lenses": 5}, summary["call_plan"]["inputs"])
+        for call in summary["calls"]:
+            self.assertLessEqual(call["bytes"], stage_inputs.PROMPT_MAX_BYTES)
+            self.assertEqual("%s.result.json" % call["input_dir"], call["result_name"])
+
+    def test_every_extract_result_of_a_sharded_run_is_taken_by_the_synthesis_input(self):
+        run = self.sharded()
+        self.assertEqual(0, stage("extract-inputs", "--run-dir", run, "--out", str(self.root / "x"))[0])
+        answers = self.root / "answers"
+        answers.mkdir()
+        args = []
+        for lens in LENSES:
+            for n in (1, 2):
+                path = answers / ("extract-%s-%02d.result.json" % (lens, n))
+                path.write_text(json.dumps({"lens": lens, "patterns": [], "observations": [], "rejected": []}))
+                args += ["--extract-result", str(path)]
+        code, summary, stderr = stage("synthesis-input", "--run-dir", run, *args, "--out", str(self.root / "s"))
+        self.assertEqual(code, 0, stderr)
+        missing = args[2:]
+        self.assertEqual(2, stage("synthesis-input", "--run-dir", run, *missing, "--out", str(self.root / "s2"))[0])
+
+    def test_a_prompt_over_the_cap_refuses_the_stage_before_anything_is_written(self):
+        run = self.sharded()
+        with mock.patch.object(stage_inputs, "PROMPT_MAX_BYTES", 5000):
+            code, _, stderr = stage("extract-inputs", "--run-dir", run, "--out", str(self.root / "x"))
+        self.assertEqual(2, code)
+        self.assertIn("5000", stderr)
+        self.assertFalse((self.root / "x").exists())
+
+    def test_a_final_prompt_that_cannot_fit_refuses_extract_inputs_unless_it_is_acknowledged(self):
+        # The final prompt carries the whole digest; the reserve is stood in with a huge one.
+        with mock.patch.object(stage_inputs, "FINAL_RESERVE_BYTES", 70000):
+            code, _, stderr = stage("extract-inputs", "--run-dir", make_run(self, self.root), "--out", str(self.root / "a"))
+            self.assertEqual(2, code)
+            self.assertNotIn("--allow-final-overflow", stderr)  # one shard: no flag changes the refusal
+            sharded_root = Path(tempfile.mkdtemp())
+            self.addCleanup(shutil.rmtree, sharded_root, ignore_errors=True)
+            run = make_run(self, sharded_root, ("--max-bytes", "1200"))
+            code, _, stderr = stage("extract-inputs", "--run-dir", run, "--out", str(sharded_root / "a"))
+            self.assertEqual(2, code)
+            self.assertIn("--allow-final-overflow", stderr)
+            self.assertFalse((sharded_root / "a").exists())
+            code, summary, stderr = stage("extract-inputs", "--run-dir", run, "--allow-final-overflow",
+                                          "--out", str(sharded_root / "b"))
+            self.assertEqual(code, 0, stderr)
+            self.assertEqual("over-cap", summary["final_budget"]["status"])
+            self.assertIn("final-input will refuse", summary["final_budget"]["note"])
+            for call in summary["calls"]:
+                self.assertLessEqual(call["bytes"], stage_inputs.PROMPT_MAX_BYTES)
 
 
 if __name__ == "__main__":

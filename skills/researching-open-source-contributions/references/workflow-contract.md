@@ -12,7 +12,7 @@ A request is one JSON object with exactly these keys. Unknown keys are rejected.
     "kind": "recent-closed-prs",
     "repositories": ["owner/name"],
     "interval": {"start_at": "2026-09-01T00:00:00Z", "end_at": "2026-09-08T00:00:00Z"},
-    "outcome": "all | merged | closed-unmerged",
+    "outcome": "all | merged | closed-unmerged | [\"merged\", \"closed-unmerged\"]",
     "max_per_repository": 5,
     "request_budget": 200,
     "reference_repositories": []
@@ -130,25 +130,45 @@ revisions, and, for AI stages, the claimed provenance.
    `content_path` is chosen by result data, it must resolve to a regular file
    inside the evidence JSON's own directory; `..`, symlinks, other absolute
    paths, and URLs are rejected before any byte is read.
-6. Several collections of one request. One isolated collection entry covers one
-   repository, so `adopt-collection` takes `--corpus C --manifest M
+6. Several collections of one request. One isolated collection entry covers
+   one repository, one outcome and a window of at most 31 days (the collector's
+   limit), so a request over several repositories or a longer period arrives as
+   several collections. `adopt-collection` takes `--corpus C --manifest M
    [--inventory I]` once per collection, repeated, in the order to merge them.
    Corpus and manifest pair up by position; inventories are given for every
-   collection or for none. One collection behaves exactly as above. Several are
+   collection or for none. One collection behaves exactly as above (it must be
+   the request's whole interval and outcome and every repository). Several are
    adopted as one corpus only when all of these hold, and any failure is a
    `scope-conflict` that changes nothing:
-   - every manifest is a v2 manifest of the `recent-closed-prs` source; in every
-     run record the interval, `outcome`, `max_per_repository` and per-run
+   - `source.interval` is the whole period. Every manifest is a v2 manifest of
+     the `recent-closed-prs` source whose runs all name the same repositories,
+     window and outcome; the window lies inside `source.interval`, the outcome
+     is one the request names, `max_per_repository` and the per-run
      `request_budget` equal the request's, `request_count` is within that
-     budget, and `docs_only` is the same value in every run of every collection;
-   - the records of one manifest name the same repositories, those repositories
-     are in `source.repositories`, and every corpus record comes from one of
-     them;
-   - the collections cover `source.repositories` exactly: a repository no
-     collection covers is refused, not adopted as partial, because the report
-     states the request's repositories as its scope and a collection that was
-     never made must not read as complete (collect it, or write a request that
-     names only what was collected); a repository in two collections is refused;
+     budget, and `docs_only` is the same value in every run of every
+     collection;
+   - `source.outcome` is `all`, `merged`, `closed-unmerged`, or the list
+     `["merged", "closed-unmerged"]`. The list form was chosen over redefining
+     `all` because `all` is already one collector mode (both kinds in a single
+     run) and its meaning must not move; the list says the request is made of
+     one collection per kind. A manifest outcome must be one of the request's
+     (`all` does not stand in for the list), and the list form needs a cover
+     for each kind;
+   - for each repository of `source.repositories` and each outcome of the
+     request, the windows of the collections that name them tile
+     `source.interval`: the first starts at its start, each next one starts
+     where the previous ended (the end is exclusive), and the last ends at its
+     end (it may be shorter than 31 days). A gap or an overlap is refused: a
+     period nobody collected must not read as complete, and a period collected
+     twice would count a pull request twice. A repository no collection names
+     is refused, never adopted as partial, because the report states the
+     request's repositories as its scope (collect it, or write a request that
+     names only what was collected). The same repository in several
+     collections is allowed exactly when their windows differ;
+   - every corpus record comes from its own collection's repositories and its
+     `pull_request.normalized_state` (`merged` or `closed-unmerged`, the
+     record's own outcome, which the merge keeps) does not contradict that
+     collection's outcome;
    - no pull request (node id, else URL) and no `run_id` appears in two
      collections, and the collectors that produced them are the same;
    - a corpus record carries no `analysis_history`: only fresh collections merge;
@@ -164,13 +184,30 @@ revisions, and, for AI stages, the claimed provenance.
    count and the per-run budgets summed, and the `pr_id` mapping. The checkpoint
    records each file's SHA-256 under `corpus-NN`, `manifest-NN` and
    `inventory-NN` in the order given, so another order is a different input and
-   needs `--replace`. Its status is the worst of the collections (`complete`,
-   `partial`, `failed`), with a reason per collection that is not complete. Every
+   needs `--replace`. When the set is made of windows or of the two outcomes,
+   every collection also records its interval and outcome. Its status is the
+   worst of the collections (`complete`, `partial`, `failed`), with a reason per collection that is not complete. Every
    run record of every collection enters the ledger once, so `--replace`,
    revision drift and the budget (`budget.total_api_requests` against the summed
    requests) work as for one collection. `status` and `report` show the number
    of collections, the records per repository and the requests per run. `digest`
    and the analyzer see the merged corpus only.
+
+## Digest shard size
+
+`digest [--max-bytes N]` passes N to the analyzer's digest builder: the largest
+digest shard one worker reads. A lens prompt is the analyzer's instructions around
+one shard, and a worker takes a prompt of at most 65,536 bytes, so the default is
+`DIGEST_PROMPT_TARGET_BYTES` (60,000, a lens prompt's target) minus
+`DIGEST_PROMPT_RESERVE_BYTES` (6,000, for the instructions, measured at 4,193
+bytes around a shard of a four-repository corpus, and a longer repository list):
+54,000. The analyzer's own default (160,000) is for readers without that limit.
+A corpus over one shard becomes several shards, each lens runs on every shard, and
+no pull request is dropped (a pull request section larger than N is refused by the
+analyzer). The shard size is an input of the digest checkpoint, so another size is
+never a reuse, and the checkpoint records the size, the shard count, every prompt's
+bytes and the largest one; a largest prompt over the target is listed in the
+checkpoint's reasons and not hidden.
 
 ## Budget ledger
 

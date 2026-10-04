@@ -584,3 +584,39 @@ def derive_bundle(source_paths, directory, repository, tag):
         paths[name] = directory / filename
         paths[name].write_text(text, encoding="utf-8")
     return paths
+
+
+def derive_window(source_paths, directory, tag, *, repository=REPO, interval=None, outcome=None, keep=None, shift=0):
+    """A collection of one window and outcome, re-labelled from a collector run.
+
+    ``keep`` lists the corpus record positions this window holds (the fixture run
+    holds two pull requests), ``interval`` is (start_at, end_at), and a
+    closed-unmerged outcome turns the kept records into closed-unmerged pull
+    requests. Node ids, run ids and fingerprints are new, so windows of one
+    repository never share a pull request or a run. ``shift`` adds to every pull request
+    number (the digest keys a pull request by repository and number).
+    """
+    paths = derive_bundle(source_paths, directory, repository, tag)
+    if shift:
+        for name in ("corpus", "inventory"):
+            text = paths[name].read_text(encoding="utf-8")
+            for number in sorted(PULLS, reverse=True):
+                text = text.replace("/pull/%d" % number, "/pull/%d" % (number + shift))
+            paths[name].write_text(text, encoding="utf-8")
+    corpus, manifest = read_json(paths["corpus"]), read_json(paths["manifest"])
+    if shift:
+        for record in corpus["records"]:
+            record["pull_request"]["number"] += shift
+    if keep is not None:
+        corpus["records"] = [corpus["records"][index] for index in keep]
+    for record in manifest["records"]:
+        if interval is not None:
+            record["interval"]["start_at"], record["interval"]["end_at"] = interval
+        if outcome is not None:
+            record["outcome"] = outcome
+    if outcome == "closed-unmerged":
+        for record in corpus["records"]:
+            record["pull_request"].update(normalized_state="closed-unmerged", merged_at=None, closure_reason="unknown")
+    write_json(paths["corpus"], corpus)
+    write_json(paths["manifest"], manifest)
+    return paths

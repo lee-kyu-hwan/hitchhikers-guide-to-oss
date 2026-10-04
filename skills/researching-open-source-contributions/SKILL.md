@@ -75,9 +75,13 @@ reports. It never opens a network connection or starts a process.
    tracker names outside it is refused, never added.
    One isolated collection covers one repository, so a request that names
    several repositories is adopted as one corpus by repeating the three flags
-   once per collection, in the order to merge them. The collections must cover
-   `source.repositories` exactly once each (see the workflow contract).
-4. Run `digest`. It builds the analyzer digest and extraction prompts. The
+   once per collection, in the order to merge them. For each repository (and
+   each outcome the request names) the collections' windows must tile
+   `source.interval` without a gap or an overlap (see the workflow contract).
+4. Run `digest [--max-bytes N]`. It builds the analyzer digest and extraction
+   prompts; the default shard size keeps each lens prompt under a worker's
+   input limit (a larger corpus becomes several shards, one prompt per lens and
+   shard). The
    extraction and synthesis that answer those prompts are isolated research.
    Adopt their validated result with `adopt-analysis --analysis A --origin ai
    [--extraction-result R ...] [--model ... --effort ...]`. The script never

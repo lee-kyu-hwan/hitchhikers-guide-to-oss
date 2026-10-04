@@ -1,0 +1,195 @@
+#!/usr/bin/env python3
+"""Collection window planner: a period, repositories and outcomes into the isolated collection runs.
+
+Host only, offline:
+
+    executable_oss-research-windows --start-at YYYY-MM-DDTHH:MM:SSZ --end-at YYYY-MM-DDTHH:MM:SSZ \\
+        --repo OWNER/NAME [--repo ...] --outcome merged|closed-unmerged|all [--outcome ...] \\
+        [--window-days 31] [--max-per-repo 5] [--request-budget 60] [--docs-only title|label] \\
+        [--max-runs 60]
+
+This is not an isolated entry and it runs nothing. It opens no network connection,
+reads no credential and starts no process: it only computes and prints JSON. One
+isolated collection entry (executable_oss-research-collect) covers one repository,
+one outcome and an interval of at most 31 days, so a longer period, several
+repositories or both outcomes are several runs. The planner lists them:
+
+  - the period [start, end) is cut from its start every --window-days days (at most
+    31, the entry's limit); the end is exclusive, so windows touch without overlapping,
+    and the last window is cut short at the period's end;
+  - one run per repository, outcome and window, in that order, each with the argument
+    list for `executable_oss-research-linux-run` (everything from `--entry` on; the
+    run's own output directory replaces <OUT_DIR>);
+  - the request budget summed and the most requests the runs can make. The estimate
+    is 4 requests plus 7 per pull request, measured on real runs of the entry
+    (11, 18 and 39 requests for 1, 2 and 5 pull requests); the entry's request budget
+    stays the hard stop, and the estimate is no guarantee;
+  - the request fragment (interval, repositories, outcome, caps) for the research
+    workflow's request file: the runs' corpora and manifests are adopted together with
+    `adopt-collection` repeated once per run, and the windows of each repository and
+    outcome tile the interval.
+
+--outcome all is one collector mode that already covers both kinds, so it cannot be
+mixed with the other two. The run limit (--max-runs) refuses an oversized plan instead
+of cutting it. Exit 0 with the plan, 2 for an argument that is refused.
+"""
+
+from __future__ import annotations
+
+import argparse
+from datetime import datetime, timedelta, timezone
+import json
+import re
+import sys
+
+SCHEMA_VERSION = "1.0.0"
+MAX_WINDOW_DAYS = 31          # the collection entry's interval limit
+MAX_PER_REPO = 5              # the entry's per-repository cap
+MAX_REQUEST_BUDGET = 60       # the entry's request budget limit
+DEFAULT_MAX_RUNS = 60
+FIXED_REQUESTS = 4            # measured: 11, 18 and 39 requests for 1, 2 and 5 pull requests
+REQUESTS_PER_PULL_REQUEST = 7
+ENTRY_TIMEOUT_SECONDS = 840   # inside the unit's 900 second limit
+UNIT_TIMEOUT_SECONDS = 900
+OUTCOME_KINDS = ("merged", "closed-unmerged")
+OUTCOMES = ("all",) + OUTCOME_KINDS
+DOCS_ONLY_MODES = ("title", "label")
+INSTANT = re.compile(r"\A\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ\Z")
+REPOSITORY = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9_.-]+\Z")
+LINUX_RUN = "/opt/oss-research/src-<COMMIT>/dot_local/bin/executable_oss-research-linux-run"
+FORMAT = "%Y-%m-%dT%H:%M:%SZ"
+
+
+def instant(value: str) -> datetime:
+    if INSTANT.match(value) is None:
+        raise argparse.ArgumentTypeError("not YYYY-MM-DDTHH:MM:SSZ: %r" % value)
+    try:
+        return datetime.strptime(value, FORMAT).replace(tzinfo=timezone.utc)
+    except ValueError:
+        raise argparse.ArgumentTypeError("not a real UTC time: %r" % value)
+
+
+def repository(value: str) -> str:
+    if REPOSITORY.match(value) is None or value.split("/")[1] in (".", ".."):
+        raise argparse.ArgumentTypeError("not OWNER/NAME: %r" % value)
+    return value
+
+
+def bounded(low: int, high: int):
+    def parse(value: str) -> int:
+        try:
+            number = int(value)
+        except ValueError:
+            raise argparse.ArgumentTypeError("not an integer: %r" % value)
+        if not low <= number <= high:
+            raise argparse.ArgumentTypeError("must be %d..%d: %r" % (low, high, value))
+        return number
+    return parse
+
+
+def parse_args(argv):
+    parser = argparse.ArgumentParser(
+        prog="oss-research-windows",
+        description=(
+            "Plan the isolated collection runs of a period: one run per repository, outcome and window of at most "
+            "%d days. This is not an isolated entry and runs nothing: it opens no network connection, reads no "
+            "credential and starts no process, and only prints the plan as JSON." % MAX_WINDOW_DAYS))
+    parser.add_argument("--start-at", required=True, type=instant, help="period start, inclusive, UTC")
+    parser.add_argument("--end-at", required=True, type=instant, help="period end, exclusive, UTC")
+    parser.add_argument("--repo", action="append", required=True, type=repository, help="OWNER/NAME (repeatable)")
+    parser.add_argument("--outcome", action="append", required=True, choices=OUTCOMES,
+                        help="merged, closed-unmerged or all (repeatable; all stands alone)")
+    parser.add_argument("--window-days", type=bounded(1, MAX_WINDOW_DAYS), default=MAX_WINDOW_DAYS,
+                        help="window length in days, at most %d (default %%(default)s)" % MAX_WINDOW_DAYS)
+    parser.add_argument("--max-per-repo", type=bounded(1, MAX_PER_REPO), default=MAX_PER_REPO)
+    parser.add_argument("--request-budget", type=bounded(1, MAX_REQUEST_BUDGET), default=MAX_REQUEST_BUDGET)
+    parser.add_argument("--docs-only", choices=DOCS_ONLY_MODES, default=None)
+    parser.add_argument("--max-runs", type=bounded(1, 1000), default=DEFAULT_MAX_RUNS)
+    args = parser.parse_args(argv)
+    if args.end_at <= args.start_at:
+        parser.error("--end-at must be after --start-at")
+    lowered = [item.lower() for item in args.repo]
+    if len(set(lowered)) != len(lowered):
+        parser.error("a repository is given twice")
+    if len(set(args.outcome)) != len(args.outcome):
+        parser.error("an outcome is given twice")
+    if "all" in args.outcome and len(args.outcome) > 1:
+        parser.error("--outcome all already covers both kinds; it cannot be mixed with another outcome")
+    return args
+
+
+def windows(start: datetime, end: datetime, days: int):
+    """[start, end) cut every ``days`` days; the end is exclusive and the last window is cut short."""
+    result, position = [], start
+    while position < end:
+        following = min(position + timedelta(days=days), end)
+        result.append((position, following))
+        position = following
+    return result
+
+
+def plan(args) -> dict:
+    spans = windows(args.start_at, args.end_at, args.window_days)
+    runs = []
+    for repo in args.repo:
+        for outcome in args.outcome:
+            for start, end in spans:
+                runs.append((repo, outcome, start, end))
+    if len(runs) > args.max_runs:
+        raise SystemExit("error: the plan has %d runs, over --max-runs %d (nothing is cut)" % (len(runs), args.max_runs))
+    per_run = min(args.request_budget, FIXED_REQUESTS + REQUESTS_PER_PULL_REQUEST * args.max_per_repo)
+    listed = []
+    for index, (repo, outcome, start, end) in enumerate(runs, 1):
+        entry = ["--out-dir", "<OUT_DIR>", "--repo", repo, "--start-at", start.strftime(FORMAT),
+                 "--end-at", end.strftime(FORMAT), "--outcome", outcome]
+        if args.docs_only:
+            entry += ["--docs-only", args.docs_only]
+        entry += ["--max-per-repo", str(args.max_per_repo), "--request-budget", str(args.request_budget),
+                  "--timeout", str(ENTRY_TIMEOUT_SECONDS)]
+        listed.append({
+            "index": index, "repository": repo, "outcome": outcome,
+            "start_at": start.strftime(FORMAT), "end_at": end.strftime(FORMAT), "days": (end - start).days,
+            "request_budget": args.request_budget,
+            "linux_run_args": ["--entry", "collect", "--egress", "pin", "--timeout", str(UNIT_TIMEOUT_SECONDS), "--"] + entry,
+        })
+    outcome_form = args.outcome[0] if len(args.outcome) == 1 else list(args.outcome)
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "executed": False,
+        "note": "plan data only: nothing was run. Each run is `executable_oss-research-linux-run` with its "
+                "linux_run_args inside the research VM, with the user's approval and the coordinator's instruction.",
+        "linux_run": LINUX_RUN,
+        "request": {
+            "start_at": args.start_at.strftime(FORMAT), "end_at": args.end_at.strftime(FORMAT),
+            "repositories": list(args.repo), "outcome": list(args.outcome), "window_days": args.window_days,
+            "max_per_repo": args.max_per_repo, "request_budget": args.request_budget, "docs_only": args.docs_only,
+        },
+        "request_fragment": {
+            "interval": {"start_at": args.start_at.strftime(FORMAT), "end_at": args.end_at.strftime(FORMAT)},
+            "repositories": list(args.repo), "outcome": outcome_form,
+            "max_per_repository": args.max_per_repo, "request_budget": args.request_budget,
+        },
+        "totals": {
+            "windows": len(spans), "runs": len(listed),
+            "request_budget_total": args.request_budget * len(listed),
+            "expected_requests_max_per_run": per_run, "expected_requests_max": per_run * len(listed),
+            "estimate": "%d + %d per pull request, capped by the request budget; measured, not guaranteed"
+                        % (FIXED_REQUESTS, REQUESTS_PER_PULL_REQUEST),
+        },
+        "runs": listed,
+    }
+
+
+def main(argv=None) -> int:
+    args = parse_args(sys.argv[1:] if argv is None else argv)
+    try:
+        document = plan(args)
+    except SystemExit as stop:
+        print(stop, file=sys.stderr)
+        return 2
+    print(json.dumps(document, ensure_ascii=False, indent=2))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

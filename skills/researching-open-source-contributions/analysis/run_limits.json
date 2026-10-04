@@ -1,6 +1,6 @@
 {
   "schema_version": "1.0.0",
-  "purpose": "#78 actual E2E limits the verifier enforces (docs/research/oss-e2e-2026-09-28/README.md)",
+  "purpose": "#78 actual E2E limits the verifier enforces (docs/research/oss-e2e-2026-09-28/README.md); the corpus size caps come from the request file, the model call limit from the shard count",
   "require_observed_model": true,
   "require_prompt_sha256": true,
   "source_repositories": [
@@ -8,8 +8,6 @@
     "eslint/markdown"
   ],
   "interval_days": 30,
-  "max_per_repository": 3,
-  "max_prs": 6,
   "relay_request_budget": 60,
   "prompt_lens": "blind",
   "prompt_max_bytes": 65536,
