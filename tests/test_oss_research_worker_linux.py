@@ -3230,5 +3230,172 @@ class RealLinuxPreflightTests(unittest.TestCase):
         self.assertEqual(worker.linux_execution_preflight(prefix, dict(os.environ)), [])
 
 
+
+class AnalysisCallLedgerTests(unittest.TestCase):
+    """analysis_call.sh's ledger limit: 12 by default, or the call_plan of the bundle's stage.json.
+
+    The harness runs as a copy whose VM root points at a fake limactl in a temp directory, so no VM,
+    model or token is used; the fake answers the staging sha and a clean SUMMARY log and writes no
+    unit, so each accepted call appends one token line to the ledger and nothing is picked up."""
+
+    HARNESS = REPO / "tests/fixtures/oss_research_worker/linux/analysis_call.sh"
+    VM_ROOT = "W=/Users/lee-kyu-hwan/.oss-research-vm\n"
+    FAKE_LIMACTL = """#!/bin/bash
+echo "$*" >> "$(dirname "$0")/../../calls.log"
+case "$*" in
+  *"cat > "*task.txt*) shasum -a 256 | cut -c1-64 ;;
+  *model_once.sh*) cat > /dev/null; echo "SUMMARY fake 0 failures" ;;
+esac
+exit 0
+"""
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp(prefix="osrl-ac-")).resolve()
+        self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
+        text = self.HARNESS.read_text()
+        self.assertEqual(text.count(self.VM_ROOT), 1)
+        vm = self.root / "vm"
+        (vm / "tool/bin").mkdir(parents=True)
+        limactl = vm / "tool/bin/limactl"
+        limactl.write_text(self.FAKE_LIMACTL)
+        limactl.chmod(0o755)
+        self.calls_log = vm / "calls.log"
+        self.harness = self.root / "repo/tests/fixtures/oss_research_worker/linux/analysis_call.sh"
+        self.harness.parent.mkdir(parents=True)
+        self.harness.write_text(text.replace(self.VM_ROOT, "W=%s\n" % vm))
+        self.ledger_dir = self.root / "ledger"
+        self.ledger = self.ledger_dir / "ledger.jsonl"
+        self.prompt = self.root / "task.txt"
+        self.prompt.write_text("analyse these PRs\n")
+        self.credential = self.root / "cred"
+        self.credential.write_text("sentinel-" + "c" * 40 + "\n")
+        self.number = 0
+
+    def stage(self, total=25, name="stage.json", **changes):
+        """A stage.json as extract-inputs writes it, with a call_plan whose total is ``total``."""
+        shards = 2 if total >= 20 else 1
+        synthesis = total - shards * 5 - 5 - 1
+        plan = {"mode": "extraction-only", "shards": shards, "lenses": 5, "extract": shards * 5,
+                "synthesis": synthesis, "verify": 5, "final": 1, "max_model_calls": total,
+                "synthesis_min": 1, "synthesis_groups_max": synthesis - 1, "formula": "...",
+                "inputs": {"max_candidates": 5, "shards": shards, "lenses": 5}}
+        plan.update(changes)
+        path = self.root / name
+        path.write_text(json.dumps({"stage": "extract", "max_model_calls": total, "call_plan": plan}))
+        return path
+
+    def call(self, plan=None, kind="token"):
+        self.number += 1
+        argv = ["bash", str(self.harness), str(self.ledger_dir), "call-%d" % self.number, str(self.prompt),
+                "0" * 40, kind, str(self.credential)] + ([] if plan is None else [str(plan)])
+        return subprocess.run(argv, capture_output=True, text=True, timeout=60)
+
+    def token_lines(self):
+        if not self.ledger.exists():
+            return 0
+        return sum(json.loads(line).get("kind") == "token" for line in self.ledger.read_text().splitlines())
+
+    def limactl_calls(self):
+        return len(self.calls_log.read_text().splitlines()) if self.calls_log.exists() else 0
+
+    def run_until_refused(self, plan=None, most=45):
+        for _ in range(most):
+            done = self.call(plan)
+            if done.returncode != 0:
+                return done
+        self.fail("never refused")
+
+    def test_without_a_call_plan_the_ledger_still_stops_at_twelve(self):
+        refused = self.run_until_refused()
+        self.assertEqual(refused.returncode, 3, refused.stderr)
+        self.assertEqual(refused.stderr, "refused: the ledger already holds 12 model calls\n")
+        self.assertEqual(self.token_lines(), 12)
+        self.assertEqual(self.limactl_calls(), 12 * 3)
+        self.assertEqual(json.loads((self.ledger_dir / "ledger-limit.json").read_text()),
+                         {"limit": 12, "call_plan_sha256": None})
+
+    def test_a_call_plan_of_25_takes_25_calls_and_refuses_the_26th(self):
+        plan = self.stage(25)
+        refused = self.run_until_refused(plan)
+        self.assertEqual(refused.returncode, 3, refused.stderr)
+        self.assertEqual(refused.stderr, "refused: the ledger already holds 25 model calls\n")
+        self.assertEqual(self.token_lines(), 25)
+        self.assertEqual(self.limactl_calls(), 25 * 3)
+        self.assertEqual(json.loads((self.ledger_dir / "ledger-limit.json").read_text()),
+                         {"limit": 25, "call_plan_sha256": hashlib.sha256(plan.read_bytes()).hexdigest()})
+
+    def test_failed_and_sentinel_calls_follow_the_same_rules(self):
+        plan = self.stage(13)
+        for _ in range(12):
+            self.assertEqual(self.call(plan).returncode, 0)
+        self.credential.write_text("SUMMARY\n")  # the log now holds the credential value: a failed call
+        failed = self.call(plan)
+        self.assertEqual(failed.returncode, 5, failed.stderr)
+        self.assertEqual(self.token_lines(), 13)
+        self.assertEqual(self.call(plan).returncode, 3)
+        self.assertEqual(self.call(plan, kind="sentinel").returncode, 5)  # sentinels are not counted
+        self.assertEqual(self.call(self.stage(14, name="other.json"), kind="sentinel").returncode, 3)
+
+    def test_a_call_plan_over_forty_is_refused_before_anything_starts(self):
+        refused = self.call(self.stage(41))
+        self.assertEqual(refused.returncode, 2, refused.stderr)
+        self.assertIn("absolute cap 40", refused.stderr)
+        self.assertFalse(self.ledger_dir.exists())
+        self.assertEqual(self.limactl_calls(), 0)
+        self.assertEqual(self.call(self.stage(40)).returncode, 0)
+
+    def test_the_bound_limit_cannot_change_inside_one_ledger(self):
+        plan = self.stage(25)
+        self.assertEqual(self.call(plan).returncode, 0)
+        before = self.limactl_calls()
+        cases = {"same total, other bytes": self.stage(25, name="spaced.json", formula="other"),
+                 "larger plan": self.stage(30, name="larger.json"),
+                 "no plan": None}
+        for label, other in cases.items():
+            with self.subTest(label):
+                refused = self.call(other)
+                self.assertEqual(refused.returncode, 3, refused.stderr)
+                self.assertIn("ledger limit", refused.stderr)
+        plan.write_text(plan.read_text() + " ")
+        with self.subTest("same path, edited file"):
+            self.assertEqual(self.call(plan).returncode, 3)
+        self.assertEqual(self.limactl_calls(), before)
+        self.assertEqual(self.token_lines(), 1)
+
+    def test_a_plan_cannot_rebind_a_ledger_that_started_without_one(self):
+        self.assertEqual(self.call().returncode, 0)
+        refused = self.call(self.stage(25))
+        self.assertEqual(refused.returncode, 3, refused.stderr)
+        (self.ledger_dir / "ledger-limit.json").unlink()  # a ledger from before the limit was recorded
+        refused = self.call(self.stage(25))
+        self.assertEqual(refused.returncode, 3, refused.stderr)
+        self.assertEqual(self.token_lines(), 1)
+
+    def test_a_missing_or_malformed_call_plan_is_refused(self):
+        link = self.root / "link.json"
+        link.symlink_to(self.stage(25))
+        bad = {"missing": self.root / "absent.json", "link": link, "directory": self.root,
+               "not json": self.root / "text.json", "no call_plan": self.root / "bare.json",
+               "string total": self.stage(25, name="s.json", max_model_calls="25"),
+               "bool total": self.stage(1, name="b.json", max_model_calls=True, shards=0, extract=0,
+                                        synthesis=0, verify=0),
+               "zero total": self.stage(0, name="z.json", shards=0, extract=0, synthesis=0, verify=0, final=0),
+               "parts disagree": self.stage(25, name="p.json", verify=4),
+               "extract is not shards x lenses": self.stage(25, name="e.json", extract=9, synthesis=10),
+               "top level disagrees": self.root / "top.json"}
+        (self.root / "text.json").write_text("{not json")
+        (self.root / "bare.json").write_text(json.dumps({"max_model_calls": 25}))
+        top = json.loads(self.stage(25, name="t.json").read_text())
+        top["max_model_calls"] = 26
+        (self.root / "top.json").write_text(json.dumps(top))
+        for label, path in bad.items():
+            with self.subTest(label):
+                refused = self.call(path)
+                self.assertEqual(refused.returncode, 2, refused.stderr)
+                self.assertIn("call plan", refused.stderr)
+        self.assertFalse(self.ledger_dir.exists())
+        self.assertEqual(self.limactl_calls(), 0)
+
+
 if __name__ == "__main__":
     unittest.main()
