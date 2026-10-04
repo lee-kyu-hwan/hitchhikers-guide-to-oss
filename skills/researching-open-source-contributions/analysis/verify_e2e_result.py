@@ -3,7 +3,7 @@
 
   verify_e2e_result.py --run-dir RUN --corpus CORPUS --prompt TASK
       [--answer-kind extract|synthesis|verify|final] [--lens LENS] [--expect-id CANDIDATE]
-      [--limits LIMITS] [--out VERDICT] [--adopt-to ANSWER.result.json]
+      [--limits LIMITS] [--out VERDICT] [--adopt-to ANSWER.result.json] [--input-scope SCOPE.json]
 
 Every model call of the E2E (5 extract, 1 synthesis, k verify, 1 final) goes
 through this same check. The worker contract (C, P, S, M, R0-R2) is identical
@@ -18,6 +18,14 @@ for every kind. What differs is R3 (the kind's answer shape) and Q1 (quotes):
              pattern quote entry PR-* "..." checked by check_extraction.py.
              Judgment-field schema, deterministic-field refusal and the
              envelope: stage_inputs assemble + validate_corpus (must run next).
+
+--input-scope FILE binds a synthesis, verify or final answer to what its input
+held, for a stage built from extraction answers instead of the whole digest
+(stage_inputs.py writes input-scope.json next to such a prompt): {"keys": [digest
+keys the input held], "quotes": [{"pr": key, "quote": text}] (final only)}. A
+synthesis answer may cite only those keys, a verify answer may only name those PRs,
+and every pattern quote of a final answer must be one of the listed pairs, exactly.
+This only adds a check (item R5); the corpus checks stay. Without it nothing changes.
 
 Limits are strict by default (run_limits.json): M1 needs status succeeded,
 exit 0 and present, empty failures and problems; M5 needs observed_models to
@@ -298,8 +306,24 @@ def final_problems(answer: object, limits: dict, keys: dict) -> tuple:
     return problems, quotes
 
 
+def scope_problems(kind: str, answer: dict, quote_doc: dict, scope: dict) -> list:
+    """What the answer used that its input did not hold (the input-scope.json of the stage)."""
+    keys = set(scope["keys"])
+    if kind == "synthesis":
+        outside = sorted({key for item in answer["candidates"] for key in item["cited_prs"]} - keys)
+        return ["cites digest keys its input did not hold: " + ", ".join(outside)] if outside else []
+    if kind == "verify":
+        named = {item["pr"] for item in answer["evidence_checks"] + answer["counterexamples"]}
+        outside = sorted(named - keys)
+        return ["names PRs whose section was not in its prompt: " + ", ".join(outside)] if outside else []
+    allowed = {(item["pr"], item["quote"]) for item in scope.get("quotes", [])}
+    outside = [item for item in quote_doc["quotes"] if (item["pr"], item["quote"]) not in allowed]
+    return ["%d pattern quote(s) are not among the verified quotes its input listed (first: %s %r)"
+            % (len(outside), outside[0]["pr"], outside[0]["quote"][:60])] if outside else []
+
+
 def verify(run_dir: Path, corpus: Path, prompt: Path, limits: dict, kind: str = "extract",
-           lens: str | None = None, expect_id: str | None = None) -> tuple:
+           lens: str | None = None, expect_id: str | None = None, scope: dict | None = None) -> tuple:
     """Return (verdict, result class, verified report bytes or None)."""
     v = Verdict()
     worker = limits["worker"]
@@ -443,8 +467,13 @@ def verify(run_dir: Path, corpus: Path, prompt: Path, limits: dict, kind: str = 
         quote_doc, quotes = {"quotes": found}, len(found)
         empty = not problems and not answer["patterns"]
     if not v.add("R3-report-schema", "FAIL" if problems else "PASS", "; ".join(problems)):
-        v.block(["Q1"], "schema failed")
+        v.block(["Q1"] + (["R5"] if scope is not None else []), "schema failed")
         return v, "invalid", None
+    if scope is not None:
+        found = scope_problems(kind, answer, quote_doc, scope)
+        if not v.add("R5-input-scope", "FAIL" if found else "PASS", "; ".join(found) or "within what the input held"):
+            v.block(["Q1"], "the answer went beyond its input")
+            return v, "invalid", None
 
     # Q: every pr+quote pair against the corpus, with the analyzer's own checker.
     if kind == "synthesis":
@@ -496,6 +525,8 @@ def main(argv=None) -> int:
     ap.add_argument("--limits", type=Path, default=HERE / "run_limits.json")
     ap.add_argument("--out", type=Path)
     ap.add_argument("--adopt-to", type=Path, help="new file that receives the verified report bytes when ok")
+    ap.add_argument("--input-scope", type=Path,
+                    help="synthesis, verify or final only: the stage's input-scope.json (keys, and quotes for final)")
     a = ap.parse_args(argv)
     if (a.lens is not None) != (a.answer_kind == "extract" and a.lens is not None):
         ap.error("--lens applies to --answer-kind extract only")
@@ -513,8 +544,22 @@ def main(argv=None) -> int:
         ap.error("only limits marked legacy_fixture: true may relax observed-model or prompt_sha256 checks")
     if legacy and a.adopt_to is not None:
         ap.error("legacy fixture limits never adopt an answer (--adopt-to is for strict live limits only)")
+    scope = None
+    if a.input_scope is not None:
+        if a.answer_kind == "extract":
+            ap.error("--input-scope applies to synthesis, verify and final answers only")
+        try:
+            scope = json.loads(a.input_scope.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as error:
+            ap.error("--input-scope is not readable JSON: %s" % error)
+        quotes = scope.get("quotes", []) if isinstance(scope, dict) else None
+        if (not isinstance(scope, dict) or not isinstance(scope.get("keys"), list)
+                or not all(isinstance(key, str) for key in scope["keys"]) or not isinstance(quotes, list)
+                or not all(isinstance(item, dict) and isinstance(item.get("pr"), str) and isinstance(item.get("quote"), str)
+                           for item in quotes)):
+            ap.error("--input-scope must be {\"keys\": [strings], \"quotes\": [{pr, quote}]}")
     verdict, result_class, report_bytes = verify(a.run_dir, a.corpus, a.prompt, limits, a.answer_kind,
-                                                 a.lens, a.expect_id)
+                                                 a.lens, a.expect_id, scope)
     document = {"ok": result_class in ("evidence", "insufficient"), "result_class": result_class,
                 "answer_kind": a.answer_kind, "limits": "legacy-fixture" if legacy else "strict",
                 "complete": False, "items": verdict.items,

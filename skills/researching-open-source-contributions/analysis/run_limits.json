@@ -15,6 +15,7 @@
   "max_patterns": 5,
   "max_observations": 20,
   "max_rejected": 20,
+  "max_synthesis_groups": 3,
   "candidate_statement_max_chars": 600,
   "verify_answer_max_bytes": 6144,
   "final_dynamic_reserve_bytes": 8192,

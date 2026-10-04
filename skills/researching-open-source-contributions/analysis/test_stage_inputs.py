@@ -370,17 +370,28 @@ class StagePipelineTests(unittest.TestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
 
-    def test_digest_boundary_is_refused_before_any_model_call(self):
+    def test_digest_boundary_decides_between_the_digest_path_and_the_extraction_only_path(self):
         fixed = len(stage_inputs.final_prompt_text(self.context, [], {}, stage_inputs.EMPTY_REPORT).encode("utf-8"))
+        self.assertFalse(self.context.reduced)
+        # One byte short: the final prompt can no longer carry the digest, so the run reduces from extraction
+        # answers instead of refusing (its own, much smaller, fixed part is what is then budgeted).
         with mock.patch.object(stage_inputs, "PROMPT_MAX_BYTES", fixed + stage_inputs.FINAL_RESERVE_BYTES - 1):
-            code, _, stderr = stage("extract-inputs", "--run-dir", self.run, "--out", str(self.root / "over"))
-        self.assertEqual(code, 2)
-        self.assertIn("refused before the next model call", stderr)
-        self.assertFalse((self.root / "over").exists())
+            code, summary, stderr = stage("extract-inputs", "--run-dir", self.run, "--out", str(self.root / "over"))
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual("extraction-only", summary["mode"])
+        self.assertNotEqual(summary["final_budget"]["fixed_bytes"], fixed)
         with mock.patch.object(stage_inputs, "PROMPT_MAX_BYTES", fixed + stage_inputs.FINAL_RESERVE_BYTES):
             code, summary, stderr = stage("extract-inputs", "--run-dir", self.run, "--out", str(self.root / "at"))
         self.assertEqual(code, 0, stderr)
+        self.assertEqual("digest-in-final", summary["mode"])
         self.assertEqual(summary["final_budget"]["fixed_bytes"], fixed)
+        # The extraction-only final prompt has its own budget: refused before any model call when even it is over.
+        with mock.patch.object(stage_inputs, "PROMPT_MAX_BYTES", 9000), \
+                mock.patch.object(stage_inputs, "FINAL_RESERVE_BYTES", 9000):
+            code, _, stderr = stage("extract-inputs", "--run-dir", self.run, "--out", str(self.root / "none"))
+        self.assertEqual(code, 2)
+        self.assertIn("refused", stderr)
+        self.assertFalse((self.root / "none").exists())
 
     def test_quotes_are_deduplicated_deterministically(self):
         paths = self.extract_results()
@@ -423,7 +434,8 @@ class StagePipelineTests(unittest.TestCase):
         synthesis = str(self.answers / "synthesis.result.json")
         args = [a for path in results for a in ("--extract-result", path)] + ["--verify-result", verify[0]]
         size = (self.root / "in-final" / "final" / "task.txt").stat().st_size
-        with mock.patch.object(stage_inputs, "PROMPT_MAX_BYTES", size - 1):
+        with mock.patch.object(stage_inputs, "PROMPT_MAX_BYTES", size - 1), \
+                mock.patch.object(stage_inputs, "FINAL_RESERVE_BYTES", 0):   # keep the run on the digest path
             code, _, stderr = stage("final-input", "--run-dir", self.run, "--synthesis", synthesis, *args,
                                     "--out", str(self.root / "in-final-2"))
         self.assertEqual(code, 2)
@@ -679,11 +691,14 @@ class ShardedRunTests(unittest.TestCase):
         self.assertEqual(code, 0, stderr)
         names = sorted(call["input_dir"] for call in summary["calls"])
         self.assertEqual(sorted("extract-%s-%02d" % (lens, n) for lens in LENSES for n in (1, 2)), names)
-        self.assertEqual(17, summary["max_model_calls"])
-        self.assertEqual({"shards": 2, "lenses": 5, "extract": 10, "synthesis": 1, "verify": 5, "final": 1,
-                          "max_model_calls": 17}, {k: v for k, v in summary["call_plan"].items() if k != "formula"
-                                                   and k != "inputs"})
-        self.assertEqual({"max_candidates": 5, "shards": 2, "lenses": 5}, summary["call_plan"]["inputs"])
+        groups = stage_inputs.MAX_SYNTHESIS_GROUPS
+        self.assertEqual(10 + groups + 1 + 5 + 1, summary["max_model_calls"])
+        self.assertEqual({"mode": "extraction-only", "shards": 2, "lenses": 5, "extract": 10, "synthesis": groups + 1,
+                          "synthesis_min": 1, "synthesis_groups_max": groups, "verify": 5, "final": 1,
+                          "max_model_calls": 10 + groups + 1 + 5 + 1},
+                         {k: v for k, v in summary["call_plan"].items() if k not in ("formula", "inputs")})
+        self.assertEqual({"max_candidates": 5, "shards": 2, "lenses": 5, "max_synthesis_groups": groups},
+                         summary["call_plan"]["inputs"])
         for call in summary["calls"]:
             self.assertLessEqual(call["bytes"], stage_inputs.PROMPT_MAX_BYTES)
             self.assertEqual("%s.result.json" % call["input_dir"], call["result_name"])
@@ -712,26 +727,71 @@ class ShardedRunTests(unittest.TestCase):
         self.assertIn("5000", stderr)
         self.assertFalse((self.root / "x").exists())
 
-    def test_a_final_prompt_that_cannot_fit_refuses_extract_inputs_unless_it_is_acknowledged(self):
-        # The final prompt carries the whole digest; the reserve is stood in with a huge one.
+    def test_a_final_prompt_that_carries_no_digest_is_budgeted_on_its_own_and_there_is_no_overflow_flag(self):
+        run = self.sharded()
+        self.assertEqual(2, stage("extract-inputs", "--run-dir", run, "--allow-final-overflow", "--out", str(self.root / "f"))[0])
         with mock.patch.object(stage_inputs, "FINAL_RESERVE_BYTES", 70000):
-            code, _, stderr = stage("extract-inputs", "--run-dir", make_run(self, self.root), "--out", str(self.root / "a"))
-            self.assertEqual(2, code)
-            self.assertNotIn("--allow-final-overflow", stderr)  # one shard: no flag changes the refusal
-            sharded_root = Path(tempfile.mkdtemp())
-            self.addCleanup(shutil.rmtree, sharded_root, ignore_errors=True)
-            run = make_run(self, sharded_root, ("--max-bytes", "1200"))
-            code, _, stderr = stage("extract-inputs", "--run-dir", run, "--out", str(sharded_root / "a"))
-            self.assertEqual(2, code)
-            self.assertIn("--allow-final-overflow", stderr)
-            self.assertFalse((sharded_root / "a").exists())
-            code, summary, stderr = stage("extract-inputs", "--run-dir", run, "--allow-final-overflow",
-                                          "--out", str(sharded_root / "b"))
+            code, _, stderr = stage("extract-inputs", "--run-dir", run, "--out", str(self.root / "a"))
+        self.assertEqual(2, code)
+        self.assertIn("the final prompt would need", stderr)
+        self.assertFalse((self.root / "a").exists())
+        code, summary, stderr = stage("extract-inputs", "--run-dir", run, "--out", str(self.root / "b"))
+        self.assertEqual(code, 0, stderr)
+        self.assertLess(summary["final_budget"]["fixed_bytes"] + summary["final_budget"]["reserve_bytes"],
+                        stage_inputs.PROMPT_MAX_BYTES)
+
+
+EVIDENCE_928 = Path("/Users/lee-kyu-hwan/.oss-research-vm/logs/a78-two-repo-20260928T075531Z")
+
+
+@unittest.skipUnless((EVIDENCE_928 / "analysis/in-final/final/task.txt").is_file(),
+                     "the 2026-09-28 run's inputs are only on the machine that made them")
+class Run928InputTests(unittest.TestCase):
+    """The six pull request, one shard run of 2026-09-28: every stage input stays byte for byte what the
+    isolated calls were given (the evidence kept their task.txt), however the larger-corpus path changes."""
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
+        analysis = EVIDENCE_928 / "analysis"
+        unpacked = EVIDENCE_928 / "unpacked"
+        self.analysis = analysis
+        self.run = str(self.root / "run")
+        for argv in (("init", "--request", str(analysis / "request.json")),
+                     ("adopt-collection", "--corpus", str(unpacked / "corpus.json"),
+                      "--manifest", str(unpacked / "collection-manifest.json"),
+                      "--inventory", str(unpacked / "inventory.md")),
+                     ("digest",)):
+            code, _, stderr = workflow(argv[0], "--run-dir", self.run, *argv[1:])
             self.assertEqual(code, 0, stderr)
-            self.assertEqual("over-cap", summary["final_budget"]["status"])
-            self.assertIn("final-input will refuse", summary["final_budget"]["note"])
-            for call in summary["calls"]:
-                self.assertLessEqual(call["bytes"], stage_inputs.PROMPT_MAX_BYTES)
+
+    def same(self, built: Path, kept: Path):
+        self.assertEqual(kept.read_bytes(), built.read_bytes(), str(kept))
+
+    def test_every_input_of_the_run_is_reproduced_byte_for_byte(self):
+        answers = self.analysis / "answers"
+        extract = [item for lens in LENSES for item in ("--extract-result", str(answers / ("extract-%s.result.json" % lens)))]
+        code, summary, stderr = stage("extract-inputs", "--run-dir", self.run, "--out", str(self.root / "extract"))
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(12, summary["max_model_calls"])
+        for lens in LENSES:
+            self.same(self.root / "extract" / ("extract-" + lens) / "task.txt",
+                      self.analysis / "in-extract-2" / ("extract-" + lens) / "task.txt")
+        code, _, stderr = stage("synthesis-input", "--run-dir", self.run, *extract, "--out", str(self.root / "synthesis"))
+        self.assertEqual(code, 0, stderr)
+        self.same(self.root / "synthesis/synthesis/task.txt", self.analysis / "in-synthesis/synthesis/task.txt")
+        synthesis = str(answers / "synthesis.result.json")
+        code, summary, stderr = stage("verify-inputs", "--run-dir", self.run, "--synthesis", synthesis, *extract,
+                                      "--out", str(self.root / "verify"))
+        self.assertEqual(code, 0, stderr)
+        for call in summary["calls"]:
+            self.same(self.root / "verify" / call["input_dir"] / "task.txt",
+                      self.analysis / "in-verify" / call["input_dir"] / "task.txt")
+        verify = [item for path in sorted(answers.glob("verify-*.result.json")) for item in ("--verify-result", str(path))]
+        code, _, stderr = stage("final-input", "--run-dir", self.run, "--synthesis", synthesis, *extract, *verify,
+                                "--out", str(self.root / "final"))
+        self.assertEqual(code, 0, stderr)
+        self.same(self.root / "final/final/task.txt", self.analysis / "in-final/final/task.txt")
 
 
 if __name__ == "__main__":
