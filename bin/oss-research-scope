@@ -1,0 +1,271 @@
+#!/usr/bin/env python3
+"""Org scope survey: which repositories of an organization are worth researching.
+
+Host only, read-only:
+
+    executable_oss-research-scope --org ORG [--org ORG ...] --since YYYY-MM-DD \\
+        [--label documentation] --out-dir DIR
+
+This is not an isolated entry. It runs on the host with the host's own `gh`
+login and only decides the scope of a later run; the research itself still goes
+through the isolated entries (executable_oss-research-linux-run). Do not read it
+as part of the isolation boundary: it has no sandbox, no relay and no allow list.
+
+Per organization it makes `gh api --method GET` requests, and nothing else:
+
+  1. the public repositories (archived repositories and forks are dropped)
+  2. open Issues with the label, counted per repository
+  3. open Issues with `docs` in the title, counted per repository
+  4. Pull Requests merged since --since with `docs` in the title, counted per
+     repository
+
+The request count is capped (MAX_REQUESTS, shared by all organizations). The
+run stops when the next request would pass the cap, keeping every response
+fetched so far, and exits 1.
+
+Output in DIR (which must be empty or new): one raw JSON file per response,
+scope-manifest.json (arguments, request count, times, one entry per request)
+and summary.md, a table per organization whose rows have the columns of
+docs/research/oss-research-targets.md so they can be pasted there. The script
+never reads, prints or stores a token; `gh` brings its own login.
+
+Exit: 0 done, 1 aborted (request cap, a failing gh, an unreadable response),
+2 a refused argument.
+"""
+
+from __future__ import annotations
+
+import argparse
+from collections import Counter
+from datetime import date, datetime, timezone
+import json
+from pathlib import Path
+import re
+import subprocess
+import sys
+from urllib.parse import quote, urlsplit
+
+MAX_REQUESTS = 20
+PER_PAGE = 100
+GH_TIMEOUT = 60
+SCHEMA_VERSION = "1.0.0"
+DEFAULT_LABEL = "documentation"
+ORG_PATTERN = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$")
+DATE_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+REGISTRY_HEADER = "| 저장소 | 조직 | 역할 | 선별 근거 | 마지막 조사 | 증거 문서 | 제외·보류 사유 | 메모 |"
+REGISTRY_RULE = "|---|---|---|---|---|---|---|---|"
+
+
+class Abort(Exception):
+    def __init__(self, reason, detail=""):
+        super().__init__(reason)
+        self.reason = reason
+        self.detail = detail
+
+
+def now():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def organization(value):
+    if not ORG_PATTERN.match(value):
+        raise argparse.ArgumentTypeError("not an organization name: " + repr(value))
+    return value
+
+
+def since_date(value):
+    if not DATE_PATTERN.match(value):
+        raise argparse.ArgumentTypeError("not YYYY-MM-DD: " + repr(value))
+    try:
+        date.fromisoformat(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError("not a date: " + repr(value))
+    return value
+
+
+def label_name(value):
+    if not value.strip() or len(value) > 50 or re.search(r'["\\\x00-\x1f\x7f]', value):
+        raise argparse.ArgumentTypeError("not a usable label: " + repr(value))
+    return value
+
+
+def parse_args(argv):
+    parser = argparse.ArgumentParser(
+        prog="oss-research-scope",
+        description=(
+            "Survey GitHub organizations to pick repositories for open-source research. "
+            "Runs on the host with the host's gh login and makes read-only `gh api --method GET` "
+            "requests only. It is not an isolated entry and sits outside the isolation boundary: "
+            "it only chooses the scope that a later request file and entry arguments then state."
+        ),
+    )
+    parser.add_argument("--org", action="append", required=True, type=organization,
+                        help="organization to survey (repeatable)")
+    parser.add_argument("--since", required=True, type=since_date,
+                        help="start of the merged docs PR window, YYYY-MM-DD")
+    parser.add_argument("--label", default=DEFAULT_LABEL, type=label_name,
+                        help="issue label to count (default: %(default)s)")
+    parser.add_argument("--out-dir", required=True, type=Path,
+                        help="new or empty directory for the raw responses, manifest and summary")
+    return parser.parse_args(argv)
+
+
+class Survey:
+    def __init__(self, args):
+        self.args = args
+        self.out = args.out_dir
+        self.requests = []
+        self.started_at = now()
+
+    def get(self, name, endpoint):
+        """One `gh api --method GET`; keeps the raw response even when it is the last one."""
+        if len(self.requests) >= MAX_REQUESTS:
+            raise Abort("request-limit")
+        number = len(self.requests) + 1
+        entry = {"n": number, "endpoint": endpoint, "file": "%02d-%s.json" % (number, name)}
+        self.requests.append(entry)
+        try:
+            done = subprocess.run(["gh", "api", "--method", "GET", endpoint],
+                                  capture_output=True, text=True, timeout=GH_TIMEOUT)
+        except (OSError, subprocess.TimeoutExpired) as error:
+            entry["error"] = type(error).__name__
+            raise Abort("gh-failed", entry["error"])
+        entry["exit_code"] = done.returncode
+        if done.returncode != 0:
+            entry["error"] = done.stderr.strip()[:300]
+            raise Abort("gh-failed", entry["error"])
+        (self.out / entry["file"]).write_text(done.stdout, encoding="utf-8")
+        try:
+            return json.loads(done.stdout)
+        except ValueError:
+            entry["error"] = "response is not JSON"
+            raise Abort("bad-response", entry["error"])
+
+    def pages(self, name, endpoint, items_of):
+        """Follow `page` while a page is full; the cap bounds this too."""
+        collected = []
+        page = 1
+        while True:
+            body = self.get("%s-p%d" % (name, page), "%s&per_page=%d&page=%d" % (endpoint, PER_PAGE, page))
+            items = items_of(body)
+            if not isinstance(items, list):
+                raise Abort("bad-response", "page %d of %s has no item list" % (page, name))
+            collected.extend(items)
+            if isinstance(body, dict) and body.get("incomplete_results"):
+                self.requests[-1]["incomplete_results"] = True
+            if len(items) < PER_PAGE:
+                return collected
+            page += 1
+
+    def search(self, name, org, terms):
+        endpoint = "search/issues?q=" + quote("org:%s %s" % (org, terms), safe="")
+        return self.pages(name, endpoint, lambda body: body.get("items") if isinstance(body, dict) else None)
+
+    def organization(self, org):
+        repos = self.pages("%s-repos" % org, "orgs/%s/repos?type=public" % org,
+                           lambda body: body if isinstance(body, list) else None)
+        active = sorted(r["full_name"] for r in repos if not r.get("archived") and not r.get("fork"))
+        label = self.args.label
+        issue_terms = "is:issue is:open label:" + json.dumps(label)
+        found = {
+            "labeled": self.search("%s-label" % org, org, issue_terms),
+            "titled": self.search("%s-title" % org, org, "is:issue is:open docs in:title"),
+            "merged": self.search("%s-merged" % org, org,
+                                  "is:pr is:merged docs in:title merged:>=%s" % self.args.since),
+        }
+        keep = set(active)
+        counts = {key: Counter(name for name in (repository(item) for item in items) if name in keep)
+                  for key, items in found.items()}
+        return {"org": org, "active": active, "skipped": len(repos) - len(active), "counts": counts}
+
+
+def repository(item):
+    """`owner/name` from a search hit's repository_url, or None."""
+    url = item.get("repository_url") if isinstance(item, dict) else None
+    segments = urlsplit(url or "").path.strip("/").split("/")
+    return "/".join(segments[-2:]) if len(segments) >= 3 and segments[-3] == "repos" else None
+
+
+def render_summary(args, results, finished_at, requests):
+    lines = [
+        "# 조직 선별 조회 요약",
+        "",
+        "- 조회 시각: %s (UTC)" % finished_at,
+        "- 조직: %s" % ", ".join(args.org),
+        "- 라벨: `%s`, docs PR 구간 시작: %s" % (args.label, args.since),
+        "- 요청 수: %d (상한 %d)" % (len(requests), MAX_REQUESTS),
+        "- 보관·fork 저장소는 표에서 뺐다. 이 표는 허용 목록이 아니며 역할 열은 사람이 정한다.",
+    ]
+    if any(r.get("incomplete_results") for r in requests):
+        lines.append("- 일부 검색 응답이 `incomplete_results`였다. 수치가 모자랄 수 있다.")
+    for result in results:
+        counts = result["counts"]
+        rows = []
+        for name in result["active"]:
+            labeled, titled, merged = (counts[key][name] for key in ("labeled", "titled", "merged"))
+            if labeled or titled or merged:
+                rows.append((labeled + titled + merged, name, labeled, titled, merged))
+        rows.sort(key=lambda row: (-row[0], row[1]))
+        lines += [
+            "",
+            "## %s" % result["org"],
+            "",
+            "활성 공개 저장소 %d개 중 %d개에서 일치(보관·fork %d개 제외)." % (
+                len(result["active"]), len(rows), result["skipped"]),
+            "",
+            REGISTRY_HEADER,
+            REGISTRY_RULE,
+        ]
+        for _, name, labeled, titled, merged in rows:
+            basis = "열린 `%s` 이슈 %d, 열린 제목 `docs` 이슈 %d, %s 이후 병합 `docs` PR %d (조회 %s)" % (
+                args.label, labeled, titled, args.since, merged, finished_at[:10])
+            lines.append("| %s | %s | (미정) | %s | - | - | - | - |" % (name, result["org"], basis))
+    return "\n".join(lines) + "\n"
+
+
+def write_json(path, value):
+    path.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+def main(argv=None):
+    args = parse_args(sys.argv[1:] if argv is None else argv)
+    if args.out_dir.exists() and (not args.out_dir.is_dir() or any(args.out_dir.iterdir())):
+        print("error: --out-dir must be a new or empty directory", file=sys.stderr)
+        return 2
+    args.out_dir.mkdir(parents=True, exist_ok=True)
+
+    survey = Survey(args)
+    manifest = {
+        "schema_version": SCHEMA_VERSION,
+        "args": {"orgs": args.org, "since": args.since, "label": args.label, "out_dir": str(args.out_dir)},
+        "max_requests": MAX_REQUESTS,
+        "started_at": survey.started_at,
+    }
+    results, failure = [], None
+    try:
+        for org in args.org:
+            results.append(survey.organization(org))
+    except Abort as stop:
+        failure = stop
+
+    manifest["finished_at"] = now()
+    manifest["request_count"] = len(survey.requests)
+    manifest["requests"] = survey.requests
+    if failure:
+        manifest.update(status="aborted", reason=failure.reason, detail=failure.detail)
+    else:
+        manifest["status"] = "complete"
+        (args.out_dir / "summary.md").write_text(
+            render_summary(args, results, manifest["finished_at"], survey.requests), encoding="utf-8")
+    write_json(args.out_dir / "scope-manifest.json", manifest)
+
+    if failure:
+        print("aborted: %s after %d requests (%s)" % (failure.reason, len(survey.requests),
+                                                       args.out_dir / "scope-manifest.json"), file=sys.stderr)
+        return 1
+    print("%d requests; wrote %s" % (len(survey.requests), args.out_dir / "summary.md"))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

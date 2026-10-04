@@ -61,7 +61,10 @@ reports. It never opens a network connection or starts a process.
    caps, per-stage and total API budgets, `static_only: true`, and the session
    model and effort. Use `"unknown"` when the session does not say. Never
    invent values. Run `python3 "$SKILL_DIR/scripts/oss_workflow.py" init --request REQ --run-dir RUN`.
-   A different request needs a new `RUN`.
+   A different request needs a new `RUN`. Take the repositories from the
+   register in the dotfiles repository's `docs/research/oss-research-targets.md`
+   (a record, not an allow list: the request file still sets the scope) and add
+   a row there when a new repository goes in.
 2. Run `status --run-dir RUN` whenever you need the next step. It prints the
    stage table, budget, and next action, including after a failure.
 3. Collection: prefer explicit reuse of an existing corpus with
