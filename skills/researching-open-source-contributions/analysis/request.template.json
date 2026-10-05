@@ -22,7 +22,7 @@
     ],
     "max_candidates_per_repo": 5,
     "max_candidates_total": 5,
-    "discover_request_budget": 100,
+    "discover_request_budget": 60,
     "locus_request_budget": 40,
     "allow_clone": false
   },

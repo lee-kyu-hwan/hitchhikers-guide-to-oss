@@ -51,6 +51,21 @@ def collect(directory: Path) -> dict:
     return paths
 
 
+def entry_budget_request(source: Path, root: Path) -> Path:
+    """An evidence run's request with its target read budgets lowered to the candidate-reads entry limit (#82).
+
+    The earlier runs asked for discover 100; init now refuses a target budget over the entry's 60
+    (oss_workflow.CANDIDATE_READS_MAX_REQUEST_BUDGET). The target budgets reach no stage input, so the inputs the
+    tests compare stay the evidence's."""
+    request = json.loads(source.read_text(encoding="utf-8"))
+    if isinstance(request.get("target"), dict):
+        for key in ("discover_request_budget", "locus_request_budget"):
+            request["target"][key] = min(request["target"][key], fx.workflow.CANDIDATE_READS_MAX_REQUEST_BUDGET)
+    path = root / "entry-budget-request.json"
+    path.write_text(json.dumps(request, indent=2), encoding="utf-8")
+    return path
+
+
 def workflow(*argv) -> tuple[int, str, str]:
     return fx.workflow.run_main(fx.workflow.main, list(argv))
 
@@ -776,10 +791,43 @@ class Run928InputTests(unittest.TestCase):
 
     And the final input: finalize.md now holds one more line, the rule that a quote keeps the source's double
     quotes and backslashes (#82; the 2026-10-05 r5 final answer copied the JSON notation \\" into a quote).
-    Without that line the final input is still the evidence's byte for byte, and with it it is pinned below."""
+    Without that line the final input is still the evidence's byte for byte, and with it it is pinned below.
 
-    # sha256 of the bundle's extract inputs for this run, with the count rule of run_limits.json (5/20/20).
+    And the search clue rule (#82, after the 2026-10-05 discover read nothing with Korean clues): the analyzer's
+    extract prompt and finalize.md now ask for GitHub search strings. With those sentences taken back
+    (CLUE_TEXT_CHANGES, FINAL_CLUE_CHANGES) every prompt is the earlier one byte for byte; the new bytes are pinned."""
+
+    # The analyzer's extract prompt: the search clue sentence, the output sentence and the schema placeholder.
+    CLUE_TEXT_CHANGES = (
+        ("search_clues 는 후보 저장소에서 GitHub 검색(`repo:<저장소> \"<단서>\"` 꼴의 이슈·PR·코드 검색)에 그대로 넣을 짧은 문자열이다: "
+         "파일 경로 조각, 헤딩·코드 토큰, 도메인, 정확한 영어 문구(예: `## Options`, `further_reading`, `npm install eslint`, "
+         "`kangax.github.io`). 설명 문장·한국어를 쓰지 않는다. 한 항목은 1~200자이고 큰따옴표·백슬래시·줄바꿈·앞뒤 공백이 없다. "
+         "앞의 5개만 검색에 쓰인다.", "search_clues 에는 후보 저장소에서 찾을 파일 경로·코드 형태·검색어를 적는다."),
+        ("quote 는 원문 그대로, search_clues 는 위 규칙의 검색 문자열로 둔다.", "quote 는 원문 그대로 둔다."),
+        ('"search_clues": ["<검색 문자열>"]', '"search_clues": ["후보 저장소에서 찾을 단서"]'),
+    )
+    # finalize.md: the output sentence (the search clue rule is its own line, taken out whole).
+    FINAL_CLUE_CHANGES = (("인용은 원문 그대로, `search_clues` 는 위 규칙의 검색 문자열로 둔다.", "인용은 원문 그대로 둔다."),)
+
+    @staticmethod
+    def taken_back(data: bytes, changes) -> bytes:
+        text = data.decode("utf-8")
+        for now, before in changes:
+            assert text.count(now) == 1, now[:40]
+            text = text.replace(now, before)
+        return text.encode("utf-8")
+
+    # sha256 of the bundle's extract inputs for this run, with the count rule of run_limits.json (5/20/20) and the
+    # search clue rule.
     EXTRACT_SHA256 = {
+        "blind": "c4df9fbd9635a3e229de22c2479a48d6c2d98cab3884cffbc0f68524139619ec",
+        "correctness": "2a23735690ca02df3f4ce994f864f45ec089437125cec7b10cb26a91cc62a366",
+        "maintenance": "47324320bdfa4bff4851e3e2d823f8201a0fec04fa46e75317a66aa93df18449",
+        "review": "b0e38587d30160dcc98ef07023232cb62d54c2f9f43650b0b2b12063ec66faa5",
+        "structure": "1f6684e2d8d3915f8656042f8b63507fd28d645fff4fba5f015d2f2c659f96e5",
+    }
+    # The same before the search clue rule (with the count rule).
+    EARLIER_EXTRACT_SHA256 = {
         "blind": "b4d018f7327933fedad57152f66fb5fe57c2e308d9379ba810884f78631a3d1c",
         "correctness": "549728379842667350aa7417da60b3ee7a0f2ff199fa3d45447e4c594cbbc6e9",
         "maintenance": "341a81180c9818bc4d0fe0231ae44f5884055d72bd1fe0f45ecb2f27319a1eec",
@@ -787,8 +835,8 @@ class Run928InputTests(unittest.TestCase):
         "structure": "26c3c9e62d97ee463663e32eb6acc3f2a01d8c4aca28b44901b0efac9dae07d5",
     }
 
-    # sha256 of the bundle's final input for this run, with finalize.md's quote rule (60,093 B).
-    FINAL_SHA256 = "fa9f21f62b7f8553bdb373352e3a90fb0ab3dfd34171cb6ae5f9ffb263b43f4e"
+    # sha256 of the bundle's final input for this run, with finalize.md's quote rule and search clue rule.
+    FINAL_SHA256 = "27f62a9de3b6fb5bb5c4dfece264d0bc780a5233669a7682740c7fc20309e2dc"
 
     def setUp(self):
         self.root = Path(tempfile.mkdtemp())
@@ -797,7 +845,7 @@ class Run928InputTests(unittest.TestCase):
         unpacked = EVIDENCE_928 / "unpacked"
         self.analysis = analysis
         self.run = str(self.root / "run")
-        for argv in (("init", "--request", str(analysis / "request.json")),
+        for argv in (("init", "--request", str(entry_budget_request(analysis / "request.json", self.root))),
                      ("adopt-collection", "--corpus", str(unpacked / "corpus.json"),
                       "--manifest", str(unpacked / "collection-manifest.json"),
                       "--inventory", str(unpacked / "inventory.md")),
@@ -817,10 +865,13 @@ class Run928InputTests(unittest.TestCase):
         digest_prompts = stage_inputs.Context(self.run).extract_prompts
         for lens in LENSES:
             kept = self.analysis / "in-extract-2" / ("extract-" + lens) / "task.txt"
-            self.same(digest_prompts / ("extract-" + lens + ".md"), kept)
+            self.assertEqual(kept.read_bytes(), self.taken_back(
+                (digest_prompts / ("extract-" + lens + ".md")).read_bytes(), self.CLUE_TEXT_CHANGES), lens)
             built = (self.root / "extract" / ("extract-" + lens) / "task.txt").read_bytes()
             self.assertNotEqual(kept.read_bytes(), built)
             self.assertEqual(self.EXTRACT_SHA256[lens], hashlib.sha256(built).hexdigest(), lens)
+            self.assertEqual(self.EARLIER_EXTRACT_SHA256[lens],
+                             hashlib.sha256(self.taken_back(built, self.CLUE_TEXT_CHANGES)).hexdigest(), lens)
         code, _, stderr = stage("synthesis-input", "--run-dir", self.run, *extract, "--out", str(self.root / "synthesis"))
         self.assertEqual(code, 0, stderr)
         self.same(self.root / "synthesis/synthesis/task.txt", self.analysis / "in-synthesis/synthesis/task.txt")
@@ -836,11 +887,13 @@ class Run928InputTests(unittest.TestCase):
                                 "--out", str(self.root / "final"))
         self.assertEqual(code, 0, stderr)
         built = (self.root / "final/final/task.txt").read_bytes()
-        rule = [line for line in (HERE / "prompts" / "finalize.md").read_text(encoding="utf-8").splitlines(True)
-                if "JSON 표기" in line]
-        self.assertEqual(1, len(rule))
-        self.assertEqual((self.analysis / "in-final/final/task.txt").read_bytes(),
-                         built.replace(rule[0].encode("utf-8"), b"", 1))
+        lines = (HERE / "prompts" / "finalize.md").read_text(encoding="utf-8").splitlines(True)
+        rule = [line for line in lines if "JSON 표기" in line]
+        clue_rule = [line for line in lines if "search_clues" in line and "GitHub 검색" in line]
+        self.assertEqual((1, 1), (len(rule), len(clue_rule)))
+        self.assertEqual((self.analysis / "in-final/final/task.txt").read_bytes(), self.taken_back(
+            built.replace(rule[0].encode("utf-8"), b"", 1).replace(clue_rule[0].encode("utf-8"), b"", 1),
+            self.FINAL_CLUE_CHANGES))
         self.assertEqual(self.FINAL_SHA256, hashlib.sha256(built).hexdigest())
 
 

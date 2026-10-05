@@ -88,6 +88,7 @@ Map an accepted candidate to the pattern record this way:
 - `confidence.evidence` holds at least one quote entry `PR-005 "<verified quote>"` per evidence PR, plus free-text reasons.
 - `counterconditions` includes counterexamples that narrow the pattern.
 - `search_clues`, `expected_tests`, and `maintainer_judgment_required` come from the extraction and verification results.
+- Each `search_clues` entry is a short string the candidate verifier puts into GitHub search as it is (`repo:<target> "<clue>"`, issue, PR and code search; only the first five are used): a path fragment, a heading or code token, a domain, or an exact English phrase such as `## Options`, `further_reading`, `npm install eslint`, `kangax.github.io`. No description sentence and no Korean; 1 to 200 characters without a double quote, a backslash, a line break or edge spaces (#82: Korean sentence clues made the 2026-10-05 discover read nothing).
 
 ## Ledger
 

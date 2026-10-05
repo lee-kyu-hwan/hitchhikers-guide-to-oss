@@ -175,7 +175,7 @@ def base_request(**changes):
                    "interval": {"start_at": INTERVAL[0], "end_at": INTERVAL[1]}, "outcome": "all",
                    "max_per_repository": 5, "request_budget": 200, "reference_repositories": []},
         "target": {"repositories": [REPO], "max_candidates_per_repo": 5, "max_candidates_total": 20,
-                   "discover_request_budget": 100, "locus_request_budget": 50, "allow_clone": False},
+                   "discover_request_budget": 60, "locus_request_budget": 40, "allow_clone": False},
         "budget": {"total_api_requests": 400, "max_elapsed_seconds": None},
         "static_only": True,
         "provenance": {"model": "unknown", "effort": "unknown"},

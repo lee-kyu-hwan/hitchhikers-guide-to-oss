@@ -58,10 +58,10 @@ QUOTE_RULES = """인용 규칙:
 EXTRACT_TAIL = """패턴의 기준:
 - 패턴은 서로 다른 PR 2개 이상에서 반복해서 관찰되는 행동이다. PR 1개에서만 보이는 것은 patterns 가 아니라 observations 에 넣는다.
 - 모든 근거(evidence)에는 인용을 붙인다.
-- 다른 오픈소스 저장소에서 기여 후보를 찾는 데 쓸 수 있어야 한다. search_clues 에는 후보 저장소에서 찾을 파일 경로·코드 형태·검색어를 적는다.
+- 다른 오픈소스 저장소에서 기여 후보를 찾는 데 쓸 수 있어야 한다. search_clues 는 후보 저장소에서 GitHub 검색(`repo:<저장소> "<단서>"` 꼴의 이슈·PR·코드 검색)에 그대로 넣을 짧은 문자열이다: 파일 경로 조각, 헤딩·코드 토큰, 도메인, 정확한 영어 문구(예: `## Options`, `further_reading`, `npm install eslint`, `kangax.github.io`). 설명 문장·한국어를 쓰지 않는다. 한 항목은 1~200자이고 큰따옴표·백슬래시·줄바꿈·앞뒤 공백이 없다. 앞의 5개만 검색에 쓰인다.
 - 억지로 개수를 늘리지 마라. 근거가 약하면 rejected 에 이유와 함께 넣는다. 패턴이 0개여도 된다.
 
-출력: 설명·코드펜스 없이 아래 형태의 JSON 객체 하나만 출력한다. 문자열 값은 한국어로 쓰되 quote 는 원문 그대로 둔다.
+출력: 설명·코드펜스 없이 아래 형태의 JSON 객체 하나만 출력한다. 문자열 값은 한국어로 쓰되 quote 는 원문 그대로, search_clues 는 위 규칙의 검색 문자열로 둔다.
 {
   "lens": "<LENS_ID>",
   "patterns": [
@@ -74,7 +74,7 @@ EXTRACT_TAIL = """패턴의 기준:
       ],
       "applicability": ["적용 조건"],
       "counterconditions": ["적용하면 안 되는 조건"],
-      "search_clues": ["후보 저장소에서 찾을 단서"],
+      "search_clues": ["<검색 문자열>"],
       "expected_tests": ["기여할 때 필요한 테스트"],
       "maintainer_judgment_required": ["관리자가 판단해야 할 남은 문제"],
       "confidence": "high | medium | low",

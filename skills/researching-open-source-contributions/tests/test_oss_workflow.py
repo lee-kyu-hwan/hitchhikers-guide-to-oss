@@ -96,7 +96,7 @@ class Flow:
         code, stdout, stderr = self.verifier.main([
             "discover", "--analysis", str(self.gen("analysis", "analysis.json")), "--repo", fx.REPO,
             "--output", str(out / "discovery.json"), "--manifest", str(out / "manifest.json"),
-            "--request-budget", "100", *extra])
+            "--request-budget", str(fx.base_request()["target"]["discover_request_budget"]), *extra])
         self.test.assertEqual(0, code, stderr)
         return out / "discovery.json", out / "manifest.json"
 
@@ -115,7 +115,8 @@ class Flow:
         shutil.copyfile(self.gen("discovery", "manifest.json"), manifest)
         code, stdout, stderr = self.verifier.main([
             "locus-search", "--discovery", str(self.gen("discovery", "discovery.json")), "--assessment", str(assessment),
-            "--output", str(out / "locus-search.json"), "--manifest", str(manifest), "--request-budget", "50"])
+            "--output", str(out / "locus-search.json"), "--manifest", str(manifest),
+            "--request-budget", str(fx.base_request()["target"]["locus_request_budget"])])
         self.test.assertEqual(0, code, stderr)
         return out / "locus-search.json", manifest
 
@@ -647,6 +648,19 @@ class NullTargetTests(unittest.TestCase):
         }
         for label, request in cases.items():
             self.assertTrue(wf.validate_request(request), label)
+
+    def test_target_read_budgets_stay_within_the_candidate_reads_entry_cap(self):
+        # A discovery or locus search is read by the candidate-reads entry, whose relay budget is at most 60
+        # (MAX_REQUEST_BUDGET); adopt-discovery requires the request's budget to equal the run's, so a larger
+        # request budget could never be adopted (#82, the 2026-10-05 discover: 100 != 60). init refuses it.
+        self.assertEqual(60, wf.CANDIDATE_READS_MAX_REQUEST_BUDGET)
+        self.assertEqual([], wf.validate_request(fx.base_request(target__discover_request_budget=60,
+                                                                 target__locus_request_budget=60)))
+        for key in ("discover_request_budget", "locus_request_budget"):
+            with self.subTest(key):
+                errors = wf.validate_request(fx.base_request(**{"target__" + key: 61}))
+                self.assertTrue(any(("target." + key) in error and "60" in error and "candidate-reads" in error
+                                    for error in errors), errors)
 
     def test_null_target_without_patterns_is_insufficient_and_skips_candidates(self):
         flow, paths = self._through_digest()

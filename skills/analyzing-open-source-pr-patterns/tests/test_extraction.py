@@ -296,8 +296,25 @@ class BuildPromptsTests(ExtractionTestCase):
         self.assertEqual(len(list(prompts.glob("*.md"))), 2 * len(shards))
         self.assertIn("조각", (prompts / "extract-blind-01.md").read_text(encoding="utf-8"))
 
-    # sha256 of the fixture's extract prompts written without count limits: the bytes every earlier run got.
+    # sha256 of the fixture's extract prompts written without count limits, with the search clue rule (#82).
+    # Taking the three changed sentences back (CLUE_TEXT_CHANGES) gives the bytes every earlier run got
+    # (EARLIER_EXTRACT_SHA256).
     DEFAULT_EXTRACT_SHA256 = {
+        "extract-blind.md": "7dac38c666979ed5662e120b77d48c983439bf237c7e18602620cc611a14117c",
+        "extract-correctness.md": "b73ba602087e335ae5458c5b1545182eb33200baf2648a0b7b6fcd78e3a2e78c",
+        "extract-maintenance.md": "31bf1da873c108d1ffc3401871d8204106327a017b6ce589fb711fe8ca11e48d",
+        "extract-review.md": "b99eb6063f94ca1e96467ed1409c4e0fd2149759578dc413314314d972336bb2",
+        "extract-structure.md": "dbd8990bdd73a8b695fbc8e1ad1c06a39937b62f20af7a1ff004e06fb29753dd",
+    }
+    CLUE_TEXT_CHANGES = (
+        ("search_clues 는 후보 저장소에서 GitHub 검색(`repo:<저장소> \"<단서>\"` 꼴의 이슈·PR·코드 검색)에 그대로 넣을 짧은 문자열이다: "
+         "파일 경로 조각, 헤딩·코드 토큰, 도메인, 정확한 영어 문구(예: `## Options`, `further_reading`, `npm install eslint`, "
+         "`kangax.github.io`). 설명 문장·한국어를 쓰지 않는다. 한 항목은 1~200자이고 큰따옴표·백슬래시·줄바꿈·앞뒤 공백이 없다. "
+         "앞의 5개만 검색에 쓰인다.", "search_clues 에는 후보 저장소에서 찾을 파일 경로·코드 형태·검색어를 적는다."),
+        ("quote 는 원문 그대로, search_clues 는 위 규칙의 검색 문자열로 둔다.", "quote 는 원문 그대로 둔다."),
+        ('"search_clues": ["<검색 문자열>"]', '"search_clues": ["후보 저장소에서 찾을 단서"]'),
+    )
+    EARLIER_EXTRACT_SHA256 = {
         "extract-blind.md": "e90a50b58009f9d2609c53c62d7233757ab744a091d679c22b82ff6e8a442a3a",
         "extract-correctness.md": "14f5f914e099c81fa8a7f2d3f1cd4d0d6b09630e94c602cb5275912f19f4f40a",
         "extract-maintenance.md": "9c4b7022ea90fb2b0371c013affe2c2aefe59f2966e3c603dd653c5c9a8516d2",
@@ -316,12 +333,32 @@ class BuildPromptsTests(ExtractionTestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         return {path.name: path.read_bytes() for path in sorted((run / "prompts").glob("*.md"))}
 
-    def test_extract_without_count_limits_keeps_the_earlier_bytes(self):
+    def test_extract_without_count_limits_differs_from_the_earlier_bytes_only_by_the_search_clue_rule(self):
         self.assertEqual(self.build_digest().returncode, 0)
         prompts = self.extract_prompts()
         self.assertEqual({name: hashlib.sha256(text).hexdigest() for name, text in prompts.items()},
                          self.DEFAULT_EXTRACT_SHA256)
+        earlier = {}
+        for name, data in prompts.items():
+            text = data.decode("utf-8")
+            for now, before in self.CLUE_TEXT_CHANGES:
+                self.assertEqual(1, text.count(now), (name, now[:30]))
+                text = text.replace(now, before)
+            earlier[name] = hashlib.sha256(text.encode("utf-8")).hexdigest()
+        self.assertEqual(earlier, self.EARLIER_EXTRACT_SHA256)
         self.assertNotIn("개수 상한".encode("utf-8"), b"".join(prompts.values()))
+
+    def test_extract_prompt_asks_for_search_clues_that_go_into_github_search_as_they_are(self):
+        self.assertEqual(self.build_digest().returncode, 0)
+        for name, data in self.extract_prompts().items():
+            text = data.decode("utf-8")
+            with self.subTest(name):
+                rule = [line for line in text.splitlines() if "search_clues" in line and "GitHub 검색" in line]
+                self.assertEqual(1, len(rule))
+                for example in ("`## Options`", "`further_reading`", "`npm install eslint`", "`kangax.github.io`"):
+                    self.assertIn(example, rule[0])
+                self.assertIn("한국어", rule[0])
+                self.assertNotIn("파일 경로·코드 형태·검색어를 적는다", text)
 
     def test_extract_with_count_limits_states_them_in_the_rules_and_changes_nothing_else(self):
         self.assertEqual(self.build_digest().returncode, 0)

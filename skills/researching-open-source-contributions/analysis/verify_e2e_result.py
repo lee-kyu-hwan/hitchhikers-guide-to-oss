@@ -27,6 +27,14 @@ synthesis answer may cite only those keys, a verify answer may only name those P
 and every pattern quote of a final answer must be one of the listed pairs, exactly.
 This only adds a check (item R5); the corpus checks stay. Without it nothing changes.
 
+A final answer's search_clues (item R6, #82) must be strings the candidate verifier can put into GitHub search
+as they are: its discover quotes each clue into repo:<target> "<clue>" (issue, PR and code searches) and drops a
+clue with a double quote, a backslash or a control character (verify_candidates._safe_search_clue). R6 fails a
+clue that is not a string, empty, longer than the candidate-reads entry's clue limit (MAX_CLUE_CHARS, 200), has
+edge spaces, a double quote, a backslash or a control character, or holds Hangul (a sentence, not a search
+string: the 2026-10-05 discover of Korean clues read nothing). A pattern without search_clues is the assemble
+schema's to refuse.
+
 Limits are strict by default (run_limits.json): M1 needs status succeeded,
 exit 0 and present, empty failures and problems; M5 needs observed_models to
 be exactly [the requested model] (missing = unknown = FAIL, mixed or fallback
@@ -91,6 +99,9 @@ VERIFY_KEYS = {"id", "verdict", "evidence_checks", "counterexamples", "distinct_
                "actionable", "actionable_reason", "confidence", "revised_statement"}
 FINAL_KEYS = {"records", "patterns", "extraction_ledger", "limitations"}
 QUOTE_ENTRY = re.compile(r'(PR-[0-9]+) "(.*)"', re.S)
+# The candidate-reads entry's clue limit (dot_local/bin/executable_oss-research-candidate-reads MAX_CLUE_CHARS).
+SEARCH_CLUE_MAX_CHARS = 200
+HANGUL = re.compile("[\u1100-\u11ff\u3130-\u318f\ua960-\ua97f\uac00-\ud7a3\ud7b0-\ud7ff]")
 STAGE_OWNER = {
     "extract": "next: stage_inputs.py synthesis-input (all five lenses, check_extraction again)",
     "synthesis": "next: stage_inputs.py verify-inputs (candidate caps, statement length, digest keys, prompt budget)",
@@ -306,6 +317,41 @@ def final_problems(answer: object, limits: dict, keys: dict) -> tuple:
     return problems, quotes
 
 
+def search_clue_problems(answer: dict) -> tuple:
+    """R6: every search clue of the final answer's patterns is a GitHub search string (see the module docstring).
+    Returns (problems, number of clues seen)."""
+    problems, seen = [], 0
+    for index, pattern in enumerate(answer.get("patterns") or []):
+        if not isinstance(pattern, dict) or "search_clues" not in pattern:
+            continue
+        clues = pattern["search_clues"]
+        if not isinstance(clues, list):
+            problems.append("patterns[%d].search_clues: not a list" % index)
+            continue
+        for number, clue in enumerate(clues):
+            seen += 1
+            at = "patterns[%d].search_clues[%d]" % (index, number)
+            if not isinstance(clue, str):
+                problems.append(at + ": not a string")
+                continue
+            if not clue:
+                problems.append(at + ": empty")
+                continue
+            if len(clue) > SEARCH_CLUE_MAX_CHARS:
+                problems.append(at + ": longer than %d characters (%d)" % (SEARCH_CLUE_MAX_CHARS, len(clue)))
+            if clue != clue.strip():
+                problems.append(at + ": edge spaces")
+            if '"' in clue:
+                problems.append(at + ": double quote")
+            if "\\" in clue:
+                problems.append(at + ": backslash")
+            if any(ord(character) < 32 or ord(character) == 127 for character in clue):
+                problems.append(at + ": control character")
+            if HANGUL.search(clue):
+                problems.append(at + ": Hangul (a sentence, not a search string) %r" % clue[:40])
+    return problems, seen
+
+
 def scope_problems(kind: str, answer: dict, quote_doc: dict, scope: dict) -> list:
     """What the answer used that its input did not hold (the input-scope.json of the stage)."""
     keys = set(scope["keys"])
@@ -479,6 +525,11 @@ def verify(run_dir: Path, corpus: Path, prompt: Path, limits: dict, kind: str = 
     if not v.add("R3-report-schema", "FAIL" if problems else "PASS", "; ".join(problems)):
         v.block(["Q1"] + (["R5"] if scope is not None else []), "schema failed")
         return v, "invalid", None
+    if kind == "final":
+        clue_problems, clues = search_clue_problems(answer)
+        v.add("R6-search-clues", "FAIL" if clue_problems else "PASS", "; ".join(clue_problems)
+              or ("%d search clue(s), each a GitHub search string" % clues if clues
+                  else "no search_clues in the patterns (the assemble schema requires them)"))
     if scope is not None:
         found = scope_problems(kind, answer, quote_doc, scope)
         if not v.add("R5-input-scope", "FAIL" if found else "PASS", "; ".join(found) or "within what the input held"):

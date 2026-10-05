@@ -311,6 +311,13 @@ def _curated_source_errors(source: dict, errors: List[str]) -> None:
         _repositories(references, "source.reference_repositories", errors)
 
 
+# The candidate-reads entry's relay budget limit (dot_local/bin/executable_oss-research-candidate-reads
+# MAX_REQUEST_BUDGET). Discover and locus-search are read through that entry, and adopt-discovery and
+# adopt-locus-search require the run's budget to equal the request's, so a larger request budget could never be
+# adopted (#82). init refuses it.
+CANDIDATE_READS_MAX_REQUEST_BUDGET = 60
+
+
 def validate_request(request: object) -> List[str]:
     errors: List[str] = []
     if not isinstance(request, dict):
@@ -372,6 +379,10 @@ def validate_request(request: object) -> List[str]:
         for key in ("max_candidates_per_repo", "max_candidates_total", "discover_request_budget",
                     "locus_request_budget"):
             _positive_int(target[key], "target." + key, errors)
+        for key in ("discover_request_budget", "locus_request_budget"):
+            if type(target[key]) is int and target[key] > CANDIDATE_READS_MAX_REQUEST_BUDGET:
+                errors.append("target.%s %d is over the candidate-reads entry budget limit %d"
+                              % (key, target[key], CANDIDATE_READS_MAX_REQUEST_BUDGET))
         if target["allow_clone"] is not False:
             errors.append("target.allow_clone must be false; clone-based static search is not connected")
     budget = request["budget"]

@@ -24,6 +24,7 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 
 import test_reduce_inputs as reduce  # noqa: E402  (installs the offline guards first)
+import test_stage_inputs as base  # noqa: E402
 
 stage_inputs, stage, workflow, CAP = reduce.stage_inputs, reduce.stage, reduce.workflow, reduce.CAP
 
@@ -285,7 +286,8 @@ class RunR2Case(unittest.TestCase):
             adopt += ["--corpus", str(unpacked / "corpus.json"), "--manifest", str(unpacked / "collection-manifest.json"),
                       "--inventory", str(unpacked / "inventory.md")]
         self.run = str(self.root / "run")
-        for argv in (("init", "--request", str(EVIDENCE_R2 / "wf-run/request.json")), ("adopt-collection", *adopt),
+        request = base.entry_budget_request(EVIDENCE_R2 / "wf-run/request.json", self.root)
+        for argv in (("init", "--request", str(request)), ("adopt-collection", *adopt),
                      ("digest", "--max-bytes", "54000")):
             code, _, stderr = workflow(argv[0], "--run-dir", self.run, *argv[1:])
             self.assertEqual(code, 0, stderr)
@@ -297,18 +299,21 @@ class RunR2Case(unittest.TestCase):
                      "the 2026-10-04 eslint r2 run is only on the machine that made it")
 class RunR2ContinuationTests(RunR2Case):
     """The eslint r2 run of 2026-10-04: 20 extract answers adopted under strict verification, then refused at
-    synthesis-input for 7 groups over the old limit of 3."""
+    synthesis-input for 7 groups over the old limit of 3. (Its 14-call continuation plan was made and run as r3,
+    a78-period-analysis-eslint-r3-20261005T025628Z/in-continue.)
 
-    def test_the_adopted_answers_continue_into_seven_groups_and_a_fourteen_call_plan(self):
-        code, summary, stderr = stage("continue-plan", "--run-dir", self.run, "--extract-stage",
-                                      str(EVIDENCE_R2 / "in-extract"), *self.extract, "--records", str(EVIDENCE_R2),
-                                      "--out", str(self.root / "continue"))
-        self.assertEqual(0, code, stderr)
-        plan = summary["call_plan"]
-        self.assertEqual(sha256(EVIDENCE_R2 / "in-extract/stage.json"), plan["continues"]["extract_stage_sha256"])
-        self.assertEqual({"extract": 20}, plan["continues"]["completed"])
-        self.assertEqual((7, 8, 5, 1, 14), (plan["synthesis_groups"], plan["synthesis"], plan["verify"], plan["final"],
-                                             plan["max_model_calls"]))
+    Since the analyzer's extract prompt asks for search clues as GitHub search strings (#82), the r2 extract stage
+    records other prompts than the analyzer writes now, and continue-plan refuses to start from it again: answers
+    are reused only under the prompts that made them. A continuation of r3 (a continue stage) does not compare
+    extract prompts and is unaffected (RunR3ChainTests)."""
+
+    def test_the_r2_extract_stage_is_not_continued_again_under_the_changed_extract_prompt(self):
+        code, _, stderr = stage("continue-plan", "--run-dir", self.run, "--extract-stage",
+                                str(EVIDENCE_R2 / "in-extract"), *self.extract, "--records", str(EVIDENCE_R2),
+                                "--out", str(self.root / "continue"))
+        self.assertEqual(2, code, stderr)
+        self.assertIn("records other prompts than this run's analyzer writes", stderr)
+        self.assertFalse((self.root / "continue").exists())
         code, synthesis, stderr = stage("synthesis-input", "--run-dir", self.run, *self.extract,
                                         "--out", str(self.root / "synthesis"))
         self.assertEqual(0, code, stderr)

@@ -21,8 +21,8 @@ A request is one JSON object with exactly these keys. Unknown keys are rejected.
     "repositories": ["owner/name"],
     "max_candidates_per_repo": 5,
     "max_candidates_total": 20,
-    "discover_request_budget": 100,
-    "locus_request_budget": 50,
+    "discover_request_budget": 60,
+    "locus_request_budget": 40,
     "allow_clone": false
   },
   "budget": {"total_api_requests": 400, "max_elapsed_seconds": null},
@@ -33,6 +33,9 @@ A request is one JSON object with exactly these keys. Unknown keys are rejected.
 
 - `source` is where historical PRs come from. `target` is where candidates are
   checked. The two lists are independent.
+- `target.discover_request_budget` and `target.locus_request_budget` are at most 60, the candidate-reads
+  entry's relay budget limit (`CANDIDATE_READS_MAX_REQUEST_BUDGET`); `init` refuses more, because a discovery or
+  locus search read through that entry could never match a larger request budget at adoption (#82).
 - `target` may be `null` when the caller names no target. That run collects and
   analyzes only: there are no candidate caps, discover/locus budgets, or clone
   flag to state, `discovery`, `locus-search`, and `record` report `skipped`
