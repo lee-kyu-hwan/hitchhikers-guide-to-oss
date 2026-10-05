@@ -645,7 +645,7 @@ def model_once(out: Path, credential_file: Path, model: str, effort: str, second
 
 
 CANDIDATE_CASES = ("normal", "anonymous-code-search", "locus-search", "drop-verifier-file", "drop-verifier", "drop-adapter-dependency",
-                   "repo-missing", "upstream-hang", "write-methods", "direct-regression")
+                   "repo-missing", "upstream-hang", "write-methods", "direct-regression", "static-rest")
 
 
 def load_candidate_entry():
@@ -685,7 +685,8 @@ def candidate_reads(out: Path, case: str = "normal", token_file: Path | None = N
     the upstream never answers. write-methods: every write method sent to the relay from
     inside srt through srt's proxy (the relay must refuse; the upstream must get none).
     direct-regression: the adapter run without srt's proxy, which srt's network namespace
-    must refuse.
+    must refuse. static-rest: discover with --static-reads rest over docs/rules (#256), README.md
+    and the rule documents answered by the mock's contents route at the head commit (complete).
     """
     import threading
     import tests.test_oss_research_candidate_reads as reads_fixture
@@ -697,6 +698,8 @@ def candidate_reads(out: Path, case: str = "normal", token_file: Path | None = N
     # The code search answers 200 except in the case that models the anonymous 401 (partial).
     routes = fixture.world(code_status=401 if case == "anonymous-code-search" else 200)
     reads_fixture.add_locus_routes(routes)
+    if case == "static-rest":
+        fixture.add_static_routes(routes)
     if case == "repo-missing":
         del routes[("/repos/" + fixture.TARGET, ())]
     upstream = fixture.MockUpstream(routes)
@@ -723,7 +726,8 @@ def candidate_reads(out: Path, case: str = "normal", token_file: Path | None = N
             "drop-adapter-dependency": tuple(str(entry.adapter_file(worker).with_name(name))
                                              for name in entry.ADAPTER_DEPENDENCIES)}.get(case, ())
     seconds = 40.0 if case == "upstream-hang" else 150.0
-    discover = entry.checked_reads(worker, "discover", fixture.TARGET, ["PAT-001"], [], 5, 5, 3, None, 60)
+    static = ("rest", ("docs/rules",)) if case == "static-rest" else ("none", ())
+    discover = entry.checked_reads(worker, "discover", fixture.TARGET, ["PAT-001"], [], 5, 5, 3, None, 60, *static)
     analysis_dir = candidate_inputs(out / "in-discover", {"analysis.json": fixture.ANALYSIS})
 
     def summary_of(run_dir, mode, kept, reads):

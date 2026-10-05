@@ -149,6 +149,16 @@ must be one object, and all of:
   the repository and a requested pattern within the caps; locus-search: the
   discovery sha256 is the envelope's input, every search is for the repository
   and uses at most the clue cap;
+- REST static reads (#256), only when the discover request carries static_reads
+  "rest" and static_dirs (1..3 plain content-path directories, at most 3 deep, a
+  budget of at least 26 + 1 + directories + 30): the output inputs name the same
+  mode and directories; every record's static_search is rest-contents at the
+  record's head sha; its files, hits, listings and absent paths are README.md, a
+  requested directory or a .md file directly inside one; excerpts are one line of
+  at most 200 characters, files at most 256 KiB, link lists at most 200, and no
+  "content" key is kept; every contents request in the transport is a policy
+  path, README.md, a requested directory or a .md file directly inside one. A
+  default request must have no static fields in the output inputs;
 - the wrapper record and the upstream as in --collect (inner mode candidate-reads,
   its stage and status the run's).
 A value of the wrong JSON type fails the pickup (no traceback). Exit 0 only for a
@@ -179,6 +189,7 @@ import re
 import stat
 import sys
 import tarfile
+from urllib.parse import unquote, urlsplit
 
 RESULT_FILES = {"manifest.json", "report.md", "stdout.json", "stderr.log", "relay.log"}
 REQUIRED = {"manifest.json", "report.md"}
@@ -711,6 +722,16 @@ CR_VERIFIER_TAIL = "verifying-open-source-contribution-candidates/scripts/verify
 HOST_VERIFIER = HOST_SKILLS / CR_VERIFIER_TAIL
 CR_REPOSITORY = re.compile(r"\A([A-Za-z0-9][A-Za-z0-9-]{0,38})/([A-Za-z0-9_.-]{1,100})\Z")
 CR_PATTERN = re.compile(r"\APAT-\d+\Z")
+# REST static reads (#256), the verifier's constants of the same names (a test keeps them equal).
+CR_STATIC_FIELDS = {"static_reads", "static_dirs"}
+CR_STATIC_MAX_DIRS, CR_STATIC_MAX_DEPTH, CR_STATIC_MAX_FILES = 3, 3, 30
+CR_STATIC_MAX_FILE_BYTES, CR_STATIC_EXCERPT_CHARS, CR_STATIC_MAX_LINKS = 256 * 1024, 200, 200
+CR_REPOSITORY_FACT_REQUESTS = 26
+CR_CONTENT_SEGMENT = r"[A-Za-z0-9_-][A-Za-z0-9_.-]{0,254}|\.[A-Za-z0-9_-][A-Za-z0-9_.-]{0,253}"
+CR_SEGMENT = re.compile(r"\A(?:" + CR_CONTENT_SEGMENT + r")\Z")
+CR_POLICY_PATHS = ("CONTRIBUTING.md", ".github/CONTRIBUTING.md", "docs/CONTRIBUTING.md", "SECURITY.md",
+                   ".github/SECURITY.md", "docs/SECURITY.md", ".github/PULL_REQUEST_TEMPLATE.md",
+                   ".github/ISSUE_TEMPLATE", "CODE_OF_CONDUCT.md", ".github/CODE_OF_CONDUCT.md")
 
 
 def cr_files(stage: str) -> set:
@@ -727,10 +748,85 @@ def cr_clue(clue) -> bool:
             and all(ord(character) >= 32 and ord(character) != 127 for character in clue))
 
 
+def cr_static_request(request: dict) -> bool:
+    """A rest request: 1..3 different directories of plain segments and a budget over the static reserve."""
+    directories = request.get("static_dirs")
+    return (request.get("static_reads") == "rest" and isinstance(directories, list)
+            and 1 <= len(directories) <= CR_STATIC_MAX_DIRS and len(set(map(str, directories))) == len(directories)
+            and all(isinstance(d, str) and len(d.split("/")) <= CR_STATIC_MAX_DEPTH
+                    and all(CR_SEGMENT.fullmatch(s) for s in d.split("/")) for d in directories)
+            and type(request.get("request_budget")) is int
+            and request["request_budget"] >= CR_REPOSITORY_FACT_REQUESTS + 1 + len(directories) + CR_STATIC_MAX_FILES)
+
+
+def cr_static_path(path, directories) -> bool:
+    """README.md, or a Markdown file directly inside a requested directory."""
+    if not isinstance(path, str):
+        return False
+    parent, _, name = path.rpartition("/")
+    return path == "README.md" or (parent in directories and name.endswith(".md")
+                                   and CR_SEGMENT.fullmatch(name) is not None)
+
+
+def _keys(value) -> set:
+    if isinstance(value, dict):
+        return set(value).union(*(_keys(item) for item in value.values()))
+    if isinstance(value, list):
+        return set().union(*(_keys(item) for item in value))
+    return set()
+
+
+def cr_static_record_problems(record: dict, directories: list) -> list:
+    """One discover record's REST static reads: the fixed paths, the caps, no file body."""
+    problems = []
+    static = _dict(record.get("static_search"))
+    head = record.get("head_sha")
+    if not (static.get("mode") == "rest-contents" and static.get("clone_sha") is None
+            and (static.get("ref") == head if isinstance(head, str)
+                 else static.get("ref") is None and static.get("error") == "head-unavailable")):
+        return ["a record's static reads are not the REST contents reads"]
+    files, hits = static.get("files"), static.get("hits")
+    files, hits = (files if isinstance(files, list) else [None]), (hits if isinstance(hits, list) else [None])
+    listings = static.get("listings") if isinstance(static.get("listings"), list) else [None]
+    absent = static.get("absent") if isinstance(static.get("absent"), list) else [None]
+    if not (len(files) <= 1 + CR_STATIC_MAX_FILES
+            and all(cr_static_path(_dict(f).get("path"), directories) for f in files + hits)
+            and all(_dict(item).get("path") in directories for item in listings)
+            and all(item in directories or cr_static_path(item, directories) for item in absent)):
+        problems.append("a record's static reads name a path outside the fixed rule")
+    excerpts = [_dict(h).get("excerpt") for h in hits]
+    links = [static.get("external_links"), static.get("unverified_links")]
+    if not (all(isinstance(e, dict) and isinstance(e.get("text"), str) and len(e["text"]) <= CR_STATIC_EXCERPT_CHARS
+                and "\n" not in e["text"] for e in excerpts)
+            and all(type(_dict(f).get("size")) is int and _dict(f)["size"] <= CR_STATIC_MAX_FILE_BYTES for f in files)
+            and all(isinstance(item, list) and len(item) <= CR_STATIC_MAX_LINKS for item in links)
+            and "content" not in _keys(static)):
+        problems.append("a record's static evidence holds more than a one-line excerpt")
+    return problems
+
+
+def cr_contents_problems(requests: list, repository: str, directories: list) -> list:
+    """Every contents request is a policy path, README.md, a requested directory or a file directly in it."""
+    organisation = repository.split("/", 1)[0] + "/.github"
+    allowed = {f"/repos/{source}/contents/{path}" for source in (repository, organisation)
+               for path in CR_POLICY_PATHS}
+    allowed |= {f"/repos/{repository}/contents/{d}" for d in directories}
+    prefix = f"/repos/{repository}/contents/"
+    for entry in requests:
+        url = _dict(entry).get("logical_url")
+        path = unquote(urlsplit(url).path) if isinstance(url, str) else ""
+        if "/contents/" not in path or path in allowed:
+            continue
+        if not (path.startswith(prefix) and cr_static_path(path[len(prefix):], directories)):
+            return ["a contents request is outside the fixed static paths"]
+    return []
+
+
 def cr_request_problems(request: dict, stage: str) -> list:
     """The candidate-reads entry's own limits, checked again on the envelope's request."""
     problems = []
-    if set(request) != CR_REQUEST_FIELDS:
+    static = stage == "discover" and set(request) == CR_REQUEST_FIELDS | CR_STATIC_FIELDS
+    if set(request) != CR_REQUEST_FIELDS and not static:
         return ["envelope request does not hold exactly the request fields"]
     repository = request.get("repository")
     if request.get("stage") != stage:
@@ -752,7 +848,8 @@ def cr_request_problems(request: dict, stage: str) -> list:
                 and all(_bounded(request.get(name), limit) for name, limit in (
                     ("max_candidates_per_repo", CR_LIMITS["candidates"]),
                     ("max_candidates_total", CR_LIMITS["candidates"]),
-                    ("max_clues_per_pattern", CR_LIMITS["clues"]))))
+                    ("max_clues_per_pattern", CR_LIMITS["clues"])))
+                and (not static or cr_static_request(request)))
     else:
         good = (patterns == [] and isinstance(clues, list) and len(clues) <= CR_LIMITS["clues"]
                 and len(set(clues)) == len(clues) and all(cr_clue(c) for c in clues)
@@ -920,12 +1017,20 @@ def candidate_bindings(dest: Path, docs: dict, result: dict, host: dict) -> list
               and found.get("pattern_ids") == request.get("patterns")
               and found.get("request_budget") == budget and found.get("allow_clone") is False,
               "output inputs differ from the request (repository, patterns, budget, clone)")
+        directories = request.get("static_dirs") if usable and request.get("static_reads") == "rest" else None
+        check(found.get("static_reads") == "rest" and found.get("static_dirs") == directories
+              if directories is not None else not {"static_reads", "static_dirs"} & set(found),
+              "output static reads differ from the request")
+        if directories is not None and isinstance(requests, list):
+            problems += cr_contents_problems(requests, repository, directories)
         records = document.get("records")
         if check(isinstance(records, list), "output has no record list") and usable:
             for item in records:
                 item = _dict(item)
                 check(item.get("repository") == repository and item.get("pattern_id") in request["patterns"],
                       "an output record is for another repository or pattern")
+                if directories is not None:
+                    problems += [p for p in cr_static_record_problems(item, directories) if p not in problems]
             check(len(records) <= request["max_candidates_per_repo"]
                   and len(records) <= request["max_candidates_total"],
                   "the output has more candidates than the caps")

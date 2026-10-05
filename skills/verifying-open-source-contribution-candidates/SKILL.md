@@ -32,3 +32,4 @@ record and render preserve partial, failed, and unknown run states instead of de
 - Sibling collectors collect PRs; sibling analyzers derive PAT-* patterns. This skill only validates supplied patterns and alone issues CAN-* records.
 
 The script may make read-only GitHub GET requests and, only when the user permits it, shallow-clone into the session temporary area for static reading. It never installs dependencies, builds, tests, imports, or executes repository code.
+With `discover --static-reads rest [--static-dir DIR]` it instead reads `README.md` and the Markdown files directly inside each requested directory (default `docs/rules`) through the GitHub contents API at the observed head commit, applies fixed comparison rules (missing `## Options`, a README install command without `eslint`, relative links and anchors within that read set) and lists external links for a person without opening them.

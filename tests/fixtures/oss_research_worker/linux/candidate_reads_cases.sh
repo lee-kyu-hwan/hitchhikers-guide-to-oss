@@ -8,7 +8,8 @@
 #    locus-search(discover 뒤 locus-search)·
 #    drop-verifier-file(REVISION_PATHS 한 파일을 읽기 집합에서 뺌)·drop-verifier(verifier 스크립트)·
 #    drop-adapter-dependency(relay-collect)·repo-missing(대상 저장소 route 404)·upstream-hang·
-#    write-methods(srt 안에서 쓰기 메서드를 relay로 보냄)·direct-regression(proxy를 뺀 직접 접속).
+#    write-methods(srt 안에서 쓰기 메서드를 relay로 보냄)·direct-regression(proxy를 뺀 직접 접속)·
+#    static-rest(--static-reads rest로 README.md·docs/rules를 contents route로 읽는 discover → complete, #256).
 #  - 부모 EOF: hang 중 wrapper를 SIGKILL.
 #  - 정식 entry(--entry candidate-reads): 범위 밖 인자·입력은 relay 전에 exit 2, unit 밖 직접 실행은 Blocked(exit 3).
 # 증거: /var/lib/oss-research-evidence/candidate-reads-<commit>/<case>/{record.json, <stage>.tar, ...}.
@@ -43,7 +44,7 @@ except Exception:
 print(json.dumps({k: i.get(k) for k in ("stage","status","manifest","upstream_requests","upstream_non_get","upstream_authorization","upstream_proxy_authorization","output_files","policy_network","regression")})[:2400]); print("stderr_tail", repr(i.get("stderr_tail", r.get("stderr", ""))[-300:]))' $1 2>&1 | head -5
 }
 echo "== before $(state)"
-for CASE in normal anonymous-code-search locus-search drop-verifier-file drop-verifier drop-adapter-dependency repo-missing upstream-hang write-methods direct-regression; do
+for CASE in normal anonymous-code-search locus-search drop-verifier-file drop-verifier drop-adapter-dependency repo-missing upstream-hang write-methods direct-regression static-rest; do
   OUT=$(sudo mktemp -d /tmp/osr-v-out-XXXX); sudo chown ossresearch:ossresearch $OUT
   sudo "${ENV[@]}" $WRAP --entry verify --egress none --timeout 200 -- candidate-reads-case $OUT $CASE > /tmp/osr-vrec.$CASE 2>/tmp/osr-verr.$CASE
   rc=$?
@@ -86,6 +87,8 @@ refuse "clue on discover" --stage discover --repo octo/demo --pattern PAT-001 --
 refuse "repo with an option" --stage discover --repo "octo/demo --allow-clone" --pattern PAT-001
 refuse "clone option" --stage discover --repo octo/demo --pattern PAT-001 --allow-clone
 refuse "upstream option" --stage discover --repo octo/demo --pattern PAT-001 --upstream http://127.0.0.1:1
+refuse "static dir dot-dot" --stage discover --repo octo/demo --pattern PAT-001 --static-reads rest --static-dir docs/../x
+refuse "static budget 57" --stage discover --repo octo/demo --pattern PAT-001 --static-reads rest --request-budget 57
 refuse "unknown stage" --stage record --repo octo/demo --pattern PAT-001
 refuse "locus-search without its inputs" --stage locus-search --repo octo/demo --clue x
 sudo touch $IN/extra.json; sudo chmod 644 $IN/extra.json

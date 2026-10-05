@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import copy
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
@@ -12,6 +13,7 @@ import json
 import math
 import os
 from pathlib import Path
+import posixpath
 import re
 import shutil
 import ssl
@@ -666,6 +668,526 @@ def static_search(dest: Path, clues: Sequence[str]) -> Dict[str, object]:
     }
 
 
+STATIC_READS_MODES = ("none", "rest")
+STATIC_DEFAULT_DIRS = ("docs/rules",)
+STATIC_MAX_DIRS = 3
+STATIC_MAX_DEPTH = 3
+STATIC_MAX_FILES = 30
+STATIC_MAX_FILE_BYTES = 256 * 1024
+STATIC_MAX_LINKS = 200
+STATIC_EXCERPT_CHARS = 200
+STATIC_README = "README.md"
+# The most requests discover_repository makes for one repository: the repository,
+# its head, community profile, vulnerability reporting and a fork's upstream, its
+# policy paths, the owner's .github repository and that repository's policy paths.
+REPOSITORY_FACT_REQUESTS = 5 + len(POLICY_PATHS) + 1 + len(POLICY_PATHS)
+# The relay's content path segment (executable_oss-research-relay _CONTENT_SEGMENT).
+# tests/test_oss_research_relay_verify.py keeps the two equal.
+CONTENT_SEGMENT = r"[A-Za-z0-9_-][A-Za-z0-9_.-]{0,254}|\.[A-Za-z0-9_-][A-Za-z0-9_.-]{0,253}"
+_CONTENT_SEGMENT_PATTERN = re.compile(r"\A(?:" + CONTENT_SEGMENT + r")\Z")
+REST_STATIC_LIMITATION = (
+    "REST static reads cover README.md and the Markdown files directly inside the "
+    "requested directories at the observed head commit only; link targets outside "
+    "that read set are unverified and external links are listed for a person, never opened."
+)
+_FENCE_OPEN = re.compile(r"\A {0,3}(`{3,}|~{3,})(.*)\Z")
+_ATX_HEADING = re.compile(r"\A {0,3}(#{1,6})(?:[ \t]+(.*?))?(?:[ \t]+#+)?[ \t]*\Z")
+_SETEXT_UNDERLINE = re.compile(r"\A {0,3}(=+|-+)[ \t]*\Z")
+_INLINE_CODE = re.compile(r"(`+)[^`]*?\1")
+_INLINE_LINK = re.compile(
+    r"!?\[(?:[^\[\]]|\[[^\[\]]*\])*\]\(\s*(<[^<>\n]*>|[^\s()<>]+(?:\([^\s()]*\)[^\s()<>]*)*)"
+    r"(?:\s+(?:\"[^\"]*\"|'[^']*'|\([^()]*\)))?\s*\)"
+)
+_REFERENCE_DEFINITION = re.compile(r"\A {0,3}\[[^\]]+\]:[ \t]*(<[^<>\n]*>|\S+)")
+_AUTOLINK = re.compile(r"<([A-Za-z][A-Za-z0-9+.-]{1,31}:[^\s<>]*)>")
+_HTML_LINK = re.compile(r"\b(?:href|src)\s*=\s*[\"']([^\"']*)[\"']", re.IGNORECASE)
+_HTML_ANCHOR = re.compile(r"<[A-Za-z][^>]*?\b(?:id|name)\s*=\s*[\"']([^\"'<>]+)[\"']", re.IGNORECASE)
+_BARE_URL = re.compile(r"https?://[^\s<>()\[\]`\"']+")
+_URL_SCHEME = re.compile(r"\A[A-Za-z][A-Za-z0-9+.-]*:")
+_LINE_ANCHOR = re.compile(r"\AL\d+(?:C\d+)?(?:-L\d+(?:C\d+)?)?\Z")
+_INSTALL_COMMAND = re.compile(
+    r"\A\s*(?:\$\s+)?(?:npm\s+(?:install|i|add)|yarn\s+add|pnpm\s+(?:add|install|i)"
+    r"|bun\s+(?:add|install|i))((?:\s+\S+)*)\s*\Z"
+)
+
+
+def static_directory_problem(directory: object) -> Optional[str]:
+    """Why a requested static directory is outside the content path rule, or None."""
+    if not isinstance(directory, str) or not directory:
+        return "must be a non-empty relative path"
+    segments = directory.split("/")
+    if len(segments) > STATIC_MAX_DEPTH:
+        return "must be at most %d path segments deep" % STATIC_MAX_DEPTH
+    if any(_CONTENT_SEGMENT_PATTERN.fullmatch(segment) is None for segment in segments):
+        return "must use only plain path segments (no '..', '.', empty or encoded segments)"
+    return None
+
+
+def static_request_reserve(directory_count: int) -> int:
+    """The requests REST static reads may need for one repository, its facts included."""
+    return REPOSITORY_FACT_REQUESTS + 1 + directory_count + STATIC_MAX_FILES
+
+
+def _markdown_lines(text: str) -> List[Tuple[int, str, bool]]:
+    """(line number, line, inside code) for every line; fences and front matter are code."""
+    lines = text.splitlines()
+    result = []  # type: List[Tuple[int, str, bool]]
+    fence = None  # type: Optional[str]
+    front_matter = bool(lines) and lines[0].strip() == "---"
+    for index, line in enumerate(lines):
+        number = index + 1
+        if front_matter:
+            result.append((number, line, True))
+            if index > 0 and line.strip() in ("---", "..."):
+                front_matter = False
+            continue
+        if fence is not None:
+            result.append((number, line, True))
+            stripped = line.strip()
+            if stripped and set(stripped) == {fence[0]} and len(stripped) >= len(fence):
+                fence = None
+            continue
+        opened = _FENCE_OPEN.match(line)
+        if opened and not (opened.group(1)[0] == "`" and "`" in opened.group(2)):
+            fence = opened.group(1)
+            result.append((number, line, True))
+            continue
+        result.append((number, line, False))
+    return result
+
+
+def _heading_text(raw: str) -> str:
+    text = re.sub(r"!?\[([^\]]*)\]\([^)]*\)", r"\1", raw)
+    text = re.sub(r"\[([^\]]*)\]\[[^\]]*\]", r"\1", text)
+    text = re.sub(r"<[^>]+>", "", text)
+    text = text.replace("`", "")
+    text = re.sub(r"(?<![A-Za-z0-9])_+|_+(?![A-Za-z0-9])", "", text)
+    return text.strip()
+
+
+def _github_slug(text: str) -> str:
+    """GitHub's heading slug: lower case, letters, digits, '-' and '_' kept, spaces to '-'."""
+    slug = []
+    for character in text.lower():
+        if character == " ":
+            slug.append("-")
+        elif character in "-_" or character.isalnum():
+            slug.append(character)
+    return "".join(slug)
+
+
+def _markdown_headings(text: str) -> List[Tuple[int, int, str]]:
+    """(line number, level, text) of ATX and setext headings outside code."""
+    lines = _markdown_lines(text)
+    headings = []  # type: List[Tuple[int, int, str]]
+    for position, (number, line, code) in enumerate(lines):
+        if code:
+            continue
+        atx = _ATX_HEADING.match(line)
+        if atx:
+            headings.append((number, len(atx.group(1)), _heading_text(atx.group(2) or "")))
+            continue
+        if not line.strip() or position + 1 >= len(lines):
+            continue
+        _, following, following_code = lines[position + 1]
+        underline = _SETEXT_UNDERLINE.match(following)
+        if (
+            not following_code
+            and underline
+            and len(line) - len(line.lstrip(" ")) <= 3
+            and not re.match(r"\A\s*(?:[-*+>|]|\d+[.)])(?:\s|\Z)", line)
+        ):
+            level = 1 if underline.group(1)[0] == "=" else 2
+            headings.append((number, level, _heading_text(line)))
+    return headings
+
+
+def _markdown_anchors(text: str) -> set:
+    """Every anchor GitHub renders for a Markdown file: heading slugs and explicit ids."""
+    occurrences = {}  # type: Dict[str, int]
+    anchors = set()
+    for _, _, heading in _markdown_headings(text):
+        original = _github_slug(heading)
+        slug = original
+        while slug in occurrences:
+            occurrences[original] += 1
+            slug = "%s-%d" % (original, occurrences[original])
+        occurrences[slug] = 0
+        anchors.add(slug)
+    for _, line, code in _markdown_lines(text):
+        if not code:
+            anchors.update(_HTML_ANCHOR.findall(line))
+    return anchors
+
+
+def _markdown_links(text: str) -> List[Tuple[int, str]]:
+    """(line number, target) of the links in a Markdown file, outside code."""
+    links = []  # type: List[Tuple[int, str]]
+    for number, line, code in _markdown_lines(text):
+        if code:
+            continue
+        visible = _INLINE_CODE.sub("", line)
+        found = []  # type: List[str]
+        remaining = visible
+        for pattern in (_INLINE_LINK, _AUTOLINK, _HTML_LINK):
+            found.extend(match.group(1) for match in pattern.finditer(remaining))
+            remaining = pattern.sub(" ", remaining)
+        definition = _REFERENCE_DEFINITION.match(remaining)
+        if definition:
+            found.append(definition.group(1))
+            remaining = remaining[definition.end():]
+        for match in _BARE_URL.finditer(remaining):
+            found.append(match.group(0).rstrip(".,;:!?"))
+        for target in found:
+            target = target.strip()
+            if target.startswith("<") and target.endswith(">"):
+                target = target[1:-1].strip()
+            if target and (number, target) not in links:
+                links.append((number, target))
+    return links
+
+
+def _install_lines(text: str) -> List[Tuple[int, str, List[str]]]:
+    """(line number, command, packages) of package install commands inside code fences."""
+    commands = []  # type: List[Tuple[int, str, List[str]]]
+    for number, line, code in _markdown_lines(text):
+        if not code:
+            continue
+        for part in re.split(r"&&|;|\|\|", line):
+            match = _INSTALL_COMMAND.match(part)
+            if match is None:
+                continue
+            packages = [token for token in match.group(1).split() if not token.startswith("-")]
+            if packages:
+                commands.append((number, part.strip(), packages))
+    return commands
+
+
+def _static_excerpt(text: str, source: str) -> Dict[str, object]:
+    line = " ".join(text.split())
+    return _untrusted_text(
+        line[:STATIC_EXCERPT_CHARS], source, len(line) > STATIC_EXCERPT_CHARS
+    )
+
+
+def _empty_rest_static(ref: Optional[str], directories: Sequence[str]) -> Dict[str, object]:
+    return {
+        "available": False,
+        "hits": [],
+        "execution_surfaces": [],
+        "skipped_files": 0,
+        "clone_sha": None,
+        "error": None,
+        "complete": False,
+        "exclusions": {"symlink": 0, "oversize": 0, "binary": 0, "unsafe_path": 0},
+        "read_failures": [],
+        "mode": "rest-contents",
+        "ref": ref,
+        "directories": list(directories),
+        "files": [],
+        "listings": [],
+        "absent": [],
+        "external_links": [],
+        "unverified_links": [],
+        "omitted_links": 0,
+        "limits": {
+            "max_files": STATIC_MAX_FILES,
+            "max_file_bytes": STATIC_MAX_FILE_BYTES,
+            "max_links": STATIC_MAX_LINKS,
+            "excerpt_chars": STATIC_EXCERPT_CHARS,
+        },
+    }
+
+
+def _exclude(result: Dict[str, object], reason: str) -> None:
+    result["exclusions"][reason] += 1
+    result["skipped_files"] += 1
+
+
+def _rest_read_file(
+    client: object,
+    repository: str,
+    path: str,
+    ref: str,
+    warnings: List[str],
+    result: Dict[str, object],
+) -> Optional[Tuple[str, Dict[str, object], str]]:
+    """Read one fixed path at ref: (text, file entry, request path), or None."""
+    endpoint = "/repos/%s/contents/%s" % (repository, path)
+    params = {"ref": ref}
+    response = client.get_json(endpoint, params)
+    request_path = _request_path(endpoint, params)
+    if response.status == 404:
+        result["absent"].append(path)
+        return None
+    if not 200 <= response.status < 300:
+        _append_response_warning(warnings, response, request_path)
+        result["read_failures"].append({"path": path, "operation": "read"})
+        return None
+    payload = response.payload
+    if isinstance(payload, dict) and payload.get("type") in ("symlink", "submodule"):
+        _exclude(result, "symlink")
+        return None
+    content = None
+    if (
+        isinstance(payload, dict)
+        and payload.get("type") == "file"
+        and payload.get("encoding") == "base64"
+        and isinstance(payload.get("content"), str)
+        and payload.get("path") == path
+    ):
+        try:
+            content = base64.b64decode(payload["content"].encode("ascii"), validate=False)
+        except (ValueError, UnicodeEncodeError):
+            content = None
+    if content is None:
+        _append_invalid_payload_warning(warnings, request_path, "static")
+        result["read_failures"].append({"path": path, "operation": "read"})
+        return None
+    if len(content) > STATIC_MAX_FILE_BYTES:
+        _exclude(result, "oversize")
+        return None
+    try:
+        if b"\x00" in content:
+            raise UnicodeDecodeError("utf-8", content, 0, 1, "NUL byte")
+        text = content.decode("utf-8")
+    except UnicodeDecodeError:
+        _exclude(result, "binary")
+        return None
+    blob_sha = payload.get("sha")
+    entry = {
+        "path": path,
+        "blob_sha": (
+            blob_sha
+            if isinstance(blob_sha, str) and re.fullmatch(r"[0-9a-f]{40}", blob_sha)
+            else None
+        ),
+        "sha256": _sha256_bytes(content),
+        "size": len(content),
+    }
+    result["files"].append(entry)
+    return text, entry, request_path
+
+
+def _rest_list_directory(
+    client: object,
+    repository: str,
+    directory: str,
+    ref: str,
+    warnings: List[str],
+    result: Dict[str, object],
+) -> Optional[Tuple[set, List[str]]]:
+    """List one requested directory at ref: (entry names, Markdown file names), or None."""
+    endpoint = "/repos/%s/contents/%s" % (repository, directory)
+    params = {"ref": ref}
+    response = client.get_json(endpoint, params)
+    request_path = _request_path(endpoint, params)
+    if response.status == 404:
+        result["absent"].append(directory)
+        return None
+    if not 200 <= response.status < 300:
+        _append_response_warning(warnings, response, request_path)
+        result["read_failures"].append({"path": directory, "operation": "list"})
+        return None
+    if not isinstance(response.payload, list):
+        _append_invalid_payload_warning(warnings, request_path, "static-listing")
+        result["read_failures"].append({"path": directory, "operation": "list"})
+        return None
+    names = set()
+    markdown = []  # type: List[str]
+    for item in response.payload:
+        name = item.get("name") if isinstance(item, dict) else None
+        if (
+            not isinstance(name, str)
+            or _CONTENT_SEGMENT_PATTERN.fullmatch(name) is None
+            or item.get("path") != directory + "/" + name
+        ):
+            _exclude(result, "unsafe_path")
+            continue
+        names.add(name)
+        path = directory + "/" + name
+        if _execution_surface(path):
+            result["execution_surfaces"].append(path)
+        if not name.lower().endswith(".md"):
+            continue
+        kind = item.get("type")
+        if kind in ("symlink", "submodule"):
+            _exclude(result, "symlink")
+            continue
+        if kind != "file":
+            continue
+        size = item.get("size")
+        if isinstance(size, int) and not isinstance(size, bool) and size > STATIC_MAX_FILE_BYTES:
+            _exclude(result, "oversize")
+            continue
+        markdown.append(name)
+    listing = json.dumps(sorted(names), separators=(",", ":")).encode("utf-8")
+    result["listings"].append(
+        {"path": directory, "entry_count": len(names), "sha256": _sha256_bytes(listing)}
+    )
+    return names, sorted(markdown)
+
+
+def _append_capped(result: Dict[str, object], key: str, item: Dict[str, object]) -> None:
+    if len(result[key]) < STATIC_MAX_LINKS:
+        result[key].append(item)
+    else:
+        result["omitted_links"] += 1
+
+
+def _check_links(
+    result: Dict[str, object],
+    documents: Sequence[Tuple[str, str, Dict[str, object], str]],
+    listed: Dict[str, set],
+) -> None:
+    """Relative link and anchor hits within the read set; the rest are listed, never read."""
+    anchors = {path: {a.lower() for a in _markdown_anchors(text)} for path, text, _, _ in documents}
+    absent = set(result["absent"])
+    for path, text, entry, source in documents:
+        lines = text.splitlines()
+        for number, target in _markdown_links(text):
+            if _URL_SCHEME.match(target) or target.startswith("//"):
+                _append_capped(
+                    result, "external_links", {"path": path, "line": number, "url": target[:300]}
+                )
+                continue
+            location, _, fragment = target.partition("#")
+            location = unquote(location.partition("?")[0])
+            anchor = unquote(fragment)
+            if location:
+                joined = (
+                    location.lstrip("/")
+                    if location.startswith("/")
+                    else posixpath.join(posixpath.dirname(path), location)
+                )
+                resolved = posixpath.normpath(joined) if joined else "."
+            else:
+                resolved = path
+            resolved = "" if resolved == "." else resolved
+            parent, name = posixpath.split(resolved)
+
+            def unverified(reason: str) -> None:
+                _append_capped(
+                    result,
+                    "unverified_links",
+                    {"path": path, "line": number, "target": target[:300], "reason": reason},
+                )
+
+            def hit(rule: str) -> None:
+                result["hits"].append(
+                    {
+                        "path": path,
+                        "line": number,
+                        "clue": rule,
+                        "rule": rule,
+                        "target": target[:300],
+                        "excerpt": _static_excerpt(lines[number - 1], source),
+                        "blob_sha": entry["blob_sha"],
+                        "sha256": entry["sha256"],
+                    }
+                )
+
+            if resolved == ".." or resolved.startswith("../"):
+                unverified("outside-repository")
+            elif resolved in anchors:
+                if anchor and _LINE_ANCHOR.fullmatch(anchor) is None and anchor.lower() not in anchors[resolved]:
+                    hit("relative-link-missing-anchor")
+            elif resolved in absent or parent in absent:
+                hit("relative-link-missing-target")
+            elif resolved in listed or (parent in listed and name in listed[parent]):
+                if anchor and _LINE_ANCHOR.fullmatch(anchor) is None:
+                    unverified("anchor-not-read")
+            elif parent in listed:
+                hit("relative-link-missing-target")
+            else:
+                unverified("outside-read-set")
+
+
+def rest_static_reads(
+    client: object,
+    repository: str,
+    ref: str,
+    directories: Sequence[str],
+    warnings: List[str],
+) -> Dict[str, object]:
+    """Read README.md and the requested directories' Markdown files at ref and compare them.
+
+    The paths come from the fixed rule and the requested directories only; nothing
+    read from the repository chooses another path, and no link is ever opened.
+    """
+    result = _empty_rest_static(ref, directories)
+    documents = []  # type: List[Tuple[str, str, Dict[str, object], str]]
+    rule_documents = []  # type: List[Tuple[str, str, Dict[str, object], str]]
+    readme = _rest_read_file(client, repository, STATIC_README, ref, warnings, result)
+    if readme is not None:
+        documents.append((STATIC_README,) + readme)
+    listed = {}  # type: Dict[str, set]
+    rule_reads = 0
+    for directory in directories:
+        listing = _rest_list_directory(client, repository, directory, ref, warnings, result)
+        if listing is None:
+            continue
+        names, markdown = listing
+        listed[directory] = names
+        allowed = max(STATIC_MAX_FILES - rule_reads, 0)
+        if len(markdown) > allowed:
+            result["read_failures"].append({"path": directory, "operation": "file-cap"})
+            markdown = markdown[:allowed]
+        for name in markdown:
+            rule_reads += 1
+            path = directory + "/" + name
+            read = _rest_read_file(client, repository, path, ref, warnings, result)
+            if read is not None:
+                documents.append((path,) + read)
+                rule_documents.append((path,) + read)
+
+    for path, text, entry, source in rule_documents:
+        headings = _markdown_headings(text)
+        if any(level == 2 and heading.casefold() == "options" for _, level, heading in headings):
+            continue
+        sections = " | ".join(heading for _, level, heading in headings if level == 2)
+        result["hits"].append(
+            {
+                "path": path,
+                "line": 0,
+                "clue": "options-heading-missing",
+                "rule": "options-heading-missing",
+                "excerpt": _static_excerpt(sections, source),
+                "blob_sha": entry["blob_sha"],
+                "sha256": entry["sha256"],
+            }
+        )
+    if readme is not None:
+        text, entry, source = readme
+        commands = _install_lines(text)
+        if commands and not any(
+            package == "eslint" or package.startswith("eslint@")
+            for _, _, packages in commands
+            for package in packages
+        ):
+            number, command, _ = commands[0]
+            result["hits"].append(
+                {
+                    "path": STATIC_README,
+                    "line": number,
+                    "clue": "readme-install-without-eslint",
+                    "rule": "readme-install-without-eslint",
+                    "excerpt": _static_excerpt(command, source),
+                    "blob_sha": entry["blob_sha"],
+                    "sha256": entry["sha256"],
+                }
+            )
+    _check_links(result, documents, listed)
+    result["execution_surfaces"].sort()
+    result["available"] = True
+    result["complete"] = not result["read_failures"]
+    if result["read_failures"]:
+        warning = "static-search-incomplete:%d" % len(result["read_failures"])
+        if warning not in warnings:
+            warnings.append(warning)
+    return result
+
+
 def _directory_size(path: Path) -> int:
     total = 0
     if not path.exists():
@@ -1258,6 +1780,8 @@ def build_parser() -> argparse.ArgumentParser:
     discover.add_argument("--keep-clone", action="store_true")
     discover.add_argument("--max-clues-per-pattern", type=_positive_integer, default=5)
     discover.add_argument("--fixture-dir")
+    discover.add_argument("--static-reads", choices=STATIC_READS_MODES, default="none")
+    discover.add_argument("--static-dir", action="append", default=[])
 
     record = subparsers.add_parser("record")
     record.add_argument("--discovery", required=True)
@@ -1314,6 +1838,8 @@ def _validate_discover_arguments(arguments: argparse.Namespace) -> None:
     for pattern_id in arguments.pattern:
         if PATTERN_ID_PATTERN.fullmatch(pattern_id) is None:
             raise CliInputError("pattern must use PAT-<n> syntax: %s" % pattern_id)
+    if arguments.static_reads == "rest" and arguments.allow_clone:
+        raise CliInputError("static-reads rest and allow-clone are separate static modes")
     if arguments.clone_root is not None and not arguments.allow_clone:
         raise CliInputError("clone-root requires --allow-clone")
     if arguments.keep_clone and not arguments.allow_clone:
@@ -1335,6 +1861,26 @@ def _validate_discover_arguments(arguments: argparse.Namespace) -> None:
                 "clone-root must resolve below the temporary area %s" % temporary_root
             )
         arguments.clone_root = clone_root
+    if arguments.static_dir and arguments.static_reads != "rest":
+        raise CliInputError("static-dir requires --static-reads rest")
+    if arguments.static_reads == "rest":
+        directories = list(arguments.static_dir) or list(STATIC_DEFAULT_DIRS)
+        if len(directories) > STATIC_MAX_DIRS:
+            raise CliInputError("static-dir accepts at most %d directories" % STATIC_MAX_DIRS)
+        if len(directories) != len(set(directories)):
+            raise CliInputError("static-dir values must not contain duplicates")
+        for directory in directories:
+            problem = static_directory_problem(directory)
+            if problem is not None:
+                raise CliInputError("static-dir %s" % problem)
+        needed = len(repositories) * static_request_reserve(len(directories))
+        if arguments.request_budget < needed:
+            raise CliInputError(
+                "request-budget must be at least %d for REST static reads "
+                "(repository facts, README.md, directory listings and %d files per repository)"
+                % (needed, STATIC_MAX_FILES)
+            )
+        arguments.static_dir = directories
 
 
 def _read_analysis(path: str) -> Dict[str, object]:
@@ -2256,6 +2802,21 @@ def _static_record(
     return result
 
 
+def _repository_rest_static(
+    client: object,
+    repository: str,
+    state: Dict[str, object],
+    directories: Sequence[str],
+) -> Dict[str, object]:
+    """REST static reads at the head commit discover observed, or why they could not run."""
+    head_sha = state.get("head_sha")
+    if not isinstance(head_sha, str):
+        result = _empty_rest_static(None, directories)
+        result["error"] = "head-unavailable"
+        return result
+    return rest_static_reads(client, repository, head_sha, directories, state["warnings"])
+
+
 def _evidence_status(remote_hits: bool, static_hits: bool) -> str:
     if remote_hits and static_hits:
         return "remote+static"
@@ -2384,6 +2945,13 @@ def run_discover(
         }
         try:
             state = discover_repository(client, repository, state)
+            if (
+                arguments.static_reads == "rest"
+                and state["outcome"] not in ACCESS_FAILURE_OUTCOMES
+            ):
+                state["rest_static"] = _repository_rest_static(
+                    client, repository, state, arguments.static_dir
+                )
         except BudgetExhausted:
             exhausted = True
             if state["stages_completed"]:
@@ -2468,6 +3036,12 @@ def run_discover(
                 )
                 checks = state["repository_checks"]
                 remote_hits = bool(code_search["hits"])
+                rest_static = state.get("rest_static")
+                if rest_static is not None:
+                    record["static_search"] = copy.deepcopy(rest_static)
+                    record["evidence_status"] = _evidence_status(
+                        remote_hits, bool(rest_static["hits"])
+                    )
                 clone_allowed = (
                     arguments.allow_clone
                     and isinstance(checks, dict)
@@ -2553,6 +3127,10 @@ def run_discover(
         "api_version": arguments.api_version,
     }
     method_limitations = [SEARCH_INDEX_LIMITATION]
+    if arguments.static_reads == "rest":
+        inputs["static_reads"] = "rest"
+        inputs["static_dirs"] = list(arguments.static_dir)
+        method_limitations.append(REST_STATIC_LIMITATION)
     warnings = []
     for state in repository_states:
         for warning in state["warnings"]:

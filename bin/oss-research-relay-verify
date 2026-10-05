@@ -5,7 +5,8 @@
         --skills-dir DIR --transport-record T.json --timeout-seconds S --max-response-bytes N \\
         --deadline-seconds D [--require-proxy] --analysis A.json --repo OWNER/NAME \\
         --output D.json --manifest M.json [--pattern PAT-001] [--max-candidates-per-repo N] \\
-        [--max-candidates-total N] [--request-budget N] [--max-clues-per-pattern N]
+        [--max-candidates-total N] [--request-budget N] [--max-clues-per-pattern N] \\
+        [--static-reads none|rest] [--static-dir DIR ...]
     executable_oss-research-relay-verify locus-search ... --discovery D.json \\
         --assessment A.json --output L.json --manifest M.json [--clue C] [--request-budget N] \\
         [--max-clues-per-locus N]
@@ -28,6 +29,14 @@ No credential: the step refuses to start when GH_TOKEN or GITHUB_TOKEN is set
 the relay itself never has one. No clone (``--allow-clone`` is not accepted),
 no record/recheck/render: only discover and locus-search, which read.
 
+``--static-reads rest`` (discover only; default ``none``) passes the verifier's
+REST static reads on: README.md and the Markdown files directly inside each
+``--static-dir`` (at most STATIC_MAX_DIRS, each at most STATIC_MAX_DEPTH plain
+segments of the relay's content path rule), read through the relay's existing
+contents route. The values are checked here before anything is loaded or sent
+(exit 2) and passed on as checked; without ``rest`` the verifier's argv is the
+same as before, byte for byte.
+
 Relay answers keep the verifier's own classification: a relayed response keeps
 GitHub's status and payload; an upstream error keeps its status and message
 (a 401 from code search, a 403 or 404 from a policy source stay what they
@@ -47,6 +56,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import re
 import sys
 import time
 import types
@@ -57,6 +67,13 @@ VERIFIER_SCRIPT = Path("verifying-open-source-contribution-candidates/scripts/ve
 ADAPTER = "executable_oss-research-relay-collect"
 TOKEN_VARIABLES = ("GH_TOKEN", "GITHUB_TOKEN")
 MAX_DEADLINE_SECONDS = 1800.0
+STATIC_READS_MODES = ("none", "rest")
+STATIC_MAX_DIRS = 3
+STATIC_MAX_DEPTH = 3
+# The relay's content path segment (executable_oss-research-relay _CONTENT_SEGMENT, the
+# verifier's CONTENT_SEGMENT). tests/test_oss_research_relay_verify.py keeps the three equal.
+CONTENT_SEGMENT = r"[A-Za-z0-9_-][A-Za-z0-9_.-]{0,254}|\.[A-Za-z0-9_-][A-Za-z0-9_.-]{0,253}"
+_STATIC_SEGMENT = re.compile(r"\A(?:" + CONTENT_SEGMENT + r")\Z")
 TRANSPORT_NOTE = (
     "logical_url is the verifier's api.github.com request. The adapter sent it to the loopback "
     "relay over plain HTTP; it did not connect to api.github.com and this record is not TLS evidence."
@@ -181,6 +198,8 @@ def build_parser(relay_collect: Any) -> argparse.ArgumentParser:
     discover.add_argument("--max-candidates-per-repo", type=int, default=5)
     discover.add_argument("--max-candidates-total", type=int, default=5)
     discover.add_argument("--max-clues-per-pattern", type=int, default=5)
+    discover.add_argument("--static-reads", choices=STATIC_READS_MODES, default="none")
+    discover.add_argument("--static-dir", action="append", default=[])
     locus = commands.choices["locus-search"]
     locus.add_argument("--discovery", required=True)
     locus.add_argument("--assessment", required=True)
@@ -200,12 +219,32 @@ def verifier_argv(args: argparse.Namespace) -> list[str]:
                  "--max-clues-per-pattern", str(args.max_clues_per_pattern)]
         for pattern in args.pattern:
             argv += ["--pattern", pattern]
+        if args.static_reads == "rest":
+            argv += ["--static-reads", "rest"]
+            for directory in args.static_dir:
+                argv += ["--static-dir", directory]
     else:
         argv += ["--discovery", args.discovery, "--assessment", args.assessment,
                  "--max-clues-per-locus", str(args.max_clues_per_locus)]
         for clue in args.clue:
             argv += ["--clue", clue]
     return argv
+
+
+def static_problem(args: argparse.Namespace) -> Optional[str]:
+    """Why discover's static options are outside the fixed rule, or None."""
+    if args.stage != "discover":
+        return None
+    directories = args.static_dir
+    if directories and args.static_reads != "rest":
+        return "--static-dir requires --static-reads rest"
+    if len(directories) > STATIC_MAX_DIRS or len(set(directories)) != len(directories):
+        return "--static-dir takes at most %d different directories" % STATIC_MAX_DIRS
+    for directory in directories:
+        segments = directory.split("/")
+        if len(segments) > STATIC_MAX_DEPTH or any(_STATIC_SEGMENT.fullmatch(s) is None for s in segments):
+            return "--static-dir must be at most %d plain relative path segments" % STATIC_MAX_DEPTH
+    return None
 
 
 def main(argv: Optional[list[str]] = None, *, environ: Optional[dict[str, str]] = None,
@@ -215,6 +254,10 @@ def main(argv: Optional[list[str]] = None, *, environ: Optional[dict[str, str]] 
     relay_collect = load_relay_collect()
     parser = build_parser(relay_collect)
     args = parser.parse_args(argv)
+    problem = static_problem(args)
+    if problem is not None:
+        print("error: {0}".format(problem), file=sys.stderr)
+        return 2
     if any(name in environ for name in TOKEN_VARIABLES):
         print("error: a GitHub token variable is set; this step runs without any credential", file=sys.stderr)
         return 2

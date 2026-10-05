@@ -178,6 +178,7 @@ upstream을 호출하지 않는다. `{"ok":true,"budget":{...}}`를 돌려준다
 - 익명 코드 검색은 GitHub가 401로 답하는 것으로 가정하고 그 응답을 그대로 전달한다. 실제 익명 응답은
   이 문서의 어떤 실행으로도 측정하지 않았다(fixture mock만).
 - 이 경로는 mock으로만 검증했다. 오프라인 시험은 `tests/test_oss_research_relay_verify.py`, 격리 안(srt·unit) 실행은 비AI entry `executable_oss-research-candidate-reads`(`linux-run --entry candidate-reads`)가 한다. entry는 relay를 `--repo <대상>`과 `--repo <소유자>/.github` 두 저장소로만 띄우고 요청 예산을 60 이하로 고정하며, 호스트 회수는 `verify_pickup.py --candidate-reads`가 한다(`oss-research-worker.md` 「후보 verifier 읽기 entry」). relay의 허용 route·메서드·예산 규칙은 entry를 만들면서 넓히지 않았다. 실제 GitHub 조회와 익명 코드 검색 응답은 측정하지 않았다.
+- REST 정적 대조(#256, `discover --static-reads rest`)도 **route를 더하지 않는다**. verifier는 기존 `contents` route로 `README.md`, 요청한 디렉터리(최대 3개, 깊이 3, 이 relay의 `_CONTENT_PATH` segment 규칙) 목록, 그 바로 아래 `.md` 파일만 `ref=<discover가 본 head sha>`로 읽는다(full sha라 branch 관찰 규칙과 무관). adapter·entry·verifier가 같은 segment 규칙(`CONTENT_SEGMENT`, 시험이 이 relay의 `_CONTENT_SEGMENT`와 같게 고정)으로 relay 전에 거부하고(exit 2), 예산은 저장소당 26(저장소 사실)+1+디렉터리 수+30 이상이어야 한다. 링크가 가리키는 외부 URL은 열지 않는다(목록만). 오프라인 시험은 `tests/test_oss_research_relay_verify.py` `StaticReadsTests`(직접 실행과 relay 실행의 discovery가 같고, upstream에 간 contents 요청이 고정 경로뿐). mock으로만 검증했고 실제 GitHub 조회는 하지 않았다.
 
 ### `POST /v1/graphql`
 

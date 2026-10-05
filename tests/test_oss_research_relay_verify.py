@@ -144,6 +144,34 @@ def world(*, org_branch="trunk", pvr_status=200, code_status=401, fork_parent=No
     return routes
 
 
+STATIC_README = b"# demo\n\n## Install\n\n```sh\nnpm install demo-plugin\n```\n\n- [one](docs/rules/one.md)\n" \
+    b"- [gone](docs/rules/gone.md)\n- [site](https://example.com/x)\n"
+STATIC_DOCS = {"one.md": b"# one\n\n## Rule Details\n", "two.md": b"# two\n\n## Options\n\nNone.\n"}
+
+
+def add_static_routes(routes, readme=STATIC_README, docs=None, directory="docs/rules"):
+    """README.md and one rule directory at HEAD, the way the contents route answers them."""
+    docs = STATIC_DOCS if docs is None else docs
+
+    def url(path):
+        return "%s/repos/%s/contents/%s?ref=%s" % (API, TARGET, path, HEAD)
+
+    def file(path, data):
+        return {"type": "file", "encoding": "base64", "content": base64.b64encode(data).decode(), "size": len(data),
+                "sha": "%040x" % len(path), "path": path, "name": path.rsplit("/", 1)[-1], "url": url(path),
+                "html_url": "https://github.com/%s/blob/%s/%s" % (TARGET, HEAD, path)}
+
+    def add(path, payload):
+        routes[("/repos/%s/contents/%s" % (TARGET, path), _query_key("ref=" + HEAD))] = {"status": 200, "payload": payload}
+
+    add("README.md", file("README.md", readme))
+    add(directory, [{"type": "file", "name": name, "path": directory + "/" + name, "sha": "%040x" % index,
+                     "size": len(data), "url": url(directory + "/" + name)}
+                    for index, (name, data) in enumerate(sorted(docs.items()))])
+    for name, data in docs.items():
+        add(directory + "/" + name, file(directory + "/" + name, data))
+
+
 class MockUpstream(http.server.ThreadingHTTPServer):
     daemon_threads = True
 
@@ -260,14 +288,16 @@ class Harness(unittest.TestCase):
                 "--max-candidates-total", "5", "--max-clues-per-pattern", "3"]
         return argv, out
 
-    def direct(self):
-        argv, out = self.discover_argv("direct")
+    def direct(self, **extra):
+        argv, out = self.discover_argv("direct", **extra)
+        argv += list(extra.get("static", ()))
         code = verifier.main(["discover"] + argv, opener=UpstreamOpener(self.upstream),
                              sleeper=lambda seconds: None, clock=lambda: FIXED_TIME)
         return code, out
 
     def relayed(self, name="relayed", environ=None, **extra):
         argv, out = self.discover_argv(name, **extra)
+        argv += list(extra.get("static", ()))
         code = adapter.main(["discover", "--relay-url", "http://127.0.0.1:%d" % self.port, "--skills-dir", str(SKILLS),
                              "--transport-record", str(out) + "-transport.json", "--timeout-seconds", "30",
                              "--max-response-bytes", str(1 << 20), "--deadline-seconds", "60"] + argv,
@@ -460,6 +490,92 @@ class BudgetTests(Harness):
         transport = _load_json(str(out) + "-transport.json")
         self.assertIn("relay-budget-exhausted", [entry.get("outcome") for entry in transport["requests"]])
         self.assertLessEqual(len(self.upstream.requests), 5)
+
+
+STATIC = ("--static-reads", "rest", "--static-dir", "docs/rules")
+
+
+class StaticReadsTests(Harness):
+    """--static-reads rest through the adapter and the unchanged relay (#256)."""
+
+    def setUp(self):
+        super().setUp()
+        add_static_routes(self.upstream.routes)
+
+    def test_relayed_static_reads_match_direct_and_read_only_the_fixed_paths(self):
+        direct_code, direct_out = self.direct(static=STATIC)
+        self.upstream.requests.clear()
+        relayed_code, relayed_out = self.relayed(static=STATIC)
+        self.assertEqual((direct_code, relayed_code), (3, 3))  # the anonymous code search 401 stays partial
+        direct, relayed = (_load_json(str(out) + "-discovery.json") for out in (direct_out, relayed_out))
+        self.assertEqual(_differences(direct, relayed), [])
+        static = relayed["records"][0]["static_search"]
+        self.assertEqual((static["mode"], static["ref"], static["complete"]), ("rest-contents", HEAD, True))
+        self.assertEqual(sorted((hit["rule"], hit["path"], hit["line"]) for hit in static["hits"]), [
+            ("options-heading-missing", "docs/rules/one.md", 0),
+            ("readme-install-without-eslint", "README.md", 6),
+            ("relative-link-missing-target", "README.md", 10)])
+        self.assertEqual([item["url"] for item in static["external_links"]], ["https://example.com/x"])
+        # The relay adds its fixed per_page upstream; the path and the ref are the verifier's.
+        contents = sorted(r["path"].partition("?")[0] for r in self.upstream.requests
+                          if "/contents/" in r["path"] and "ref=" + HEAD in r["path"])
+        self.assertEqual(contents, ["/repos/%s/contents/%s" % (TARGET, path) for path in (
+            "README.md", "docs/rules", "docs/rules/one.md", "docs/rules/two.md")])
+        self.assertFalse([r for r in self.upstream.requests if "example.com" in r["path"]])
+        transport = _load_json(str(relayed_out) + "-transport.json")
+        self.assertTrue(all(entry["outcome"] in ("relayed", "upstream-error") for entry in transport["requests"]))
+
+    def test_the_verifier_argv_is_unchanged_without_rest(self):
+        relay_collect = adapter.load_relay_collect()
+        common = ["discover", "--relay-url", "http://127.0.0.1:1", "--skills-dir", str(SKILLS),
+                  "--transport-record", "t", "--timeout-seconds", "30", "--max-response-bytes", "1024",
+                  "--deadline-seconds", "60", "--output", "o", "--manifest", "m", "--request-budget", "60",
+                  "--analysis", "a", "--repo", TARGET, "--pattern", "PAT-001"]
+        legacy = ["discover", "--output", "o", "--manifest", "m", "--request-budget", "60", "--analysis", "a",
+                  "--repo", TARGET, "--max-candidates-per-repo", "5", "--max-candidates-total", "5",
+                  "--max-clues-per-pattern", "5", "--pattern", "PAT-001"]
+        parse = adapter.build_parser(relay_collect).parse_args
+        self.assertEqual(adapter.verifier_argv(parse(common)), legacy)
+        self.assertEqual(adapter.verifier_argv(parse(common + ["--static-reads", "none"])), legacy)
+        self.assertEqual(adapter.verifier_argv(parse(common + ["--static-reads", "rest"])),
+                         legacy + ["--static-reads", "rest"])
+        self.assertEqual(adapter.verifier_argv(parse(common + list(STATIC) + ["--static-dir", "docs"])),
+                         legacy + list(STATIC) + ["--static-dir", "docs"])
+
+    def test_out_of_rule_static_options_stop_before_the_network(self):
+        cases = {
+            "dir without rest": ("--static-dir", "docs/rules"),
+            "dot-dot": ("--static-reads", "rest", "--static-dir", "docs/../x"),
+            "absolute": ("--static-reads", "rest", "--static-dir", "/docs"),
+            "too deep": ("--static-reads", "rest", "--static-dir", "a/b/c/d"),
+            "too many": ("--static-reads", "rest", "--static-dir", "a", "--static-dir", "b", "--static-dir", "c",
+                         "--static-dir", "d"),
+            "duplicate": ("--static-reads", "rest", "--static-dir", "a", "--static-dir", "a"),
+            "encoded": ("--static-reads", "rest", "--static-dir", "docs%2Frules"),
+        }
+        for name, static in cases.items():
+            with self.subTest(name):
+                code, out = self.relayed(name="bad-" + name.replace(" ", "-"), static=static)
+                self.assertEqual(code, 2)
+                self.assertFalse(Path(str(out) + "-discovery.json").exists())
+                self.assertFalse(Path(str(out) + "-transport.json").exists())
+        with self.assertRaises(SystemExit) as raised:
+            self.relayed(name="bad-mode", static=("--static-reads", "clone"))
+        self.assertEqual(raised.exception.code, 2)
+        # The verifier's own budget floor (repository facts, README, listings, 30 files) also stops early.
+        code, out = self.relayed(name="small-budget", static=STATIC, budget=57)
+        self.assertEqual(code, 2)
+        self.assertEqual(self.upstream.requests, [])
+
+    def test_the_content_path_rule_is_the_relays(self):
+        self.assertEqual(adapter.CONTENT_SEGMENT, relay_module._CONTENT_SEGMENT)
+        self.assertEqual(verifier.CONTENT_SEGMENT, relay_module._CONTENT_SEGMENT)
+        self.assertEqual((adapter.STATIC_READS_MODES, adapter.STATIC_MAX_DIRS, adapter.STATIC_MAX_DEPTH),
+                         (verifier.STATIC_READS_MODES, verifier.STATIC_MAX_DIRS, verifier.STATIC_MAX_DEPTH))
+        # Every path the static reads can request is a contents path the relay accepts.
+        pattern = re.compile(r"\A" + relay_module._CONTENT_PATH + r"\Z")
+        for path in ("README.md", "docs/rules", "docs/rules/one.md", ".github/x/y.md", "a/b/c/" + "n" * 200 + ".md"):
+            self.assertIsNotNone(pattern.match(path), path)
 
 
 if __name__ == "__main__":

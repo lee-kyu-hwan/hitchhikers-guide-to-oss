@@ -189,7 +189,7 @@ class CandidateReadsEntryTests(EntryCase):
         self.assertEqual(options, {"--out-dir", "--input-dir", "--stage", "--repo", "--pattern", "--clue",
                                    "--max-candidates-per-repo", "--max-candidates-total",
                                    "--max-clues-per-pattern", "--max-clues-per-locus", "--request-budget",
-                                   "--timeout", "--github-token-file"})
+                                   "--timeout", "--github-token-file", "--static-reads", "--static-dir"})
 
     def test_the_read_set_is_the_verifiers_revision_files(self):
         verifier = relay_verify_tests.verifier
@@ -902,6 +902,164 @@ class OfflinePartialLocusSearchTests(LocusCase):
         code, seen = self.pickup("locus-search", self.members("locus-search", run_dir))
         self.assertEqual((code, seen["problems"], seen["step_status"]), (3, [], "partial"), seen)
         self.assertIn("404", seen["upstream_errors"])
+
+
+STATIC_DIRS = ("docs/rules",)
+
+
+class StaticReadsEntryTests(EntryCase):
+    """--static-reads rest (#256): the entry's limits, request and child argv."""
+
+    def test_static_reads_are_inside_fixed_limits_and_the_default_request_is_unchanged(self):
+        legacy = set(self.discover().as_request())
+        self.assertNotIn("static_reads", legacy)
+        rest = self.discover(static_reads="rest", static_dirs=STATIC_DIRS)
+        self.assertEqual(set(rest.as_request()) - legacy, {"static_reads", "static_dirs"})
+        self.assertEqual((rest.as_request()["static_reads"], rest.as_request()["static_dirs"]), ("rest", ["docs/rules"]))
+        self.assertEqual(self.discover(static_reads="rest", static_dirs=("a", "b/c", ".github/x"),
+                                       request_budget=60).static_dirs, ("a", "b/c", ".github/x"))
+        bad = {"unknown mode": dict(static_reads="clone"), "rest without a directory": dict(static_reads="rest"),
+               "a directory without rest": dict(static_dirs=STATIC_DIRS),
+               "dot-dot": dict(static_reads="rest", static_dirs=("docs/../x",)),
+               "absolute": dict(static_reads="rest", static_dirs=("/docs",)),
+               "too deep": dict(static_reads="rest", static_dirs=("a/b/c/d",)),
+               "four directories": dict(static_reads="rest", static_dirs=("a", "b", "c", "d")),
+               "duplicate": dict(static_reads="rest", static_dirs=("a", "a")),
+               "encoded": dict(static_reads="rest", static_dirs=("docs%2Frules",)),
+               "not a string": dict(static_reads="rest", static_dirs=(1,)),
+               "budget below the static reserve": dict(static_reads="rest", static_dirs=STATIC_DIRS, request_budget=57),
+               "three directories over the budget": dict(static_reads="rest", static_dirs=("a", "b", "c"),
+                                                         request_budget=59)}
+        for label, change in bad.items():
+            with self.subTest(label), self.assertRaises(ValueError):
+                self.discover(**change)
+        with self.assertRaises(ValueError):
+            self.locus(static_reads="rest", static_dirs=STATIC_DIRS)
+
+    def test_the_limits_are_the_verifiers(self):
+        verifier = relay_verify_tests.verifier
+        self.assertEqual((entry.STATIC_READS_MODES, entry.STATIC_DEFAULT_DIRS, entry.STATIC_MAX_DIRS,
+                          entry.STATIC_MAX_DEPTH, entry.STATIC_MAX_FILES, entry.REPOSITORY_FACT_REQUESTS,
+                          entry.CONTENT_SEGMENT),
+                         (verifier.STATIC_READS_MODES, verifier.STATIC_DEFAULT_DIRS, verifier.STATIC_MAX_DIRS,
+                          verifier.STATIC_MAX_DEPTH, verifier.STATIC_MAX_FILES, verifier.REPOSITORY_FACT_REQUESTS,
+                          verifier.CONTENT_SEGMENT))
+        pickup = load("verify_pickup_for_static", VERIFY)
+        self.assertEqual((pickup.CR_STATIC_MAX_DIRS, pickup.CR_STATIC_MAX_DEPTH, pickup.CR_STATIC_MAX_FILES,
+                          pickup.CR_STATIC_MAX_FILE_BYTES, pickup.CR_STATIC_EXCERPT_CHARS, pickup.CR_STATIC_MAX_LINKS,
+                          pickup.CR_REPOSITORY_FACT_REQUESTS, pickup.CR_CONTENT_SEGMENT, pickup.CR_POLICY_PATHS),
+                         (verifier.STATIC_MAX_DIRS, verifier.STATIC_MAX_DEPTH, verifier.STATIC_MAX_FILES,
+                          verifier.STATIC_MAX_FILE_BYTES, verifier.STATIC_EXCERPT_CHARS, verifier.STATIC_MAX_LINKS,
+                          verifier.REPOSITORY_FACT_REQUESTS, verifier.CONTENT_SEGMENT, verifier.POLICY_PATHS))
+
+    def test_the_child_gets_the_static_options_only_in_rest_mode(self):
+        run_dir, input_dir = self.root / "run", self.root / "in"
+        legacy = entry.adapter_arguments(worker, self.discover(), 1, run_dir, input_dir, 300.0)
+        self.assertFalse([a for a in legacy if a.startswith("--static")])
+        rest = entry.adapter_arguments(worker, self.discover(static_reads="rest", static_dirs=("docs/rules", "docs")),
+                                       1, run_dir, input_dir, 300.0)
+        self.assertEqual(rest[len(legacy):], ["--static-reads", "rest", "--static-dir", "docs/rules",
+                                              "--static-dir", "docs"])
+        self.assertEqual(rest[:len(legacy)], legacy)
+
+    def test_main_takes_the_default_directory_and_refuses_bad_static_options_before_the_relay(self):
+        real = entry.load_collect_entry()
+        local = real.load_worker()
+        launches, seen = [], []
+        local.relay_launch = lambda *args, **kwargs: launches.append(args)
+        real.load_worker = lambda *args, **kwargs: local
+        out = self.root / "out"
+        out.mkdir()
+        directory = self.inputs("in", {"analysis.json": {"patterns": [{"pattern_id": "PAT-001", "superseded_by": None}]}})
+        base = ["--out-dir", str(out), "--input-dir", str(directory), "--stage", "discover", "--repo", TARGET,
+                "--pattern", "PAT-001"]
+        original = entry.checked_reads
+
+        def recording(*args, **kwargs):
+            reads = original(*args, **kwargs)
+            seen.append(reads)
+            return reads
+
+        with mock.patch.object(entry, "load_collect_entry", lambda *args: real), mock.patch.object(sys, "stderr"), \
+                mock.patch.object(entry, "checked_reads", recording):
+            for label, arguments in (("dot-dot", base + ["--static-reads", "rest", "--static-dir", "../x"]),
+                                     ("dir without rest", base + ["--static-dir", "docs/rules"]),
+                                     ("unknown mode", base + ["--static-reads", "clone"]),
+                                     ("small budget", base + ["--static-reads", "rest", "--request-budget", "57"]),
+                                     ("on locus-search", base[:5] + ["locus-search"] + base[6:7] + [TARGET]
+                                      + ["--static-reads", "rest"])):
+                with self.subTest(label):
+                    self.assertEqual(entry.main(arguments), 2)
+            environment = {k: v for k, v in os.environ.items() if k != worker.UNIT_ENV_MARKER}
+            with mock.patch.dict(os.environ, environment, clear=True):
+                self.assertEqual(entry.main(base + ["--static-reads", "rest"]), 3)  # outside the unit: Blocked
+        self.assertEqual((seen[-1].static_reads, seen[-1].static_dirs), ("rest", ("docs/rules",)))
+        self.assertEqual(launches, [])
+        self.assertEqual(list(out.iterdir()), [])
+
+
+class OfflineStaticDiscoverTests(PickupCase):
+    """A real offline rest-mode discover (relay, adapter, verifier) and its pickup."""
+
+    def setUp(self):
+        super().setUp()
+        relay_verify_tests.add_static_routes(self.upstream.routes)
+
+    def static_run(self):
+        reads, directory = self.discover_run(static_reads="rest", static_dirs=STATIC_DIRS)
+        run_dir, kept, manifest = self.step("run", reads, directory, 3)
+        self.assertEqual((kept, manifest["status"], manifest["problems"]), (True, "partial", []))
+        return run_dir
+
+    def test_a_bound_rest_discover_and_its_counterexamples(self):
+        good = self.members("discover", self.static_run())
+        code, seen = self.pickup("discover", good)
+        self.assertEqual((code, seen["problems"], seen["step_status"]), (3, [], "partial"), seen)
+        discovery = json.loads(good["discovery.json"])
+        static = discovery["records"][0]["static_search"]
+        self.assertEqual(static["mode"], "rest-contents")
+        self.assertTrue(static["hits"])
+        both = lambda change: (lambda m: edited(edited(m, "read-envelope.json", change), "run-manifest.json", change))
+        request = lambda key, value: (lambda d: d["request"].__setitem__(key, value))
+        record = lambda change: (lambda m: edited(m, "discovery.json", lambda d: change(d["records"][0]["static_search"])))
+        cases = {
+            "a dot-dot directory requested": (both(request("static_dirs", ["docs/../x"])), "outside the entry's limits"),
+            "four directories requested": (both(request("static_dirs", ["a", "b", "c", "d"])), "outside the entry's limits"),
+            "another mode requested": (both(request("static_reads", "clone")), "outside the entry's limits"),
+            "a budget below the static reserve": (both(request("request_budget", 57)), "outside the entry's limits"),
+            "static fields on a locus-like request": (both(lambda d: d["request"].pop("static_dirs")),
+                                                      "does not hold exactly the request fields"),
+            "output inputs without the static mode": (
+                lambda m: edited(m, "discovery.json", lambda d: d["inputs"].pop("static_reads")),
+                "output static reads differ from the request"),
+            "a record without REST static reads": (record(lambda s: s.__setitem__("mode", "clone")),
+                                                   "a record's static reads are not the REST contents reads"),
+            "a read outside the directories": (
+                record(lambda s: s["files"].append({"path": "src/x.md", "blob_sha": None, "sha256": "0" * 64, "size": 1})),
+                "a record's static reads name a path outside the fixed rule"),
+            "a hit outside the directories": (record(lambda s: s["hits"][0].__setitem__("path", "docs/rules/x/y.md")),
+                                              "a record's static reads name a path outside the fixed rule"),
+            "a long excerpt": (record(lambda s: s["hits"][0]["excerpt"].__setitem__("text", "x" * 201)),
+                               "a record's static evidence holds more than a one-line excerpt"),
+            "a file body kept": (record(lambda s: s["files"][0].__setitem__("content", "Zm9v")),
+                                 "a record's static evidence holds more than a one-line excerpt"),
+            "another ref": (record(lambda s: s.__setitem__("ref", "f" * 40)),
+                            "a record's static reads are not the REST contents reads"),
+            "an extra contents request": (
+                lambda m: edited(m, "transport.json", lambda d: d["requests"].append(dict(
+                    d["requests"][-1], logical_url="https://api.github.com/repos/%s/contents/src/secret.md?ref=%s"
+                    % (TARGET, relay_verify_tests.HEAD)))),
+                "a contents request is outside the fixed static paths"),
+        }
+        for label, (change, text) in cases.items():
+            with self.subTest(label):
+                self.expect("discover", change(good), text)
+
+    def test_a_legacy_request_with_static_output_fails(self):
+        good = self.members("discover", self.static_run())
+        legacy = lambda d: [d["request"].pop(key) for key in ("static_reads", "static_dirs")]
+        members = edited(edited(good, "read-envelope.json", legacy), "run-manifest.json", legacy)
+        self.expect("discover", members, "output static reads differ from the request")
 
 
 def entry_common():
