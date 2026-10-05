@@ -217,5 +217,26 @@ class RunR3MergeTests(RunR2Case):
         self.assertEqual((25, 61), (len(scope["keys"]), len(scope["quotes"])))
 
 
+
+@unittest.skipUnless((EVIDENCE_R3 / "answers/verify-C5.result.json").is_file() and (EVIDENCE_R2 / "answers").is_dir(),
+                     "the 2026-10-05 eslint r4 answers are only on the machine that made them")
+class RunR4FinalTests(RunR2Case):
+    """The eslint r4 step of 2026-10-05: the merge answer and five verify answers adopted under strict verification,
+    then the final input refused at 77,376 bytes. With one quote per (candidate, cited PR) plus the verify answers'
+    verified quotes it fits."""
+
+    def test_the_final_input_of_the_adopted_answers_is_within_the_cap(self):
+        verify = [item for path in sorted((EVIDENCE_R3 / "answers").glob("verify-C*.result.json"))
+                  for item in ("--verify-result", str(path))]
+        code, final, stderr = stage("final-input", "--run-dir", self.run, "--synthesis",
+                                    str(EVIDENCE_R3 / "answers/synthesis.result.json"), *self.extract, *verify,
+                                    "--out", str(self.root / "f"))
+        self.assertEqual(0, code, stderr)
+        self.assertLessEqual(final["calls"][0]["bytes"], CAP)
+        self.assertEqual({"listed": 38, "no_quote": 0}, final["final_quotes"])
+        scope = json.loads((self.root / "f" / "final.scope.json").read_text(encoding="utf-8"))
+        self.assertEqual((28, 38), (len(scope["keys"]), len(scope["quotes"])))
+
+
 if __name__ == "__main__":
     unittest.main()

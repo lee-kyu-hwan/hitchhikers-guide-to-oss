@@ -640,26 +640,57 @@ def reduced_synthesis_input(context: Context, args, stems: list[str], results: d
     return summary
 
 
+class QuoteSelection:
+    """Verified quotes picked from a check report, each (PR, quote) listed once in the order picked. A file's
+    quotes are in the order check_extraction reports them (pattern evidence, then observations)."""
+
+    def __init__(self, report: dict) -> None:
+        self.by_file, self.evidence, self.missing, self.seen = {}, [], [], set()
+        for item in report["verified_evidence"]:
+            self.by_file.setdefault(Path(item["file"]).name, []).append(item)
+
+    def add(self, item: dict) -> None:
+        if (item["pr"], item["quote"]) not in self.seen:
+            self.seen.add((item["pr"], item["quote"]))
+            self.evidence.append({"pr": item["pr"], "pr_id": item["pr_id"], "quote": item["quote"]})
+
+    def first(self, files: list[str], candidate: dict, where: dict) -> None:
+        """For each PR the candidate cites, the first verified quote of these files in this order; a PR with none
+        is recorded as no quote (``where`` names the candidate), never filled from other files."""
+        for key in dict.fromkeys(candidate["cited_prs"]):
+            item = next((item for name in files for item in self.by_file.get(name, []) if item["pr"] == key), None)
+            if item is None:
+                self.missing.append({**where, "candidate": candidate["id"], "pr": key})
+            else:
+                self.add(item)
+
+    def every(self, files: list[str]) -> None:
+        for name in files:
+            for item in self.by_file.get(name, []):
+                self.add(item)
+
+
 def merge_quotes(previous: dict, candidates_of: dict, results: dict, report: dict) -> tuple[list, list]:
     """For each (group candidate, cited PR), the first verified quote of that candidate's own group: the group's
-    extract answers in its stem order, then each answer's order as check_extraction reports it (pattern evidence,
-    then observations). Each (PR, quote) is listed once; a pair with no verified quote in its group is listed in
-    the second list (no quote), never filled from another group."""
-    by_file = {}
-    for item in report["verified_evidence"]:
-        by_file.setdefault(Path(item["file"]).name, []).append(item)
-    evidence, missing, seen = [], [], set()
+    extract answers in its stem order, then each answer's order. A pair with no verified quote in its group is
+    listed in the second list (no quote), never filled from another group."""
+    selection = QuoteSelection(report)
     for group in previous["groups"]:
         files = [Path(results[stem][0]).name for stem in group["stems"]]
         for candidate in candidates_of[group["input_dir"]]:
-            for key in dict.fromkeys(candidate["cited_prs"]):
-                item = next((item for name in files for item in by_file.get(name, []) if item["pr"] == key), None)
-                if item is None:
-                    missing.append({"group": group["input_dir"], "candidate": candidate["id"], "pr": key})
-                elif (item["pr"], item["quote"]) not in seen:
-                    seen.add((item["pr"], item["quote"]))
-                    evidence.append({"pr": item["pr"], "pr_id": item["pr_id"], "quote": item["quote"]})
-    return evidence, missing
+            selection.first(files, candidate, {"group": group["input_dir"]})
+    return selection.evidence, selection.missing
+
+
+def final_quotes(context: Context, candidates: list, extract: dict, verify: dict, report: dict) -> tuple[list, list]:
+    """For each (final candidate, cited PR), the first verified quote of the extract answers (the run's stem order,
+    then each answer's order), then every verified quote the verify answers cite (verify stems in order)."""
+    selection = QuoteSelection(report)
+    files = [Path(extract[stem][0]).name for stem in context.extract_stems()]
+    for candidate in candidates:
+        selection.first(files, candidate, {})
+    selection.every([Path(verify[stem][0]).name for stem in sorted(verify)])
+    return selection.evidence, selection.missing
 
 
 def cmd_synthesis_merge_input(context: Context, args) -> dict:
@@ -938,8 +969,13 @@ def cmd_final_input(context: Context, args) -> dict:
         if document.get("id") != stem[len("verify-"):] or not isinstance(document.get("evidence_checks"), list):
             raise StageError("verify result %s must answer its own candidate id with evidence_checks" % stem)
     report = check_quotes(context, [path for path, _ in extract.values()] + [path for path, _ in verify.values()])
-    text = final_prompt_text(context, candidates, {stem: doc for stem, (_, doc) in verify.items()},
-                             compact_report(report))
+    if context.reduced:
+        # the quotes the candidates and the verify answers point at, never the whole report (#82)
+        kept, missing = final_quotes(context, candidates, extract, verify, report)
+        quote_report = {"totals": report["totals"], "verified_evidence": kept, "no_quote": missing}
+    else:
+        quote_report = compact_report(report)
+    text = final_prompt_text(context, candidates, {stem: doc for stem, (_, doc) in verify.items()}, quote_report)
     if len(text.encode("utf-8")) > PROMPT_MAX_BYTES:
         raise StageError("final-input: the final prompt is %d bytes (> %d) with these verify answers; a dynamic "
                          "overflow the earlier projections could not rule out; refused, not cut"
@@ -948,11 +984,12 @@ def cmd_final_input(context: Context, args) -> dict:
     write_json(out / "check-all.json", report)
     entry = write_prompt(out / "final", text)
     entry["result_name"] = "final.result.json"
-    if context.reduced:
-        quotes = [{"pr": item["pr"], "quote": item["quote"]} for item in compact_report(report)["verified_evidence"]]
-        write_scope(out, "final", list(context.keymap["sections"]), quotes)
     summary = {"stage": "final", "calls": [entry], "candidates": len(candidates), "quotes": report["totals"],
                "clean_results": report["clean_results"]}
+    if context.reduced:
+        write_scope(out, "final", list(context.keymap["sections"]),
+                    [{"pr": item["pr"], "quote": item["quote"]} for item in kept])
+        summary["final_quotes"] = {"listed": len(kept), "no_quote": len(missing)}
     write_json(out / "stage.json", summary)
     return summary
 

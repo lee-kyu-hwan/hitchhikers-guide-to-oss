@@ -358,16 +358,13 @@ class MergeTests(ReducedCase):
         self.assertFalse((self.root / "x").exists())
 
 
-class MinimalMergeTests(ReducedCase):
-    """The merge input holds the group candidates (never their dropped ideas), the PR index, and for each
-    (candidate, cited PR) the first verified quote of that candidate's own group: the group's extract answers in
-    the group's stem order, then each answer's own order (pattern evidence, then observations)."""
+class LensQuoteCase(ReducedCase):
+    """Extract answers whose quote for a PR differs by lens, so a selected quote shows which answer it came from."""
 
     PAD = 1000
     # Which of a key's real sentences each lens quotes: the three groups' first lenses (blind, maintenance,
     # structure... and blind vs correctness) differ, so the quote shows which answer it was taken from.
     INDEX = {"blind": 0, "correctness": 1, "maintenance": 2, "review": 1, "structure": 2}
-    RULE = "입력에는 각 그룹이 남긴 후보만 있다. 그룹이 버린 항목은 다시 살리지 않는다."
 
     def setUp(self):
         super().setUp()
@@ -418,6 +415,19 @@ class MinimalMergeTests(ReducedCase):
             paths.append(str(path))
         return paths
 
+    def section(self, text, title):
+        head = "=== %s ===\n" % title
+        start = text.index(head) + len(head)
+        return json.loads(text[start:text.index("\n=== %s 끝 ===" % title, start)])
+
+
+class MinimalMergeTests(LensQuoteCase):
+    """The merge input holds the group candidates (never their dropped ideas), the PR index, and for each
+    (candidate, cited PR) the first verified quote of that candidate's own group: the group's extract answers in
+    the group's stem order, then each answer's own order (pattern evidence, then observations)."""
+
+    RULE = "입력에는 각 그룹이 남긴 후보만 있다. 그룹이 버린 항목은 다시 살리지 않는다."
+
     def grouped(self, paths, out="g"):
         cap = self.group_size(["blind", "correctness"], self.PAD, paths=paths) + 50
         with mock.patch.object(stage_inputs, "PROMPT_MAX_BYTES", cap):
@@ -447,11 +457,6 @@ class MinimalMergeTests(ReducedCase):
                           *[item for path in groups for item in ("--group-result", path)],
                           *[item for path in extract for item in ("--extract-result", path)],
                           "--out", str(self.root / out), code=code)
-
-    def section(self, text, title):
-        head = "=== %s ===\n" % title
-        start = text.index(head) + len(head)
-        return json.loads(text[start:text.index("\n=== %s 끝 ===" % title, start)])
 
     def expected_quote(self, summary, group_dir, key, broken=()):
         group = next(g for g in summary["groups"] if g["input_dir"] == group_dir)
@@ -617,20 +622,97 @@ class FinalTests(ReducedCase):
         self.assertNotIn(fx.PULLS[101]["patch"][:30], text)
         self.assertIn(fx.PULLS[101]["quote"], text)                  # a verified quote from the extraction answers
 
-    def test_the_scope_lists_the_verified_quotes_the_final_answer_may_use(self):
+    def test_the_scope_lists_the_quotes_the_final_input_kept(self):
         self.final()
         scope = json.loads((self.root / "f" / "final.scope.json").read_text(encoding="utf-8"))
         self.assertEqual(sorted(self.context.keymap["sections"]), sorted(scope["keys"]))
-        pairs = {(item["pr"], item["quote"]) for item in scope["quotes"]}
-        self.assertEqual(6, len({pr for pr, _ in pairs}))
-        for key in self.context.keymap["sections"]:
-            self.assertIn((key, self.quote_of(key)), pairs)
+        keys = list(self.context.keymap["sections"])[:2]             # what the candidate and its verify answer cite
+        self.assertEqual([{"pr": key, "quote": self.quote_of(key)} for key in keys], scope["quotes"])
 
     def test_a_final_prompt_over_the_cap_is_refused_not_cut(self):
         built = self.inputs()
         with mock.patch.object(stage_inputs, "PROMPT_MAX_BYTES", 8000):
             self.final(out="x", code=2, built=built)
         self.assertFalse((self.root / "x").exists())
+
+
+class MinimalFinalTests(LensQuoteCase):
+    """The extraction-only final input keeps, besides the PR index, the candidates and the verify answers: for each
+    (final candidate, cited PR) the first verified quote of the extract answers (stem order, then each answer's
+    order), and every (PR, quote) a verify answer cited that the checker verified. Nothing else."""
+
+    def keys(self):
+        return list(self.context.keymap["sections"])
+
+    def built(self, broken=()):
+        extract = self.lens_answers(broken)
+        keys = self.keys()
+        synthesis = self.write("synthesis.result.json", {"candidates": [
+            {"id": "C1", "statement": "first", "cited_prs": [keys[0], keys[1], keys[2]], "found_by": "blind"},
+            {"id": "C2", "statement": "second", "cited_prs": [keys[2], keys[3], keys[5]], "found_by": "review"}],
+            "dropped": [{"idea": "DROPPED-final", "reason": "weak"}]})
+        verify = [
+            self.write("verify-C1.result.json", {
+                "id": "C1", "verdict": "supported",
+                "evidence_checks": [{"pr": keys[4], "holds": True, "quote": self.sentences[keys[4]][2], "reason": "r"}],
+                "counterexamples": [{"pr": keys[0], "quote": self.sentences[keys[0]][1], "reason": "r"}],
+                "distinct_prs": 2, "distinct_repos": 1, "actionable": True, "actionable_reason": "r",
+                "confidence": "medium", "revised_statement": "s"}),
+            self.write("verify-C2.result.json", {
+                "id": "C2", "verdict": "weak",
+                "evidence_checks": [{"pr": keys[3], "holds": True, "quote": self.sentences[keys[3]][2] + " (reworded)",
+                                     "reason": "r"}],
+                "counterexamples": [], "distinct_prs": 2, "distinct_repos": 1, "actionable": True,
+                "actionable_reason": "r", "confidence": "low", "revised_statement": "s"})]
+        return extract, synthesis, verify
+
+    def final(self, built, out="f", reverse=False, code=0):
+        extract, synthesis, verify = built
+        extract = list(reversed(extract)) if reverse else extract
+        verify = list(reversed(verify)) if reverse else verify
+        return self.stage("final-input", "--run-dir", self.run, "--synthesis", synthesis,
+                          *[item for path in extract for item in ("--extract-result", path)],
+                          *[item for path in verify for item in ("--verify-result", path)],
+                          "--out", str(self.root / out), code=code)
+
+    def first_quote(self, key, broken=()):
+        """The first verified extract quote of a key: stems in order (blind first), each answer in its own order."""
+        for stem in self.context.extract_stems():
+            lens = stem.split("-")[1]
+            if key in self.key_of_shard()["digest-%s.md" % stem.rsplit("-", 1)[1]] and (lens, key) not in broken:
+                return self.sentences[key][self.INDEX[lens]]
+        return None
+
+    def test_the_quote_report_holds_one_quote_per_candidate_pr_and_the_verified_verify_quotes(self):
+        built = self.built()
+        summary, _ = self.final(built)
+        text = self.prompt("f", "final", "task.txt")
+        report = self.section(text, "인용 확인 보고서")
+        keys = self.keys()
+        expected = []
+        for key in (keys[0], keys[1], keys[2], keys[3], keys[5]):           # C1 then C2, each PR once
+            expected.append({"pr": key, "quote": self.first_quote(key)})
+        expected += [{"pr": keys[4], "quote": self.sentences[keys[4]][2]},   # verify-C1, in its own order
+                     {"pr": keys[0], "quote": self.sentences[keys[0]][1]}]
+        self.assertEqual(expected, [{"pr": item["pr"], "quote": item["quote"]} for item in report["verified_evidence"]])
+        self.assertEqual([], report["no_quote"])
+        self.assertNotIn(self.sentences[keys[3]][2] + " (reworded)", json.dumps(report, ensure_ascii=False))
+        self.assertEqual({"verified", "total"}, set(report["totals"]))
+        self.assertIn("no_quote", text.split("=== PR 색인 ===")[0])          # the instructions explain both lists
+        scope = json.loads((self.root / "f" / "final.scope.json").read_text(encoding="utf-8"))
+        self.assertEqual({"keys": sorted(keys), "quotes": expected},
+                         {"keys": sorted(scope["keys"]), "quotes": scope["quotes"]})
+        self.assertEqual({"listed": len(expected), "no_quote": 0}, summary["final_quotes"])
+        self.final(built, out="f2", reverse=True)
+        self.assertEqual(text, self.prompt("f2", "final", "task.txt"))
+
+    def test_a_candidate_pr_without_any_verified_extract_quote_is_marked_no_quote(self):
+        keys = self.keys()
+        built = self.built(broken={(lens, keys[5]) for lens in LENSES})
+        self.final(built)
+        report = self.section(self.prompt("f", "final", "task.txt"), "인용 확인 보고서")
+        self.assertEqual([{"candidate": "C2", "pr": keys[5]}], report["no_quote"])
+        self.assertNotIn(keys[5], [item["pr"] for item in report["verified_evidence"]])
 
 
 EVIDENCE_1010 = Path("/Users/lee-kyu-hwan/.oss-research-vm/logs/a78-docs-first-20261004T021348Z")
