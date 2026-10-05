@@ -176,10 +176,11 @@ class ContinueChainTests(reduce.ReducedCase):
         self.record("synthesis", "synthesis", self.synthesis, "5" * 64)
         self.record("verify-c1", "verify", self.verify, "6" * 64)
 
-    def record(self, call, kind, path, prompt_sha):
+    def record(self, call, kind, path, prompt_sha, ledger=None):
         """The call directory and ledger line of an adopted reduce answer (as analysis_call.sh and the verifier
         leave them; harness call names are lower case)."""
-        directory = self.ledger / call
+        ledger = ledger or self.ledger
+        directory = ledger / call
         (directory / "result").mkdir(parents=True)
         (directory / "result" / "manifest.json").write_text(json.dumps(
             {"status": "succeeded", "prompt_sha256": prompt_sha, "report_sha256": sha256(path)}))
@@ -188,7 +189,7 @@ class ContinueChainTests(reduce.ReducedCase):
             "adopted_to": "/elsewhere/answers/" + Path(path).name,
             "items": [{"id": "P3-prompt-sha256", "status": "INFO", "detail": prompt_sha},
                       {"id": "P4-prompt-binding", "status": "PASS", "detail": "manifest prompt_sha256 matches"}]}))
-        with (self.ledger / "ledger.jsonl").open("a") as handle:
+        with (ledger / "ledger.jsonl").open("a") as handle:
             handle.write(json.dumps({"name": call, "kind": "token", "input_sha256": prompt_sha,
                                      "prompt_sha256_recorded": prompt_sha, "report_sha256": sha256(path),
                                      "status": "succeeded"}) + "\n")
@@ -268,7 +269,102 @@ class ContinueChainTests(reduce.ReducedCase):
             self.assertIn("continue stage", stderr)
 
 
-EVIDENCE_R2 = Path("/Users/lee-kyu-hwan/.oss-research-vm/logs/a78-period-analysis-eslint-r2-20261004T131350Z")
+class ContinueStraightChainTests(ContinueChainTests):
+    """continue-plan on the latest ledger of a straight chain (#258): the parent ledger (gen3) continued gen2 and
+    made only the calls its plan left, so the synthesis and verify answers adopted from gen2 are bound to gen2's
+    ledger lines. With --ancestor-records gen2, linked by the sha gen3's ledger-limit.json recorded for its parent,
+    those answers are found there, provided the continue stage of gen3 adopted the very same answers."""
+
+    def setUp(self):
+        super().setUp()
+        self.gen3 = self.leaf("d", "gen3", "--verify-result", self.verify)
+
+    def leaf(self, out, name, *extra):
+        """A continue stage made from gen2 (``out``) and the ledger bound to it, continuing gen2 (``name``)."""
+        ContinueChainTests.chain(self, *extra, out=out)
+        ledger = self.root / name
+        ledger.mkdir()
+        (ledger / "ledger-limit.json").write_text(json.dumps({
+            "limit": 1, "call_plan_sha256": sha256(self.root / out / "stage.json"),
+            "parent": {"ledger_sha256": sha256(self.ledger / "ledger.jsonl"), "calls": 2, "ancestors": 15,
+                       "limit_sha256": sha256(self.ledger / "ledger-limit.json")}}) + "\n")
+        (ledger / "ledger.jsonl").write_text(json.dumps({"name": "final", "kind": "token", "status": "succeeded"}) + "\n")
+        return ledger
+
+    def chain(self, *extra, out="e", code=0, synthesis=True, stage="d", records=None, ancestors=("gen2",)):
+        args = [item for path in self.paths for item in ("--extract-result", path)]
+        if synthesis:
+            args += ["--synthesis-result", self.synthesis]
+        args += [item for name in ancestors for item in ("--ancestor-records", str(self.root / name))]
+        return self.stage("continue-plan", "--run-dir", self.run, "--extract-stage", str(self.root / stage), *args,
+                          *extra, "--records", str(records or self.gen3), "--out", str(self.root / out), code=code)
+
+    def test_the_answers_adopted_from_an_ancestor_leave_only_the_final(self):
+        summary, _ = self.chain("--verify-result", self.verify)
+        plan = summary["call_plan"]
+        self.assertEqual({"extract_stage_sha256": sha256(self.root / "d" / "stage.json"),
+                          "completed": {"extract": 15, "synthesis": 1, "verify": 1}, "parent_stage": "continue"},
+                         plan["continues"])
+        self.assertEqual((0, 0, 0, 1, 1), (plan["extract"], plan["synthesis"], plan["verify"], plan["final"],
+                                           plan["max_model_calls"]))
+        recorded = json.loads((self.root / "d" / "stage.json").read_text(encoding="utf-8"))["reduce_answers"]
+        self.assertEqual([dict(answer, ancestor=1) for answer in recorded], summary["reduce_answers"])
+
+    def test_an_answer_made_by_the_parent_and_one_adopted_from_the_ancestor(self):
+        gen3 = self.leaf("d2", "gen3b")                                # gen3 still had the verify call to make
+        verify = self.root / "gen3b-answers" / "verify-C1.result.json"     # gen3b's own verify answer
+        verify.parent.mkdir()
+        verify.write_text(json.dumps(dict(json.loads(Path(self.verify).read_text()), confidence="high")))
+        verify = str(verify)
+        self.record("verify-c1", "verify", verify, "7" * 64, ledger=gen3)
+        summary, _ = self.chain("--verify-result", verify, stage="d2", records=gen3)
+        self.assertEqual([("synthesis", 1), ("verify-c1", None)],
+                         [(answer["call"], answer.get("ancestor")) for answer in summary["reduce_answers"]])
+        self.assertEqual((0, 1), (summary["call_plan"]["verify"], summary["max_model_calls"]))
+
+    def test_an_answer_of_the_chain_not_bound_through_the_recorded_links_is_refused(self):
+        gen2_ledger, gen2_limit = self.ledger / "ledger.jsonl", self.ledger / "ledger-limit.json"
+        with self.subTest("no ancestor records"):
+            _, stderr = self.chain("--verify-result", self.verify, out="no-ancestor", code=2, ancestors=())
+            self.assertIn("no call record", stderr)
+        cases = {
+            "ancestor ledger grew": lambda: gen2_ledger.write_text(gen2_ledger.read_text() + gen2_ledger.read_text()),
+            "ancestor limit edited": lambda: gen2_limit.write_text(gen2_limit.read_text() + " "),
+            "parent records another parent": lambda: (self.gen3 / "ledger-limit.json").write_text(
+                (self.gen3 / "ledger-limit.json").read_text().replace(sha256(gen2_ledger), "0" * 64)),
+        }
+        for number, (label, spoil) in enumerate(cases.items()):
+            with self.subTest(label):
+                saved = {path: path.read_bytes() for path in (gen2_ledger, gen2_limit, self.gen3 / "ledger-limit.json")}
+                try:
+                    spoil()
+                    _, stderr = self.chain("--verify-result", self.verify, out="refused-%d" % number, code=2)
+                    self.assertIn("is not the parent ledger", stderr)
+                    self.assertFalse((self.root / ("refused-%d" % number)).exists())
+                finally:
+                    for path, data in saved.items():
+                        path.write_bytes(data)
+        with self.subTest("records with no ledger as the ancestor"):
+            _, stderr = self.chain("--verify-result", self.verify, out="calls", code=2, ancestors=("calls",))
+            self.assertIn("error: continue-plan:", stderr)
+        with self.subTest("an ancestor answer the continue stage did not adopt"):
+            gen3 = self.leaf("d3", "gen3c")                            # d3 left the verify call to gen3c
+            _, stderr = self.chain("--verify-result", self.verify, out="not-adopted", code=2, stage="d3", records=gen3)
+            self.assertIn("not adopted by the continue stage", stderr)
+        with self.subTest("ancestor records with an extract stage"):
+            args = [item for path in self.paths for item in ("--extract-result", path)]
+            _, stderr = self.stage("continue-plan", "--run-dir", self.run, "--extract-stage", str(self.extract_stage),
+                                   *args, "--ancestor-records", str(self.ledger), "--records", str(self.records),
+                                   "--out", str(self.root / "x-ancestor"), code=2)
+            self.assertIn("continue stage", stderr)
+
+    # the gen2 cases of ContinueChainTests run against gen2 itself
+    test_with_the_synthesis_and_every_verify_answer_adopted_only_the_final_remains = None
+    test_a_candidate_without_its_verify_answer_keeps_its_verify_call = None
+    test_a_reduce_answer_not_bound_to_the_parent_ledger_is_refused = None
+
+
+EVIDENCE_R2 =Path("/Users/lee-kyu-hwan/.oss-research-vm/logs/a78-period-analysis-eslint-r2-20261004T131350Z")
 
 
 class RunR2Case(unittest.TestCase):
@@ -391,6 +487,49 @@ class RunR3ChainTests(RunR2Case):
         self.assertEqual("continue", plan["continues"]["parent_stage"])
         self.assertEqual((0, 0, 0, 1, 1), (plan["extract"], plan["synthesis"], plan["verify"], plan["final"],
                                            plan["max_model_calls"]))
+
+
+EVIDENCE_R6 = Path("/Users/lee-kyu-hwan/.oss-research-vm/logs/a78-period-analysis-eslint-r6-20261005T043448Z")
+
+
+@unittest.skipUnless((EVIDENCE_R6 / "in-continue/stage.json").is_file() and (EVIDENCE_R6 / "ledger-limit.json").is_file()
+                     and (EVIDENCE_R3 / "answers/verify-C5.result.json").is_file() and (EVIDENCE_R2 / "answers").is_dir(),
+                     "the 2026-10-05 eslint r6 ledger is only on the machine that made it")
+class RunR6ChainTests(RunR2Case):
+    """The eslint r6 ledger of 2026-10-05 (a continuation of r3, final 1/1 used): the latest ledger of the chain
+    r2 → r3 → r6 (#258). Its continue stage adopted r3's merge and five verify answers, which stay bound to r3's
+    ledger lines; with r3 as the ancestor ledger (linked by the sha r6's ledger-limit.json recorded) they continue
+    into a plan of the final call only, bound to r6's continue stage. The evidence is only read."""
+
+    def test_the_latest_ledger_continues_with_the_answers_bound_in_r3(self):
+        verify = [item for path in sorted((EVIDENCE_R3 / "answers").glob("verify-C*.result.json"))
+                  for item in ("--verify-result", str(path))]
+        kept = {path: path.read_bytes() for directory in (EVIDENCE_R3, EVIDENCE_R6)
+                for path in (directory / "ledger.jsonl", directory / "ledger-limit.json")}
+        common = ("--run-dir", self.run, "--extract-stage", str(EVIDENCE_R6 / "in-continue"), *self.extract,
+                  "--synthesis-result", str(EVIDENCE_R3 / "answers/synthesis.result.json"), *verify,
+                  "--records", str(EVIDENCE_R6))
+        code, _, stderr = stage("continue-plan", *common, "--out", str(self.root / "no-ancestor"))
+        self.assertEqual(2, code, stderr)
+        self.assertIn("no call record", stderr)
+        code, _, stderr = stage("continue-plan", *common, "--ancestor-records", str(EVIDENCE_R2),
+                                "--out", str(self.root / "r2-as-ancestor"))
+        self.assertEqual(2, code, stderr)
+        self.assertIn("is not the parent ledger", stderr)
+        code, summary, stderr = stage("continue-plan", *common, "--ancestor-records", str(EVIDENCE_R3),
+                                      "--out", str(self.root / "r7"))
+        self.assertEqual(0, code, stderr)
+        plan = summary["call_plan"]
+        bound = json.loads((EVIDENCE_R6 / "ledger-limit.json").read_text(encoding="utf-8"))["call_plan_sha256"]
+        self.assertEqual(bound, plan["continues"]["extract_stage_sha256"])
+        self.assertEqual({"extract": 20, "synthesis": 8, "verify": 5}, plan["continues"]["completed"])
+        self.assertEqual("continue", plan["continues"]["parent_stage"])
+        self.assertEqual((0, 0, 0, 1, 1), (plan["extract"], plan["synthesis"], plan["verify"], plan["final"],
+                                           plan["max_model_calls"]))
+        recorded = json.loads((EVIDENCE_R6 / "in-continue/stage.json").read_text(encoding="utf-8"))["reduce_answers"]
+        self.assertEqual([dict(answer, ancestor=1) for answer in recorded], summary["reduce_answers"])
+        self.assertEqual({path: path.read_bytes() for path in kept}, kept)
+        self.assertFalse((EVIDENCE_R6 / "continued-by.json").exists() or (EVIDENCE_R3 / "continued-by.json").exists())
 
 
 if __name__ == "__main__":

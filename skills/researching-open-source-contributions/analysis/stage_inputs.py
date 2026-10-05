@@ -8,7 +8,8 @@ call, and assembles the final analysis envelope deterministically:
 
   extract-inputs   RUN → OUT/extract-<lens>/task.txt           (5 independent calls)
   continue-plan    RUN + adopted extract results + their extract stage → OUT/stage.json
-                   (or + a continue stage and the adopted synthesis/verify answers of its ledger: the rest)
+                   (or + a continue stage and the adopted synthesis/verify answers of its ledger, or of the
+                   ancestor ledgers of a straight chain: the rest)
                    (no prompt: the call plan of the stages not yet run, #82)
   synthesis-input  RUN + extract results → OUT/task.txt        (1 call: candidates)
   verify-inputs    RUN + synthesis answer → OUT/verify-<id>/task.txt  (k calls, k may be 0)
@@ -860,36 +861,86 @@ def adopted_extract_answer(context: Context, stem: str, path: str, prompt_sha: s
     return {"stem": stem, "result_name": Path(path).name, "answer_sha256": answer_sha, "prompt_sha256": prompt_sha}
 
 
-def adopted_reduce_answer(kind: str, path: str, records: Path, ledger: list) -> dict:
-    """One adopted synthesis or verify answer of the parent ledger (#82): its call record (recorded_call_problems)
-    and the ledger line of that call, the one analysis_call.sh appended (a token call, succeeded, the same input,
-    prompt and report sha). The call directory is the answer's stem as the harness named it (lower case)."""
+def ledger_lines(records: Path, label: str) -> list:
+    """The ledger.jsonl of a ledger directory, one JSON object per line (anything else is refused)."""
+    ledger = []
+    for line in read_bounded(records / "ledger.jsonl", ANSWER_MAX_BYTES, label).decode("utf-8").splitlines():
+        try:
+            entry = json.loads(line)
+        except ValueError as error:
+            raise StageError("the %s is not one JSON object per line: %s" % (label, error)) from error
+        ledger.append(entry if isinstance(entry, dict) else {})
+    return ledger
+
+
+def chain_ledgers(records: Path, bound: dict, ancestors: list) -> list:
+    """The parent ledger and its ancestor ledgers, nearest first (#258): each ancestor must be the ledger the one
+    before it recorded as its parent in ledger-limit.json (analysis_call.sh: the parent ledger.jsonl sha256, and
+    for a chain the parent ledger-limit.json sha256 too). Returns [(directory, ledger lines)]."""
+    ledgers, child, child_bound = [(records, ledger_lines(records, "parent ledger"))], records, bound
+    for directory in map(Path, ancestors):
+        recorded = child_bound.get("parent") if isinstance(child_bound, dict) else None
+        if directory.is_symlink() or not directory.is_dir() or not isinstance(recorded, dict):
+            raise StageError("%s is not the parent ledger %s records" % (directory, child))
+        data = read_bounded(directory / "ledger.jsonl", ANSWER_MAX_BYTES, "ancestor ledger")
+        limit = read_bounded(directory / "ledger-limit.json", ANSWER_MAX_BYTES, "ancestor ledger limit")
+        if (hashlib.sha256(data).hexdigest() != recorded.get("ledger_sha256")
+                or "limit_sha256" in recorded and hashlib.sha256(limit).hexdigest() != recorded["limit_sha256"]):
+            raise StageError("%s is not the parent ledger %s records (another ledger or ledger limit sha)"
+                             % (directory, child))
+        child, child_bound = directory, read_json(directory / "ledger-limit.json", ANSWER_MAX_BYTES, "ancestor ledger limit")
+        ledgers.append((directory, ledger_lines(directory, "ancestor ledger")))
+    return ledgers
+
+
+def reduce_answer_key(answer: dict) -> tuple:
+    return tuple(answer.get(key) for key in ("kind", "call", "result_name", "answer_sha256", "prompt_sha256"))
+
+
+def adopted_reduce_answer(kind: str, path: str, ledgers: list, recorded: list) -> dict:
+    """One adopted synthesis or verify answer of the parent ledger (#82) or of an ancestor ledger (#258): its call
+    record (recorded_call_problems) and the ledger line of that call, the one analysis_call.sh appended (a token
+    call, succeeded, the same input, prompt and report sha). The call directory is the answer's stem as the harness
+    named it (lower case). The nearest ledger (chain_ledgers) that binds it wins; one bound to an ancestor ledger
+    must also be an answer the continue stage adopted (``recorded``), and is marked with its ancestor depth."""
     name = Path(path).name
     if not name.endswith(".result.json"):
         raise StageError("%s is not a <stem>.result.json answer" % name)
     stem = name[: -len(".result.json")]
-    entries = set(os.listdir(records))
-    call = stem if stem in entries else stem.lower() if stem.lower() in entries else None
-    if call is None or (records / call).is_symlink() or not (records / call).is_dir():
+    refusals = []
+    for depth, (records, ledger) in enumerate(ledgers):
+        entries = set(os.listdir(records))
+        call = stem if stem in entries else stem.lower() if stem.lower() in entries else None
+        if call is None or (records / call).is_symlink() or not (records / call).is_dir():
+            continue
+        where = "the parent ledger" if depth == 0 else "the ancestor ledger %s" % records
+        problems, answer_sha, prompt_sha = recorded_call_problems(kind, path, records / call, None)
+        lines = [line for line in ledger if line.get("name") == call and line.get("kind") == "token"]
+        if len(lines) != 1:
+            problems.append("%s holds %d token lines for the call %s" % (where, len(lines), call))
+        elif (lines[0].get("status") != "succeeded" or lines[0].get("input_sha256") != prompt_sha
+              or lines[0].get("prompt_sha256_recorded") != prompt_sha or lines[0].get("report_sha256") != answer_sha):
+            problems.append("%s line of %s records another input, prompt or report" % (where, call))
+        answer = {"kind": kind, "call": call, "result_name": name, "answer_sha256": answer_sha, "prompt_sha256": prompt_sha}
+        if depth and not problems and reduce_answer_key(answer) not in map(reduce_answer_key, recorded):
+            problems.append("bound to %s but not adopted by the continue stage" % where)
+        if not problems:
+            return dict(answer, ancestor=depth) if depth else answer
+        refusals.append("not bound to %s: %s" % (where, "; ".join(problems)))
+    if not refusals:
         raise StageError("no call record for the adopted answer %s" % name)
-    problems, answer_sha, prompt_sha = recorded_call_problems(kind, path, records / call, None)
-    lines = [line for line in ledger if line.get("name") == call and line.get("kind") == "token"]
-    if len(lines) != 1:
-        problems.append("the parent ledger holds %d token lines for the call %s" % (len(lines), call))
-    elif (lines[0].get("status") != "succeeded" or lines[0].get("input_sha256") != prompt_sha
-          or lines[0].get("prompt_sha256_recorded") != prompt_sha or lines[0].get("report_sha256") != answer_sha):
-        problems.append("the parent ledger line of %s records another input, prompt or report" % call)
-    if problems:
-        raise StageError("the adopted answer %s is not bound to the parent ledger: %s" % (name, "; ".join(problems)))
-    return {"kind": kind, "call": call, "result_name": name, "answer_sha256": answer_sha, "prompt_sha256": prompt_sha}
+    raise StageError("the adopted answer %s is %s" % (name, " / ".join(refusals)))
 
 
 def continue_chain_plan(context: Context, args, data: bytes, recorded: dict) -> dict:
     """continue-plan on a continue stage (#82): the parent ledger was itself a continuation (bound to this continue
     stage) and has adopted the synthesis answer and some or all verify answers. The extract answers must be the
     ones the continue stage recorded (same bytes); each reduce answer must be bound to the parent ledger
-    (adopted_reduce_answer). The new plan holds the verify calls of candidates without an adopted answer and the
-    final, bound to this continue stage with parent_stage "continue" so the harness counts the ancestors too."""
+    (adopted_reduce_answer), or, for an answer the continue stage itself adopted from further up, to an ancestor
+    ledger given with --ancestor-records and linked through the recorded parent shas (chain_ledgers, #258): so the
+    latest ledger of a straight chain is the one continued. The new plan holds the verify calls of candidates
+    without an adopted answer and the final, bound to this continue stage with parent_stage "continue" so the
+    harness counts the ancestors too."""
     if not args.synthesis_result:
         raise StageError("a continue stage needs its adopted synthesis answer (--synthesis-result)")
     before, listed = recorded.get("call_plan"), recorded.get("answers")
@@ -913,15 +964,12 @@ def continue_chain_plan(context: Context, args, data: bytes, recorded: dict) -> 
     bound = read_json(records / "ledger-limit.json", ANSWER_MAX_BYTES, "parent ledger limit")
     if not isinstance(bound, dict) or bound.get("call_plan_sha256") != hashlib.sha256(data).hexdigest():
         raise StageError("the records are not the ledger bound to this continue stage")
-    ledger = []
-    for line in read_bounded(records / "ledger.jsonl", ANSWER_MAX_BYTES, "parent ledger").decode("utf-8").splitlines():
-        try:
-            entry = json.loads(line)
-        except ValueError as error:
-            raise StageError("the parent ledger is not one JSON object per line: %s" % error) from error
-        ledger.append(entry if isinstance(entry, dict) else {})
+    ledgers = chain_ledgers(records, bound, args.ancestor_records)
+    adopted = recorded.get("reduce_answers", [])
+    if not isinstance(adopted, list) or not all(isinstance(answer, dict) for answer in adopted):
+        raise StageError("the continue stage.json records no list of reduce answers")
     candidates = parse_synthesis(context, args.synthesis_result)
-    reduce_answers = [adopted_reduce_answer("synthesis", args.synthesis_result, records, ledger)]
+    reduce_answers = [adopted_reduce_answer("synthesis", args.synthesis_result, ledgers, adopted)]
     ids, verified = [candidate["id"] for candidate in candidates], []
     for path in args.verify_result:
         document = read_json(Path(path), ANSWER_MAX_BYTES, "verify result")
@@ -929,7 +977,7 @@ def continue_chain_plan(context: Context, args, data: bytes, recorded: dict) -> 
         if answer_id not in ids or answer_id in verified or Path(path).name != "verify-%s.result.json" % answer_id:
             raise StageError("%s is not the verify answer of one synthesis candidate" % Path(path).name)
         verified.append(answer_id)
-        reduce_answers.append(adopted_reduce_answer("verify", path, records, ledger))
+        reduce_answers.append(adopted_reduce_answer("verify", path, ledgers, adopted))
     verify = len(ids) - len(verified)
     total = verify + 1
     plan = {"mode": context.mode,
@@ -964,8 +1012,9 @@ def cmd_continue_plan(context: Context, args) -> dict:
             return continue_chain_plan(context, args, data, recorded)
         if not isinstance(recorded, dict) or recorded.get("stage") != "extract":
             raise StageError("that stage.json is not an extract stage (nor a continue stage)")
-        if args.synthesis_result or args.verify_result:
-            raise StageError("adopted synthesis and verify answers are taken only with a continue stage")
+        if args.synthesis_result or args.verify_result or args.ancestor_records:
+            raise StageError("adopted synthesis and verify answers (and ancestor records) are taken only with a "
+                             "continue stage")
         calls = recorded.get("calls")
         if not isinstance(calls, list) or not all(isinstance(call, dict) and isinstance(call.get("input_dir"), str)
                                                   and isinstance(call.get("sha256"), str) for call in calls):
@@ -1334,6 +1383,10 @@ def build_parser() -> argparse.ArgumentParser:
     resume.add_argument("--synthesis-result", help="continue stage only: the adopted synthesis (or merge) answer")
     resume.add_argument("--verify-result", action="append", default=[],
                         help="continue stage only: the adopted verify answers (verify-<id>.result.json)")
+    resume.add_argument("--ancestor-records", action="append", default=[],
+                        help="continue stage only: the ancestor ledger directories of --records, nearest first "
+                             "(each the parent its successor's ledger-limit.json records), where the adopted "
+                             "answers the continue stage took from them are bound (#258)")
     resume.add_argument("--out", required=True)
     synthesis = command("synthesis-input")
     synthesis.add_argument("--extract-result", action="append", required=True)

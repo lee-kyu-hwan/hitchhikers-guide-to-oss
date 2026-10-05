@@ -3519,9 +3519,114 @@ exit 0
         refused = self.call(plan, ledger=self.root / "gen3", parent=parent_dir)
         self.assertEqual(refused.returncode, 3, refused.stderr)       # 20 + 14 + 1 = 35: the one call is made
         self.assertEqual(refused.stderr, "refused: the ledger already holds 1 model calls\n")
-        boundary = self.call(self.chain(parent_plan, remaining=6, name="c6.json"), ledger=self.root / "gen3b",
+
+    def test_a_third_generation_of_exactly_forty_is_still_within_the_cap(self):
+        parent_dir, parent_plan = self.generations()
+        boundary = self.call(self.chain(parent_plan, remaining=6, name="c6.json"), ledger=self.root / "gen3",
                              parent=parent_dir)
         self.assertEqual(boundary.returncode, 0, boundary.stderr)     # 20 + 14 + 6 = 40 is still within the cap
+
+    def claim_of(self, ledger_dir, plan):
+        return {"ledger_dir": str(ledger_dir), "call_plan_sha256": hashlib.sha256(plan.read_bytes()).hexdigest()}
+
+    def test_a_second_child_of_one_parent_is_refused_before_anything_starts(self):
+        parent_dir, parent_plan = self.generations()                 # 20 + 14, as the eslint r2 and r3 ledgers
+        first, plan = self.root / "gen3", self.chain(parent_plan, remaining=1)
+        self.assertEqual(self.call(plan, ledger=first, parent=parent_dir).returncode, 0)
+        claim = parent_dir / "continued-by.json"
+        self.assertEqual(json.loads(claim.read_text()), self.claim_of(first, plan))
+        self.assertEqual(json.loads((self.ledger_dir / "continued-by.json").read_text()),
+                         self.claim_of(parent_dir, parent_plan))         # gen2 claimed its own parent too
+        kept = {path: path.read_bytes() for path in (claim, parent_dir / "ledger.jsonl", parent_dir / "ledger-limit.json")}
+        self.assertEqual(json.loads((first / "ledger-limit.json").read_text())["parent"]["ledger_sha256"],
+                         hashlib.sha256(kept[parent_dir / "ledger.jsonl"]).hexdigest())  # the claim is not in the sha
+        before = self.limactl_calls()
+        for label, (child_plan, child) in {"the same plan": (plan, self.root / "gen3b"),
+                                           "a plan of its own": (self.chain(parent_plan, remaining=1, name="c1b.json"),
+                                                                 self.root / "gen3c")}.items():
+            with self.subTest(label):
+                refused = self.call(child_plan, ledger=child, parent=parent_dir)
+                self.assertEqual(refused.returncode, 2, refused.stderr)
+                self.assertIn("already continued by %s" % first, refused.stderr)
+                self.assertIn("continue the latest ledger of the chain", refused.stderr)
+                self.assertFalse(child.exists())
+        self.assertEqual(self.limactl_calls(), before)
+        self.assertEqual({path: path.read_bytes() for path in kept}, kept)
+
+    def test_a_fourth_generation_counts_the_whole_straight_chain(self):
+        parent_dir, parent_plan = self.generations()                 # 20 + 14
+        third, third_plan = self.root / "gen3", self.chain(parent_plan, remaining=1)
+        self.assertEqual(self.call(third_plan, ledger=third, parent=parent_dir).returncode, 0)
+        before = self.limactl_calls()
+        refused = self.call(self.chain(third_plan, remaining=6, name="gen4-6.json"), ledger=self.root / "gen4",
+                            parent=third)
+        self.assertEqual(refused.returncode, 2, refused.stderr)
+        self.assertIn("34 ancestor calls + 1 parent calls + 6 is over the absolute cap 40", refused.stderr)
+        self.assertFalse((self.root / "gen4").exists())
+        self.assertFalse((third / "continued-by.json").exists())
+        self.assertEqual(self.limactl_calls(), before)
+        plan = self.chain(third_plan, remaining=1, name="gen4.json")
+        done = self.call(plan, ledger=self.root / "gen4", parent=third)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        recorded = json.loads((self.root / "gen4" / "ledger-limit.json").read_text())
+        self.assertEqual(recorded["parent"], {
+            "ledger_sha256": hashlib.sha256((third / "ledger.jsonl").read_bytes()).hexdigest(), "calls": 1,
+            "ancestors": 34, "limit_sha256": hashlib.sha256((third / "ledger-limit.json").read_bytes()).hexdigest()})
+        self.assertEqual(36, recorded["parent"]["ancestors"] + recorded["parent"]["calls"] + recorded["limit"])
+
+    def test_a_parent_claim_changed_or_removed_is_refused(self):
+        parent_plan = self.parent(calls=3)
+        child, plan = self.root / "child", self.continuation(parent_plan)
+        self.assertEqual(self.call(plan, ledger=child, parent=self.ledger_dir).returncode, 0)
+        claim = self.ledger_dir / "continued-by.json"
+        original = claim.read_text()
+        elsewhere = self.root / "claim-copy.json"
+        elsewhere.write_text(original)
+        before = self.limactl_calls()
+        cases = {"names another ledger": lambda: claim.write_text(json.dumps(self.claim_of(self.root / "other", plan))),
+                 "names another plan": lambda: claim.write_text(json.dumps(dict(json.loads(original),
+                                                                                call_plan_sha256="0" * 64))),
+                 "removed": claim.unlink,
+                 "a link": lambda: (claim.unlink(), claim.symlink_to(elsewhere)),
+                 "not json": lambda: claim.write_text("{")}
+        for label, spoil in cases.items():
+            with self.subTest(label):
+                spoil()
+                refused = self.call(plan, ledger=child, parent=self.ledger_dir)
+                self.assertEqual(refused.returncode, 3, refused.stderr)
+                self.assertIn("continued-by.json", refused.stderr)
+                if os.path.lexists(claim):
+                    claim.unlink()
+                claim.write_text(original)
+        self.assertEqual(self.limactl_calls(), before)
+        self.assertEqual(self.call(plan, ledger=child, parent=self.ledger_dir).returncode, 0)
+        self.assertEqual(self.limactl_calls(), before + 3)
+
+    EVIDENCE_R6 = Path("/Users/lee-kyu-hwan/.oss-research-vm/logs/a78-period-analysis-eslint-r6-20261005T043448Z")
+
+    @unittest.skipUnless((EVIDENCE_R6 / "ledger-limit.json").is_file() and (EVIDENCE_R6 / "in-continue/stage.json").is_file(),
+                         "the 2026-10-05 eslint r6 ledger is only on the machine that made it")
+    def test_the_eslint_r6_ledger_continues_into_one_more_call_counting_36(self):
+        """The eslint r6 ledger (final 1/1, a continuation of r3 14/14, itself of r2 20/20), copied: the evidence is
+        only read. Its continuation of one final call counts 20 + 14 + 1 + 1 = 36, and a second one is refused."""
+        evidence = {name: (self.EVIDENCE_R6 / name).read_bytes() for name in ("ledger.jsonl", "ledger-limit.json")}
+        parent = self.root / "r6"
+        parent.mkdir()
+        for name, data in evidence.items():
+            (parent / name).write_bytes(data)
+        plan = self.chain(self.EVIDENCE_R6 / "in-continue/stage.json", remaining=1, name="r7.json")
+        done = self.call(plan, ledger=self.root / "r7", parent=parent)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        recorded = json.loads((self.root / "r7" / "ledger-limit.json").read_text())
+        self.assertEqual(recorded["parent"], {
+            "ledger_sha256": hashlib.sha256(evidence["ledger.jsonl"]).hexdigest(), "calls": 1, "ancestors": 34,
+            "limit_sha256": hashlib.sha256(evidence["ledger-limit.json"]).hexdigest()})
+        self.assertEqual(36, recorded["parent"]["ancestors"] + recorded["parent"]["calls"] + recorded["limit"])
+        refused = self.call(self.chain(self.EVIDENCE_R6 / "in-continue/stage.json", remaining=1, name="r7b.json"),
+                            ledger=self.root / "r7b", parent=parent)
+        self.assertEqual(refused.returncode, 2, refused.stderr)
+        self.assertFalse((self.EVIDENCE_R6 / "continued-by.json").exists())
+        self.assertEqual({name: (self.EVIDENCE_R6 / name).read_bytes() for name in evidence}, evidence)
 
     def test_an_ancestor_record_changed_or_missing_is_refused(self):
         parent_dir, parent_plan = self.generations(grandparent_calls=3, parent_calls=7)

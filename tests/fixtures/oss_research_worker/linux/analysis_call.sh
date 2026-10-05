@@ -31,6 +31,11 @@
 #                within 40 (else exit 2). The first call records the ancestors and the parent
 #                ledger-limit.json sha256 too, so an ancestor record edited later is refused (exit 3). A
 #                plan that is not a chain refuses a parent that records a parent of its own (exit 2).
+#                A straight chain (#258): the first call also creates PARENT_LEDGER_DIR/continued-by.json
+#                (O_EXCL; this ledger's real path and call plan sha; beside the parent ledger, not in its sha),
+#                so the counts above are the whole chain. A parent another ledger already continues is refused
+#                (exit 2: continue the latest ledger instead); a later call finding the claim changed, removed
+#                or a link is refused (exit 3).
 #
 # Steps: refuse when LEDGER_DIR/ledger.jsonl already holds the limit of calls (started calls count,
 # failed ones too); stage PROMPT_FILE root-only in the guest (/var/lib/oss-research-staging/<NAME>/task.txt,
@@ -122,6 +127,16 @@ else:
     if own is not None:
         sys.exit("parent ledger is itself a continuation; a plan continuing it must say so (parent_stage)")
     ancestors, limit_sha = 0, "-"
+claim = os.path.join(parent, "continued-by.json")
+if os.path.lexists(claim) and not os.path.lexists(os.path.join(child, "ledger-limit.json")):
+    # a straight chain (#258): a parent another ledger already continues is not continued again
+    try:
+        named = json.loads(open(claim).read()).get("ledger_dir") if regular(claim) else None
+    except (ValueError, AttributeError):
+        named = None
+    if named != os.path.realpath(child):
+        sys.exit("parent ledger is already continued by %s: continue the latest ledger of the chain "
+                 "(the one no ledger continues yet) instead" % named)
 data = open(ledger, "rb").read()
 print(sum(b'"kind": "token"' in line for line in data.splitlines()), hashlib.sha256(data).hexdigest(),
       ancestors if chain == "continue" else "-", limit_sha)
@@ -147,14 +162,23 @@ mkdir -p -m 0700 "$LEDGER_DIR"
 LEDGER="$LEDGER_DIR/ledger.jsonl"
 BOUND="$LEDGER_DIR/ledger-limit.json"
 PYTHONDONTWRITEBYTECODE=1 python3 -I -B - "$BOUND" "$LEDGER" "$LIMIT" "$PLAN_SHA" "$PARENT_SHA" "$PARENT_CALLS" \
-    "$ANCESTORS" "$PARENT_LIMIT_SHA" <<'PY' || exit 3
+    "$ANCESTORS" "$PARENT_LIMIT_SHA" "$PARENT" "$LEDGER_DIR" <<'PY'
 import json, os, sys
-bound, ledger, limit, sha, parent_sha, parent_calls, ancestors, parent_limit_sha = sys.argv[1:9]
+bound, ledger, limit, sha, parent_sha, parent_calls, ancestors, parent_limit_sha, parent, child = sys.argv[1:11]
 now = {"limit": int(limit), "call_plan_sha256": None if sha == "null" else sha}
+claim = mine = None
 if parent_sha != "-":
     now["parent"] = {"ledger_sha256": parent_sha, "calls": int(parent_calls)}
     if ancestors != "-":
         now["parent"].update(ancestors=int(ancestors), limit_sha256=parent_limit_sha)
+    # the parent's one child (#258): beside its ledger, not in the ledger sha
+    claim = os.path.join(parent, "continued-by.json")
+    mine = {"ledger_dir": os.path.realpath(child), "call_plan_sha256": sha}
+def claimed():
+    try:
+        return json.loads(open(claim).read()) if os.path.isfile(claim) and not os.path.islink(claim) else None
+    except ValueError:
+        return None
 if os.path.lexists(bound):
     try:
         recorded = json.loads(open(bound).read()) if not os.path.islink(bound) else None
@@ -162,13 +186,28 @@ if os.path.lexists(bound):
         recorded = None
     if recorded != now:
         sys.exit("refused: the ledger limit is bound to %s, this call asks for %s" % (json.dumps(recorded), json.dumps(now)))
+    if claim and claimed() != mine:
+        sys.exit("refused: the parent ledger's continued-by.json no longer names this ledger: %s" % claim)
 elif os.path.exists(ledger) and os.path.getsize(ledger) and now != {"limit": 12, "call_plan_sha256": None}:
     sys.exit("refused: the ledger already holds calls without a recorded ledger limit")
 else:
+    if claim:
+        try:
+            fd = os.open(claim, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+            os.write(fd, (json.dumps(mine) + "\n").encode())
+            os.close(fd)
+        except FileExistsError:
+            other = claimed()
+            if other != mine:
+                print("parent ledger is already continued by %s: continue the latest ledger of the chain "
+                      "(the one no ledger continues yet) instead"
+                      % (other.get("ledger_dir") if isinstance(other, dict) else None), file=sys.stderr)
+                sys.exit(2)
     fd = os.open(bound, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     os.write(fd, (json.dumps(now) + "\n").encode())
     os.close(fd)
 PY
+rc=$?; [ "$rc" = 0 ] || exit $(( rc == 2 ? 2 : 3 ))
 count=$(grep -c '"kind": "token"' "$LEDGER" 2>/dev/null); count=${count:-0}
 if [ "$KIND" = token ] && [ "$count" -ge "$LIMIT" ]; then
   echo "refused: the ledger already holds $LIMIT model calls" >&2; exit 3
