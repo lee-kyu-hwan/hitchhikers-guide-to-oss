@@ -145,12 +145,9 @@ class ContinuePlanTests(reduce.ReducedCase):
 EVIDENCE_R2 = Path("/Users/lee-kyu-hwan/.oss-research-vm/logs/a78-period-analysis-eslint-r2-20261004T131350Z")
 
 
-@unittest.skipUnless((EVIDENCE_R2 / "in-extract/stage.json").is_file() and (EVIDENCE_R2 / "answers").is_dir(),
-                     "the 2026-10-04 eslint r2 run is only on the machine that made it")
-class RunR2ContinuationTests(unittest.TestCase):
-    """The eslint r2 run of 2026-10-04: 20 extract answers adopted under strict verification, then refused at
-    synthesis-input for 7 groups over the old limit of 3. The evidence is only read; the run is rebuilt from
-    the same collections in a temporary directory (same corpus, same digest, same extract prompts)."""
+class RunR2Case(unittest.TestCase):
+    """The eslint r2 run rebuilt from the same collections in a temporary directory (same corpus, same digest,
+    same extract prompts); the evidence is only read."""
 
     def setUp(self):
         self.root = Path(tempfile.mkdtemp())
@@ -170,6 +167,13 @@ class RunR2ContinuationTests(unittest.TestCase):
         self.answers = sorted(str(path) for path in (EVIDENCE_R2 / "answers").glob("*.result.json"))
         self.extract = [item for path in self.answers for item in ("--extract-result", path)]
 
+
+@unittest.skipUnless((EVIDENCE_R2 / "in-extract/stage.json").is_file() and (EVIDENCE_R2 / "answers").is_dir(),
+                     "the 2026-10-04 eslint r2 run is only on the machine that made it")
+class RunR2ContinuationTests(RunR2Case):
+    """The eslint r2 run of 2026-10-04: 20 extract answers adopted under strict verification, then refused at
+    synthesis-input for 7 groups over the old limit of 3."""
+
     def test_the_adopted_answers_continue_into_seven_groups_and_a_fourteen_call_plan(self):
         code, summary, stderr = stage("continue-plan", "--run-dir", self.run, "--extract-stage",
                                       str(EVIDENCE_R2 / "in-extract"), *self.extract, "--records", str(EVIDENCE_R2),
@@ -186,6 +190,31 @@ class RunR2ContinuationTests(unittest.TestCase):
         self.assertEqual(7, len(synthesis["groups"]))
         self.assertEqual(8, synthesis["synthesis_calls"])
         self.assertTrue(all(call["bytes"] <= CAP for call in synthesis["calls"]))
+
+
+
+EVIDENCE_R3 = Path("/Users/lee-kyu-hwan/.oss-research-vm/logs/a78-period-analysis-eslint-r3-20261005T025628Z")
+
+
+@unittest.skipUnless((EVIDENCE_R3 / "answers/synthesis-07.result.json").is_file()
+                     and (EVIDENCE_R2 / "answers").is_dir(), "the 2026-10-05 eslint r3 run is only on the machine that made it")
+class RunR3MergeTests(RunR2Case):
+    """The eslint r3 run of 2026-10-05: seven group answers adopted under strict verification, then the merge input
+    refused at 83,563 bytes. With the candidates only and one quote per (candidate, cited PR) it fits."""
+
+    def test_the_seven_group_answers_make_a_merge_input_within_the_cap(self):
+        code, _, stderr = stage("synthesis-input", "--run-dir", self.run, *self.extract, "--out", str(self.root / "s"))
+        self.assertEqual(0, code, stderr)
+        groups = [item for path in sorted((EVIDENCE_R3 / "answers").glob("synthesis-*.result.json"))
+                  for item in ("--group-result", str(path))]
+        code, merged, stderr = stage("synthesis-merge-input", "--run-dir", self.run, "--synthesis-stage",
+                                     str(self.root / "s"), *groups, *self.extract, "--out", str(self.root / "m"))
+        self.assertEqual(0, code, stderr)
+        self.assertLessEqual(merged["calls"][0]["bytes"], CAP)
+        self.assertEqual({"listed": 61, "no_quote": 0}, merged["merge_quotes"])
+        self.assertEqual(8, merged["synthesis_calls"])
+        scope = json.loads((self.root / "m" / "synthesis.scope.json").read_text(encoding="utf-8"))
+        self.assertEqual((25, 61), (len(scope["keys"]), len(scope["quotes"])))
 
 
 if __name__ == "__main__":

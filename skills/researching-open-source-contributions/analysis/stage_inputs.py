@@ -640,8 +640,31 @@ def reduced_synthesis_input(context: Context, args, stems: list[str], results: d
     return summary
 
 
+def merge_quotes(previous: dict, candidates_of: dict, results: dict, report: dict) -> tuple[list, list]:
+    """For each (group candidate, cited PR), the first verified quote of that candidate's own group: the group's
+    extract answers in its stem order, then each answer's order as check_extraction reports it (pattern evidence,
+    then observations). Each (PR, quote) is listed once; a pair with no verified quote in its group is listed in
+    the second list (no quote), never filled from another group."""
+    by_file = {}
+    for item in report["verified_evidence"]:
+        by_file.setdefault(Path(item["file"]).name, []).append(item)
+    evidence, missing, seen = [], [], set()
+    for group in previous["groups"]:
+        files = [Path(results[stem][0]).name for stem in group["stems"]]
+        for candidate in candidates_of[group["input_dir"]]:
+            for key in dict.fromkeys(candidate["cited_prs"]):
+                item = next((item for name in files for item in by_file.get(name, []) if item["pr"] == key), None)
+                if item is None:
+                    missing.append({"group": group["input_dir"], "candidate": candidate["id"], "pr": key})
+                elif (item["pr"], item["quote"]) not in seen:
+                    seen.add((item["pr"], item["quote"]))
+                    evidence.append({"pr": item["pr"], "pr_id": item["pr_id"], "quote": item["quote"]})
+    return evidence, missing
+
+
 def cmd_synthesis_merge_input(context: Context, args) -> dict:
-    """The second level of a synthesis that did not fit one prompt: the group answers, merged by one call."""
+    """The second level of a synthesis that did not fit one prompt: the group candidates (never their dropped
+    ideas), the PR index, and one verified quote per (candidate, cited PR) from the candidate's own group."""
     if not context.reduced:
         raise StageError("synthesis-merge-input is for the extraction-only path; this run's synthesis is one call")
     previous = read_json(Path(args.synthesis_stage) / "stage.json", PROMPT_MAX_BYTES, "synthesis stage")
@@ -650,32 +673,33 @@ def cmd_synthesis_merge_input(context: Context, args) -> dict:
     expected = [group["input_dir"] for group in previous["groups"]]
     found = load_results(args.group_result, expected, "group result")
     group_keys = {group["input_dir"]: set(group["keys"]) for group in previous["groups"]}
-    blocks, cited = [], []
+    candidates_of, cited = {}, []
     for name in expected:
         candidates = parse_synthesis(context, found[name][0])
         outside = sorted({key for c in candidates for key in c["cited_prs"]} - group_keys[name])
         if outside:
             raise StageError("group result %s cites keys its own input did not hold: %s" % (name, ", ".join(outside)))
-        blocks.append((name, {"candidates": candidates, "dropped": found[name][1]["dropped"]}))
+        candidates_of[name] = candidates
         cited += [key for c in candidates for key in c["cited_prs"]]
     cited = list(dict.fromkeys(cited))
     results = load_results(args.extract_result, context.extract_stems(), "extract result")
     report = check_quotes(context, [path for path, _ in results.values()])
-    evidence = [item for item in compact_report(report)["verified_evidence"] if item["pr"] in set(cited)]
+    evidence, missing = merge_quotes(previous, candidates_of, results, report)
     text = read_bounded(PROMPTS / "synthesize-merge.md", PROMPT_MAX_BYTES, "merge template").decode("utf-8")
     text += block("PR 색인", context.pr_index())
-    for name, document in blocks:
-        text += block("그룹 종합 " + name, document)
-    text += block("인용 확인 보고서", {"totals": report["totals"], "verified_evidence": evidence})
+    for name in expected:
+        text += block("그룹 종합 " + name, {"candidates": candidates_of[name]})
+    text += block("인용 확인 보고서", {"totals": report["totals"], "verified_evidence": evidence, "no_quote": missing})
     if len(text.encode("utf-8")) > PROMPT_MAX_BYTES:
         raise StageError("synthesis-merge-input: the merge prompt is %d bytes (> %d) with these group answers; "
                          "refused, not cut" % (len(text.encode("utf-8")), PROMPT_MAX_BYTES))
     out = new_directory(args.out)
     entry = write_prompt(out / "synthesis", text)
     entry["result_name"] = "synthesis.result.json"
-    write_scope(out, "synthesis", cited)
-    summary = {"stage": "synthesis-merge", "mode": context.mode, "calls": [entry], "groups": len(blocks),
-               "synthesis_calls": len(blocks) + 1, "quotes": report["totals"]}
+    write_scope(out, "synthesis", cited, [{"pr": item["pr"], "quote": item["quote"]} for item in evidence])
+    summary = {"stage": "synthesis-merge", "mode": context.mode, "calls": [entry], "groups": len(expected),
+               "synthesis_calls": len(expected) + 1, "quotes": report["totals"],
+               "merge_quotes": {"listed": len(evidence), "no_quote": len(missing)}}
     write_json(out / "stage.json", summary)
     return summary
 

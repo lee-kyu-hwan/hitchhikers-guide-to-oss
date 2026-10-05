@@ -95,9 +95,9 @@ class ReducedCase(unittest.TestCase):
         return self.write(name, {"candidates": [{"id": candidate, "statement": fx.SYNTHETIC + " backoff",
                                                  "cited_prs": keys, "found_by": "blind"}], "dropped": []})
 
-    def group_size(self, stems_of_lenses, pad, note=True):
+    def group_size(self, stems_of_lenses, pad, note=True, paths=None):
         """The synthesis prompt for whole lenses (every shard of each), measured the way the stage measures it."""
-        paths = self.extract_args(pad)[1::2]
+        paths = paths or self.extract_args(pad)[1::2]
         results = stage_inputs.load_results(paths, self.context.extract_stems(), "extract result")
         report = stage_inputs.check_quotes(self.context, [path for path, _ in results.values()])
         stems = [stem for stem in self.context.extract_stems() if stem.split("-")[1] in stems_of_lenses]
@@ -356,6 +356,168 @@ class MergeTests(ReducedCase):
         with mock.patch.object(stage_inputs, "PROMPT_MAX_BYTES", 5000):
             self.merge(results, out="x", code=2)
         self.assertFalse((self.root / "x").exists())
+
+
+class MinimalMergeTests(ReducedCase):
+    """The merge input holds the group candidates (never their dropped ideas), the PR index, and for each
+    (candidate, cited PR) the first verified quote of that candidate's own group: the group's extract answers in
+    the group's stem order, then each answer's own order (pattern evidence, then observations)."""
+
+    PAD = 1000
+    # Which of a key's real sentences each lens quotes: the three groups' first lenses (blind, maintenance,
+    # structure... and blind vs correctness) differ, so the quote shows which answer it was taken from.
+    INDEX = {"blind": 0, "correctness": 1, "maintenance": 2, "review": 1, "structure": 2}
+    RULE = "입력에는 각 그룹이 남긴 후보만 있다. 그룹이 버린 항목은 다시 살리지 않는다."
+
+    def setUp(self):
+        super().setUp()
+        self.sentences = self.real_sentences()
+
+    def real_sentences(self):
+        """Per digest key, distinct sentences of its section that the quote checker accepts."""
+        candidates = []
+        for name in self.context.keymap["shards"]:
+            text = (self.context.digest_dir / name).read_text(encoding="utf-8")
+            for chunk in text.split("\n### "):
+                head = chunk.lstrip("#").lstrip().split(" — ", 1)[0].strip()
+                if head in self.context.keymap["sections"]:
+                    for line in chunk.splitlines():
+                        words = line.strip().split(" ")
+                        if line.startswith("  ") and 25 <= len(line.strip()) <= 200:
+                            # the line, and the line without its first or last word: still contiguous source text
+                            candidates += [(head, " ".join(part)) for part in (words, words[1:], words[:-1])
+                                           if len(" ".join(part)) >= 25]
+        probe = self.answers / "probe.result.json"
+        probe.write_text(json.dumps({"lens": "blind", "patterns": [], "rejected": [], "observations": [
+            {"pr": key, "note": "n", "quote": quote} for key, quote in candidates]}))
+        report = stage_inputs.check_quotes(self.context, [str(probe)])
+        probe.unlink()
+        found = {}
+        for item in report["verified_evidence"]:
+            if item["quote"] not in found.setdefault(item["pr"], []):
+                found[item["pr"]].append(item["quote"])
+        for key in self.context.keymap["sections"]:
+            self.assertGreaterEqual(len(found.get(key, [])), 3, key)
+        return found
+
+    def lens_answers(self, broken=()):
+        """Extract answers whose observation quote for a key differs by lens; (lens, key) in broken gets a reworded
+        quote the checker refuses."""
+        shards = self.key_of_shard()
+        paths = []
+        for stem in self.context.extract_stems():
+            lens = stem.split("-")[1]
+            keys = shards["digest-%s.md" % stem.rsplit("-", 1)[1]]
+            observations = []
+            for key in keys:
+                quote = self.sentences[key][self.INDEX[lens]]
+                observations.append({"pr": key, "note": fx.SYNTHETIC + " " + "n" * self.PAD,
+                                     "quote": quote + " (reworded)" if (lens, key) in broken else quote})
+            path = self.answers / (stem + ".result.json")
+            path.write_text(json.dumps({"lens": lens, "patterns": [], "rejected": [], "observations": observations}))
+            paths.append(str(path))
+        return paths
+
+    def grouped(self, paths, out="g"):
+        cap = self.group_size(["blind", "correctness"], self.PAD, paths=paths) + 50
+        with mock.patch.object(stage_inputs, "PROMPT_MAX_BYTES", cap):
+            summary, _ = self.stage("synthesis-input", "--run-dir", self.run,
+                                    *[item for path in paths for item in ("--extract-result", path)],
+                                    "--out", str(self.root / out))
+        self.assertEqual([["blind", "correctness"], ["maintenance", "review"], ["structure"]],
+                         [sorted({stem.split("-")[1] for stem in group["stems"]}) for group in summary["groups"]])
+        return summary
+
+    def group_answers(self, summary):
+        """Two candidates per group, each citing three of the group's keys, and dropped ideas the merge must not see."""
+        paths = []
+        for group in summary["groups"]:
+            keys = sorted(group["keys"])
+            answer = {"candidates": [{"id": "C%d" % n, "statement": "%s candidate %d" % (group["input_dir"], n),
+                                      "cited_prs": [keys[(n + step) % len(keys)] for step in range(3)],
+                                      "found_by": "blind"} for n in (1, 2)],
+                      "dropped": [{"idea": "DROPPED-%s-%d" % (group["input_dir"], n), "reason": "weak"} for n in range(3)]}
+            path = self.answers / (group["input_dir"] + ".result.json")
+            path.write_text(json.dumps(answer), encoding="utf-8")
+            paths.append(str(path))
+        return paths
+
+    def merge(self, groups, extract, out="m", code=0):
+        return self.stage("synthesis-merge-input", "--run-dir", self.run, "--synthesis-stage", str(self.root / "g"),
+                          *[item for path in groups for item in ("--group-result", path)],
+                          *[item for path in extract for item in ("--extract-result", path)],
+                          "--out", str(self.root / out), code=code)
+
+    def section(self, text, title):
+        head = "=== %s ===\n" % title
+        start = text.index(head) + len(head)
+        return json.loads(text[start:text.index("\n=== %s 끝 ===" % title, start)])
+
+    def expected_quote(self, summary, group_dir, key, broken=()):
+        group = next(g for g in summary["groups"] if g["input_dir"] == group_dir)
+        for stem in group["stems"]:
+            lens = stem.split("-")[1]
+            if key in self.key_of_shard()["digest-%s.md" % stem.rsplit("-", 1)[1]] and (lens, key) not in broken:
+                return self.sentences[key][self.INDEX[lens]]
+        return None
+
+    def test_the_group_blocks_hold_the_candidates_only_and_the_prompt_says_dropped_ideas_stay_dropped(self):
+        extract = self.lens_answers()
+        summary = self.grouped(extract)
+        groups = self.group_answers(summary)
+        self.merge(groups, extract)
+        text = self.prompt("m", "synthesis", "task.txt")
+        self.assertIn(self.RULE, text)
+        self.assertNotIn("DROPPED-", text)
+        for group, path in zip(summary["groups"], groups):
+            self.assertEqual({"candidates": json.loads(Path(path).read_text())["candidates"]},
+                             self.section(text, "그룹 종합 " + group["input_dir"]))
+
+    def test_each_candidate_pr_gets_the_first_verified_quote_of_its_own_group(self):
+        extract = self.lens_answers()
+        summary = self.grouped(extract)
+        groups = self.group_answers(summary)
+        merged, _ = self.merge(groups, extract)
+        report = self.section(self.prompt("m", "synthesis", "task.txt"), "인용 확인 보고서")
+        expected, picks = [], []
+        for group, path in zip(summary["groups"], groups):
+            for candidate in json.loads(Path(path).read_text())["candidates"]:
+                for key in candidate["cited_prs"]:
+                    quote = self.expected_quote(summary, group["input_dir"], key)
+                    self.assertIsNotNone(quote)
+                    picks.append({"group": group["input_dir"], "candidate": candidate["id"], "pr": key, "quote": quote})
+                    if {"pr": key, "quote": quote} not in expected:
+                        expected.append({"pr": key, "quote": quote})
+        self.assertEqual(expected, [{"pr": item["pr"], "quote": item["quote"]} for item in report["verified_evidence"]])
+        self.assertEqual([], report["no_quote"])
+        # the second group's quotes come from its own lenses (maintenance first), not from blind
+        second = [pick for pick in picks if pick["group"] == summary["groups"][1]["input_dir"]]
+        self.assertTrue(all(pick["quote"] == self.sentences[pick["pr"]][self.INDEX["maintenance"]] for pick in second))
+        scope = json.loads((self.root / "m" / "synthesis.scope.json").read_text(encoding="utf-8"))
+        self.assertEqual({"keys": sorted({pick["pr"] for pick in picks}), "quotes": expected}, scope)
+        reordered, _ = self.merge(list(reversed(groups)), list(reversed(extract)), out="m2")
+        self.assertEqual(self.prompt("m", "synthesis", "task.txt"), self.prompt("m2", "synthesis", "task.txt"))
+
+    def test_a_candidate_pr_without_a_verified_quote_in_its_group_is_marked_not_filled_from_another_group(self):
+        first = self.key_of_shard()["digest-01.md"][0]
+        broken = {("blind", first), ("correctness", first)}             # the first group's two lenses
+        extract = self.lens_answers(broken)
+        summary = self.grouped(extract)
+        groups = self.group_answers(summary)
+        group_dir = summary["groups"][0]["input_dir"]
+        answer = json.loads(Path(groups[0]).read_text())
+        other = next(key for key in sorted(summary["groups"][0]["keys"]) if key != first)
+        answer["candidates"][0]["cited_prs"] = [first, other]
+        Path(groups[0]).write_text(json.dumps(answer), encoding="utf-8")
+        self.merge(groups, extract)
+        report = self.section(self.prompt("m", "synthesis", "task.txt"), "인용 확인 보고서")
+        self.assertEqual([{"group": group_dir, "candidate": "C1", "pr": first}],
+                         [item for item in report["no_quote"] if item["pr"] == first and item["group"] == group_dir])
+        # another group's quote for the same PR is never borrowed: only groups whose own candidates cite it add one
+        elsewhere = {self.expected_quote(summary, group["input_dir"], first, broken)
+                     for group, path in zip(summary["groups"][1:], groups[1:])
+                     if any(first in c["cited_prs"] for c in json.loads(Path(path).read_text())["candidates"])}
+        self.assertEqual(elsewhere, {item["quote"] for item in report["verified_evidence"] if item["pr"] == first})
 
 
 class VerifyTests(ReducedCase):
