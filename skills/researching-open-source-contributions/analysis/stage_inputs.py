@@ -8,6 +8,7 @@ call, and assembles the final analysis envelope deterministically:
 
   extract-inputs   RUN → OUT/extract-<lens>/task.txt           (5 independent calls)
   continue-plan    RUN + adopted extract results + their extract stage → OUT/stage.json
+                   (or + a continue stage and the adopted synthesis/verify answers of its ledger: the rest)
                    (no prompt: the call plan of the stages not yet run, #82)
   synthesis-input  RUN + extract results → OUT/task.txt        (1 call: candidates)
   verify-inputs    RUN + synthesis answer → OUT/verify-<id>/task.txt  (k calls, k may be 0)
@@ -817,20 +818,26 @@ def cmd_synthesis_input(context: Context, args) -> dict:
     return summary
 
 
-def adopted_extract_answer(context: Context, stem: str, path: str, prompt_sha: str, records: Path) -> dict:
-    """One adopted extract answer, bound to the prompt its extract stage recorded: the strict verdict of its call
-    (ok, strict limits, an extract answer, P3 the prompt sha, P4 PASS, adopted under this file name) and the
-    picked-up worker manifest (that prompt sha, and this answer's bytes as the report)."""
-    answer = read_bounded(Path(path), ANSWER_MAX_BYTES, "extract result")
-    verdict = read_json(records / stem / "verdict.json", ANSWER_MAX_BYTES, "verdict of " + stem)
-    manifest = read_json(records / stem / "result" / "manifest.json", ANSWER_MAX_BYTES, "manifest of " + stem)
+def recorded_call_problems(kind: str, path: str, call_dir: Path, prompt_sha: str | None) -> tuple:
+    """The strict verdict of the call that made an adopted answer (ok, strict limits, this answer kind, P3 the
+    prompt sha, P4 PASS, adopted under this file name) and its picked-up worker manifest (that prompt sha, and the
+    answer's bytes as the report). prompt_sha None takes the verdict's own P3. Returns (problems, answer sha,
+    prompt sha)."""
+    answer = read_bounded(Path(path), ANSWER_MAX_BYTES, kind + " result")
+    verdict = read_json(call_dir / "verdict.json", ANSWER_MAX_BYTES, "verdict of " + call_dir.name)
+    manifest = read_json(call_dir / "result" / "manifest.json", ANSWER_MAX_BYTES, "manifest of " + call_dir.name)
     if not isinstance(verdict, dict) or not isinstance(manifest, dict) or not isinstance(verdict.get("items"), list):
-        raise StageError("the record of %s is not a verdict and a worker manifest" % stem)
+        raise StageError("the record of %s is not a verdict and a worker manifest" % call_dir.name)
     items = {item.get("id"): item for item in verdict["items"] if isinstance(item, dict)}
     problems = []
-    if verdict.get("ok") is not True or verdict.get("limits") != "strict" or verdict.get("answer_kind") != "extract":
-        problems.append("the verdict is not an ok strict extract verdict")
-    if items.get("P3-prompt-sha256", {}).get("detail") != prompt_sha:
+    if verdict.get("ok") is not True or verdict.get("limits") != "strict" or verdict.get("answer_kind") != kind:
+        problems.append("the verdict is not an ok strict %s verdict" % kind)
+    checked = items.get("P3-prompt-sha256", {}).get("detail")
+    if prompt_sha is None:
+        prompt_sha = checked if isinstance(checked, str) and re.fullmatch(r"[0-9a-f]{64}", checked) else None
+        if prompt_sha is None:
+            problems.append("the verdict records no prompt sha")
+    elif checked != prompt_sha:
         problems.append("the verdict checked another prompt")
     if items.get("P4-prompt-binding", {}).get("status") != "PASS":
         problems.append("the verdict did not pass the prompt binding")
@@ -842,9 +849,106 @@ def adopted_extract_answer(context: Context, stem: str, path: str, prompt_sha: s
     answer_sha = hashlib.sha256(answer).hexdigest()
     if manifest.get("report_sha256") != answer_sha:
         problems.append("the answer bytes are not the report the worker manifest records")
+    return problems, answer_sha, prompt_sha
+
+
+def adopted_extract_answer(context: Context, stem: str, path: str, prompt_sha: str, records: Path) -> dict:
+    """One adopted extract answer, bound to the prompt its extract stage recorded (recorded_call_problems)."""
+    problems, answer_sha, _ = recorded_call_problems("extract", path, records / stem, prompt_sha)
     if problems:
         raise StageError("the adopted answer %s is not bound to its recorded prompt: %s" % (stem, "; ".join(problems)))
     return {"stem": stem, "result_name": Path(path).name, "answer_sha256": answer_sha, "prompt_sha256": prompt_sha}
+
+
+def adopted_reduce_answer(kind: str, path: str, records: Path, ledger: list) -> dict:
+    """One adopted synthesis or verify answer of the parent ledger (#82): its call record (recorded_call_problems)
+    and the ledger line of that call, the one analysis_call.sh appended (a token call, succeeded, the same input,
+    prompt and report sha). The call directory is the answer's stem as the harness named it (lower case)."""
+    name = Path(path).name
+    if not name.endswith(".result.json"):
+        raise StageError("%s is not a <stem>.result.json answer" % name)
+    stem = name[: -len(".result.json")]
+    entries = set(os.listdir(records))
+    call = stem if stem in entries else stem.lower() if stem.lower() in entries else None
+    if call is None or (records / call).is_symlink() or not (records / call).is_dir():
+        raise StageError("no call record for the adopted answer %s" % name)
+    problems, answer_sha, prompt_sha = recorded_call_problems(kind, path, records / call, None)
+    lines = [line for line in ledger if line.get("name") == call and line.get("kind") == "token"]
+    if len(lines) != 1:
+        problems.append("the parent ledger holds %d token lines for the call %s" % (len(lines), call))
+    elif (lines[0].get("status") != "succeeded" or lines[0].get("input_sha256") != prompt_sha
+          or lines[0].get("prompt_sha256_recorded") != prompt_sha or lines[0].get("report_sha256") != answer_sha):
+        problems.append("the parent ledger line of %s records another input, prompt or report" % call)
+    if problems:
+        raise StageError("the adopted answer %s is not bound to the parent ledger: %s" % (name, "; ".join(problems)))
+    return {"kind": kind, "call": call, "result_name": name, "answer_sha256": answer_sha, "prompt_sha256": prompt_sha}
+
+
+def continue_chain_plan(context: Context, args, data: bytes, recorded: dict) -> dict:
+    """continue-plan on a continue stage (#82): the parent ledger was itself a continuation (bound to this continue
+    stage) and has adopted the synthesis answer and some or all verify answers. The extract answers must be the
+    ones the continue stage recorded (same bytes); each reduce answer must be bound to the parent ledger
+    (adopted_reduce_answer). The new plan holds the verify calls of candidates without an adopted answer and the
+    final, bound to this continue stage with parent_stage "continue" so the harness counts the ancestors too."""
+    if not args.synthesis_result:
+        raise StageError("a continue stage needs its adopted synthesis answer (--synthesis-result)")
+    before, listed = recorded.get("call_plan"), recorded.get("answers")
+    done = before.get("continues", {}).get("completed", {}) if isinstance(before, dict) else {}
+    if (not isinstance(before, dict) or not isinstance(listed, list) or recorded.get("mode") != context.mode
+            or before.get("shards") != context.shards or not isinstance(done.get("extract"), int)
+            or not isinstance(before.get("synthesis"), int)
+            or not all(isinstance(item, dict) and isinstance(item.get("stem"), str) for item in listed)):
+        raise StageError("the continue stage.json is not a continue plan of this run")
+    stems, results, report, projected = checked_extract_answers(context, args.extract_result, "continue-plan")
+    expected = {item["stem"]: item for item in listed}
+    if sorted(expected) != sorted(stems):
+        raise StageError("the extract answers are not the ones the continue stage recorded")
+    for stem in stems:
+        path = results[stem][0]
+        if (Path(path).name != expected[stem].get("result_name")
+                or hashlib.sha256(read_bounded(Path(path), ANSWER_MAX_BYTES, "extract result")).hexdigest()
+                != expected[stem].get("answer_sha256")):
+            raise StageError("the extract answer %s is not the one the continue stage recorded" % stem)
+    records = Path(args.records)
+    bound = read_json(records / "ledger-limit.json", ANSWER_MAX_BYTES, "parent ledger limit")
+    if not isinstance(bound, dict) or bound.get("call_plan_sha256") != hashlib.sha256(data).hexdigest():
+        raise StageError("the records are not the ledger bound to this continue stage")
+    ledger = []
+    for line in read_bounded(records / "ledger.jsonl", ANSWER_MAX_BYTES, "parent ledger").decode("utf-8").splitlines():
+        try:
+            entry = json.loads(line)
+        except ValueError as error:
+            raise StageError("the parent ledger is not one JSON object per line: %s" % error) from error
+        ledger.append(entry if isinstance(entry, dict) else {})
+    candidates = parse_synthesis(context, args.synthesis_result)
+    reduce_answers = [adopted_reduce_answer("synthesis", args.synthesis_result, records, ledger)]
+    ids, verified = [candidate["id"] for candidate in candidates], []
+    for path in args.verify_result:
+        document = read_json(Path(path), ANSWER_MAX_BYTES, "verify result")
+        answer_id = document.get("id") if isinstance(document, dict) else None
+        if answer_id not in ids or answer_id in verified or Path(path).name != "verify-%s.result.json" % answer_id:
+            raise StageError("%s is not the verify answer of one synthesis candidate" % Path(path).name)
+        verified.append(answer_id)
+        reduce_answers.append(adopted_reduce_answer("verify", path, records, ledger))
+    verify = len(ids) - len(verified)
+    total = verify + 1
+    plan = {"mode": context.mode,
+            "continues": {"extract_stage_sha256": hashlib.sha256(data).hexdigest(),
+                          "completed": {"extract": done["extract"],
+                                        "synthesis": done.get("synthesis", 0) + before["synthesis"],
+                                        "verify": len(verified)},
+                          "parent_stage": "continue"},
+            "shards": context.shards, "lenses": len(context.siblings.build_prompts.LENSES), "extract": 0,
+            "synthesis": 0, "verify": verify, "final": 1, "max_model_calls": total,
+            "formula": "%d extract and %d synthesis calls done, %d of %d verify answers adopted; %d (verify) + 1 "
+                       "(final) = %d" % (done["extract"], done.get("synthesis", 0) + before["synthesis"],
+                                         len(verified), len(ids), verify, total),
+            "inputs": {"max_candidates": MAX_CANDIDATES, "candidates": len(ids)}}
+    out = new_directory(args.out)
+    summary = {"stage": "continue", "mode": context.mode, "answers": listed, "reduce_answers": reduce_answers,
+               "max_model_calls": total, "call_plan": plan, "final_projection_bytes": projected}
+    write_json(out / "stage.json", summary)
+    return summary
 
 
 def cmd_continue_plan(context: Context, args) -> dict:
@@ -856,8 +960,12 @@ def cmd_continue_plan(context: Context, args) -> dict:
             recorded = json.loads(data.decode("utf-8"), object_pairs_hook=_unique_object, parse_constant=_refuse_constant)
         except (UnicodeDecodeError, ValueError) as error:
             raise StageError("the extract stage.json is not one strict JSON document: %s" % error) from error
+        if isinstance(recorded, dict) and recorded.get("stage") == "continue":
+            return continue_chain_plan(context, args, data, recorded)
         if not isinstance(recorded, dict) or recorded.get("stage") != "extract":
-            raise StageError("that stage.json is not an extract stage")
+            raise StageError("that stage.json is not an extract stage (nor a continue stage)")
+        if args.synthesis_result or args.verify_result:
+            raise StageError("adopted synthesis and verify answers are taken only with a continue stage")
         calls = recorded.get("calls")
         if not isinstance(calls, list) or not all(isinstance(call, dict) and isinstance(call.get("input_dir"), str)
                                                   and isinstance(call.get("sha256"), str) for call in calls):
@@ -1217,10 +1325,15 @@ def build_parser() -> argparse.ArgumentParser:
     command("extract-inputs").add_argument("--out", required=True)
     resume = command("continue-plan")
     resume.add_argument("--extract-stage", required=True,
-                        help="the extract-inputs output directory whose stage.json made the adopted answers' prompts")
+                        help="the extract-inputs output directory whose stage.json made the adopted answers' prompts, "
+                             "or a continue-plan output directory whose ledger has adopted reduce answers")
     resume.add_argument("--extract-result", action="append", required=True)
     resume.add_argument("--records", required=True,
-                        help="directory with <stem>/verdict.json (strict) and <stem>/result/manifest.json per call")
+                        help="directory with <stem>/verdict.json (strict) and <stem>/result/manifest.json per call "
+                             "(for a continue stage: the parent ledger directory, with ledger.jsonl)")
+    resume.add_argument("--synthesis-result", help="continue stage only: the adopted synthesis (or merge) answer")
+    resume.add_argument("--verify-result", action="append", default=[],
+                        help="continue stage only: the adopted verify answers (verify-<id>.result.json)")
     resume.add_argument("--out", required=True)
     synthesis = command("synthesis-input")
     synthesis.add_argument("--extract-result", action="append", required=True)

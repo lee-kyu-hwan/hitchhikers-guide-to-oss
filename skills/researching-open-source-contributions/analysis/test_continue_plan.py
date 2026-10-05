@@ -142,6 +142,131 @@ class ContinuePlanTests(reduce.ReducedCase):
         self.assertFalse((self.root / "short").exists())
 
 
+class ContinueChainTests(reduce.ReducedCase):
+    """continue-plan on a continue stage (#82): the parent ledger was itself a continuation and has adopted the
+    synthesis (and some or all verify) answers, so only the stages after them remain, bound to that continue
+    stage. Each reduce answer must be bound to the parent ledger: its strict verdict, its worker manifest and
+    the ledger line of its call (input and report sha)."""
+
+    adopted = ContinuePlanTests.adopted
+
+    def setUp(self):
+        super().setUp()
+        self.extract_stage = self.root / "x"
+        self.stage("extract-inputs", "--run-dir", self.run, "--out", str(self.extract_stage))
+        self.records = self.root / "calls"
+        self.paths = self.adopted()
+        args = [item for path in self.paths for item in ("--extract-result", path)]
+        self.stage("continue-plan", "--run-dir", self.run, "--extract-stage", str(self.extract_stage), *args,
+                   "--records", str(self.records), "--out", str(self.root / "c"))
+        self.continue_stage = self.root / "c"
+        self.ledger = self.root / "gen2"
+        self.ledger.mkdir()
+        (self.ledger / "ledger-limit.json").write_text(json.dumps({
+            "limit": 7, "call_plan_sha256": sha256(self.continue_stage / "stage.json"),
+            "parent": {"ledger_sha256": "a" * 64, "calls": 15}}) + "\n")
+        keys = list(self.context.keymap["sections"])[:2]
+        self.synthesis = self.synthesis_answer(keys)
+        self.verify = self.write("verify-C1.result.json", {
+            "id": "C1", "verdict": "supported", "evidence_checks": [
+                {"pr": key, "holds": True, "quote": self.quote_of(key), "reason": "r"} for key in keys],
+            "counterexamples": [], "distinct_prs": 2, "distinct_repos": 1, "actionable": True,
+            "actionable_reason": "r", "confidence": "medium", "revised_statement": "s"})
+        self.record("synthesis", "synthesis", self.synthesis, "5" * 64)
+        self.record("verify-c1", "verify", self.verify, "6" * 64)
+
+    def record(self, call, kind, path, prompt_sha):
+        """The call directory and ledger line of an adopted reduce answer (as analysis_call.sh and the verifier
+        leave them; harness call names are lower case)."""
+        directory = self.ledger / call
+        (directory / "result").mkdir(parents=True)
+        (directory / "result" / "manifest.json").write_text(json.dumps(
+            {"status": "succeeded", "prompt_sha256": prompt_sha, "report_sha256": sha256(path)}))
+        (directory / "verdict.json").write_text(json.dumps({
+            "ok": True, "result_class": "evidence", "answer_kind": kind, "limits": "strict",
+            "adopted_to": "/elsewhere/answers/" + Path(path).name,
+            "items": [{"id": "P3-prompt-sha256", "status": "INFO", "detail": prompt_sha},
+                      {"id": "P4-prompt-binding", "status": "PASS", "detail": "manifest prompt_sha256 matches"}]}))
+        with (self.ledger / "ledger.jsonl").open("a") as handle:
+            handle.write(json.dumps({"name": call, "kind": "token", "input_sha256": prompt_sha,
+                                     "prompt_sha256_recorded": prompt_sha, "report_sha256": sha256(path),
+                                     "status": "succeeded"}) + "\n")
+
+    def chain(self, *extra, out="d", code=0, synthesis=True):
+        args = [item for path in self.paths for item in ("--extract-result", path)]
+        if synthesis:
+            args += ["--synthesis-result", self.synthesis]
+        return self.stage("continue-plan", "--run-dir", self.run, "--extract-stage", str(self.continue_stage), *args,
+                          *extra, "--records", str(self.ledger), "--out", str(self.root / out), code=code)
+
+    def test_with_the_synthesis_and_every_verify_answer_adopted_only_the_final_remains(self):
+        summary, _ = self.chain("--verify-result", self.verify)
+        plan = summary["call_plan"]
+        self.assertEqual({"extract_stage_sha256": sha256(self.continue_stage / "stage.json"),
+                          "completed": {"extract": 15, "synthesis": 1, "verify": 1}, "parent_stage": "continue"},
+                         plan["continues"])
+        self.assertEqual((0, 0, 0, 1, 1), (plan["extract"], plan["synthesis"], plan["verify"], plan["final"],
+                                           plan["max_model_calls"]))
+        self.assertEqual(plan["max_model_calls"], plan["extract"] + plan["synthesis"] + plan["verify"] + plan["final"])
+        self.assertEqual(1, summary["max_model_calls"])
+        self.assertEqual([("synthesis", "synthesis", "synthesis.result.json"), ("verify", "verify-c1", "verify-C1.result.json")],
+                         [(a["kind"], a["call"], a["result_name"]) for a in summary["reduce_answers"]])
+        self.assertEqual(summary, json.loads((self.root / "d" / "stage.json").read_text(encoding="utf-8")))
+
+    def test_a_candidate_without_its_verify_answer_keeps_its_verify_call(self):
+        plan = self.chain()[0]["call_plan"]
+        self.assertEqual((0, 1, 1, 2), (plan["synthesis"], plan["verify"], plan["final"], plan["max_model_calls"]))
+        self.assertEqual({"extract": 15, "synthesis": 1, "verify": 0}, plan["continues"]["completed"])
+
+    def test_a_reduce_answer_not_bound_to_the_parent_ledger_is_refused(self):
+        def edit_json(path, change):
+            document = json.loads(path.read_text(encoding="utf-8"))
+            change(document)
+            path.write_text(json.dumps(document), encoding="utf-8")
+
+        def edit_ledger(change):
+            lines = [json.loads(line) for line in (self.ledger / "ledger.jsonl").read_text().splitlines()]
+            change(lines)
+            (self.ledger / "ledger.jsonl").write_text("".join(json.dumps(line) + "\n" for line in lines))
+
+        cases = {
+            "answer edited after adoption": lambda: Path(self.verify).write_text(
+                Path(self.verify).read_text(encoding="utf-8") + " ", encoding="utf-8"),
+            "verdict of another answer kind": lambda: edit_json(self.ledger / "verify-c1/verdict.json",
+                                                                lambda d: d.update(answer_kind="synthesis")),
+            "verdict not strict": lambda: edit_json(self.ledger / "synthesis/verdict.json", lambda d: d.update(limits="legacy")),
+            "no ledger line for the call": lambda: edit_ledger(lambda lines: lines.pop()),
+            "ledger input is another prompt": lambda: edit_ledger(lambda lines: lines[1].update(input_sha256="7" * 64)),
+            "ledger report is another answer": lambda: edit_ledger(lambda lines: lines[0].update(report_sha256="8" * 64)),
+            "records bound to another plan": lambda: edit_json(self.ledger / "ledger-limit.json",
+                                                               lambda d: d.update(call_plan_sha256="9" * 64)),
+            "verify answer of no candidate": lambda: edit_json(Path(self.verify), lambda d: d.update(id="C9")),
+            "extract answer not the one the continue stage recorded": lambda: Path(self.paths[0]).write_text(
+                Path(self.paths[0]).read_text(encoding="utf-8").replace("}", ' }', 1), encoding="utf-8"),
+        }
+        for number, (label, spoil) in enumerate(cases.items()):
+            with self.subTest(label):
+                saved = {path: path.read_bytes() for path in list(self.ledger.rglob("*")) + [Path(p) for p in self.paths]
+                         + [Path(self.verify), Path(self.synthesis)] if path.is_file()}
+                try:
+                    spoil()
+                    _, stderr = self.chain("--verify-result", self.verify, out="refused-%d" % number, code=2)
+                    self.assertIn("error: continue-plan:", stderr)
+                    self.assertFalse((self.root / ("refused-%d" % number)).exists())
+                finally:
+                    for path, data in saved.items():
+                        path.write_bytes(data)
+        with self.subTest("no synthesis answer"):
+            _, stderr = self.chain(out="no-synthesis", code=2, synthesis=False)
+            self.assertIn("synthesis answer", stderr)
+        with self.subTest("reduce answers given with an extract stage"):
+            args = [item for path in self.paths for item in ("--extract-result", path)]
+            _, stderr = self.stage("continue-plan", "--run-dir", self.run, "--extract-stage", str(self.extract_stage),
+                                   *args, "--synthesis-result", self.synthesis, "--records", str(self.records),
+                                   "--out", str(self.root / "x-reduce"), code=2)
+            self.assertIn("continue stage", stderr)
+
+
 EVIDENCE_R2 = Path("/Users/lee-kyu-hwan/.oss-research-vm/logs/a78-period-analysis-eslint-r2-20261004T131350Z")
 
 
@@ -236,6 +361,31 @@ class RunR4FinalTests(RunR2Case):
         self.assertEqual({"listed": 38, "no_quote": 0}, final["final_quotes"])
         scope = json.loads((self.root / "f" / "final.scope.json").read_text(encoding="utf-8"))
         self.assertEqual((28, 38), (len(scope["keys"]), len(scope["quotes"])))
+
+
+
+@unittest.skipUnless((EVIDENCE_R3 / "in-continue/stage.json").is_file() and (EVIDENCE_R3 / "answers/verify-C5.result.json").is_file()
+                     and (EVIDENCE_R2 / "answers").is_dir(), "the 2026-10-05 eslint r3 ledger is only on the machine that made it")
+class RunR3ChainTests(RunR2Case):
+    """The eslint r3 ledger of 2026-10-05 (a continuation of r2, 14/14 used): its adopted merge and five verify
+    answers continue into a plan of the final call only, bound to the r3 continue stage that its ledger is bound
+    to (#82). The evidence is only read."""
+
+    def test_the_adopted_reduce_answers_leave_one_final_call(self):
+        verify = [item for path in sorted((EVIDENCE_R3 / "answers").glob("verify-C*.result.json"))
+                  for item in ("--verify-result", str(path))]
+        code, summary, stderr = stage("continue-plan", "--run-dir", self.run, "--extract-stage",
+                                      str(EVIDENCE_R3 / "in-continue"), *self.extract, "--synthesis-result",
+                                      str(EVIDENCE_R3 / "answers/synthesis.result.json"), *verify,
+                                      "--records", str(EVIDENCE_R3), "--out", str(self.root / "chain"))
+        self.assertEqual(0, code, stderr)
+        plan = summary["call_plan"]
+        bound = json.loads((EVIDENCE_R3 / "ledger-limit.json").read_text(encoding="utf-8"))["call_plan_sha256"]
+        self.assertEqual(bound, plan["continues"]["extract_stage_sha256"])
+        self.assertEqual({"extract": 20, "synthesis": 8, "verify": 5}, plan["continues"]["completed"])
+        self.assertEqual("continue", plan["continues"]["parent_stage"])
+        self.assertEqual((0, 0, 0, 1, 1), (plan["extract"], plan["synthesis"], plan["verify"], plan["final"],
+                                           plan["max_model_calls"]))
 
 
 if __name__ == "__main__":

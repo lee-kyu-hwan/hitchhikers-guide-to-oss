@@ -24,6 +24,13 @@
 #                the parent ledger's sha256 and call count in LEDGER_DIR/ledger-limit.json; a later call
 #                finding the parent changed (grown or edited) is refused (exit 3). A continuation plan
 #                without a parent, or a parent with an extract plan, is refused (exit 2).
+#                A chain (call_plan.continues.parent_stage "continue": the parent ledger was itself a
+#                continuation, and its continue stage.json is what this plan continues) also counts the
+#                parent's ancestors: the parent's ledger-limit.json must record its own parent (calls, and
+#                ancestors when it was a chain too), and ancestors + parent calls + this limit must stay
+#                within 40 (else exit 2). The first call records the ancestors and the parent
+#                ledger-limit.json sha256 too, so an ancestor record edited later is refused (exit 3). A
+#                plan that is not a chain refuses a parent that records a parent of its own (exit 2).
 #
 # Steps: refuse when LEDGER_DIR/ledger.jsonl already holds the limit of calls (started calls count,
 # failed ones too); stage PROMPT_FILE root-only in the guest (/var/lib/oss-research-staging/<NAME>/task.txt,
@@ -39,10 +46,10 @@ case "$KIND" in token|sentinel) ;; *) echo "KIND must be token or sentinel" >&2;
 [[ "$NAME" =~ ^[a-z0-9][a-z0-9-]{0,40}$ ]] || { echo "NAME must be [a-z0-9-]" >&2; exit 2; }
 [ -f "$CREDENTIAL" ] && [ ! -L "$CREDENTIAL" ] || { echo "credential file missing" >&2; exit 2; }
 [ -f "$PROMPT_FILE" ] && [ ! -L "$PROMPT_FILE" ] || { echo "prompt file missing or a link" >&2; exit 2; }
-LIMIT=12; PLAN_SHA=null; CONTINUES=-; PARENT_SHA=-; PARENT_CALLS=-
+LIMIT=12; PLAN_SHA=null; CONTINUES=-; CHAIN=-; PARENT_SHA=-; PARENT_CALLS=-; ANCESTORS=-; PARENT_LIMIT_SHA=-
 if [ $# -ge 7 ]; then
   [ -f "$CALL_PLAN" ] && [ ! -L "$CALL_PLAN" ] || { echo "call plan file missing or a link" >&2; exit 2; }
-  read -r LIMIT PLAN_SHA CONTINUES < <(PYTHONDONTWRITEBYTECODE=1 python3 -I -B - "$CALL_PLAN" <<'PY'
+  read -r LIMIT PLAN_SHA CONTINUES CHAIN < <(PYTHONDONTWRITEBYTECODE=1 python3 -I -B - "$CALL_PLAN" <<'PY'
 import hashlib, json, sys
 data = open(sys.argv[1], "rb").read()
 def whole(v):
@@ -53,13 +60,17 @@ try:
     total = plan["max_model_calls"]
     parts = [plan[k] for k in ("shards", "lenses", "extract", "synthesis", "verify", "final")]
     planned = plan["shards"] * plan["lenses"]
-    continues = "-"
+    continues, chain = "-", "-"
     if "continues" in plan:
         # continue-plan: the extract calls were made under the parent ledger; only the later stages remain.
         bound, done = plan["continues"]["extract_stage_sha256"], plan["continues"]["completed"]["extract"]
         ok = plan["extract"] == 0 and whole(done) and done == planned >= 1 and type(bound) is str \
             and len(bound) == 64 and all(c in "0123456789abcdef" for c in bound)
         continues = bound
+        # a chain: the parent ledger was itself a continuation (its continue stage.json is "bound").
+        stage_of_parent = plan["continues"].get("parent_stage")
+        chain = "extract" if stage_of_parent is None else "continue" if stage_of_parent == "continue" else "?"
+        ok = ok and chain != "?"
     else:
         ok = plan["extract"] == planned
     ok = ok and all(whole(v) and v >= 0 for v in parts + [total]) and total >= 1 and plan["final"] == 1 \
@@ -68,16 +79,17 @@ try:
 except (ValueError, TypeError, KeyError, AttributeError):
     ok = False
 if ok:
-    print(total, hashlib.sha256(data).hexdigest(), continues)
+    print(total, hashlib.sha256(data).hexdigest(), continues, chain)
 PY
 )
   [ -n "$PLAN_SHA" ] && [ "$PLAN_SHA" != null ] || { echo "call plan malformed: $CALL_PLAN" >&2; exit 2; }
   [ "$LIMIT" -le 40 ] || { echo "call plan of $LIMIT calls is over the absolute cap 40" >&2; exit 2; }
   if [ $# -ge 8 ]; then
     [ "$CONTINUES" != - ] || { echo "a parent ledger needs a continue-plan call plan (call_plan.continues)" >&2; exit 2; }
-    read -r PARENT_CALLS PARENT_SHA < <(PYTHONDONTWRITEBYTECODE=1 python3 -I -B - "$PARENT" "$LEDGER_DIR" "$CONTINUES" <<'PY'
+    read -r PARENT_CALLS PARENT_SHA ANCESTORS PARENT_LIMIT_SHA < <(PYTHONDONTWRITEBYTECODE=1 python3 -I -B - \
+        "$PARENT" "$LEDGER_DIR" "$CONTINUES" "$CHAIN" <<'PY'
 import hashlib, json, os, sys
-parent, child, bound = sys.argv[1:4]
+parent, child, bound, chain = sys.argv[1:5]
 def regular(path):
     return os.path.isfile(path) and not os.path.islink(path)
 if not parent or os.path.islink(parent) or not os.path.isdir(parent) \
@@ -86,19 +98,43 @@ if not parent or os.path.islink(parent) or not os.path.isdir(parent) \
 ledger, limit = os.path.join(parent, "ledger.jsonl"), os.path.join(parent, "ledger-limit.json")
 if not regular(ledger) or not regular(limit):
     sys.exit("parent ledger directory must hold ledger.jsonl and ledger-limit.json: %s" % parent)
+limit_bytes = open(limit, "rb").read()
 try:
-    recorded = json.loads(open(limit).read())["call_plan_sha256"]
+    limit_doc = json.loads(limit_bytes)
+    recorded = limit_doc["call_plan_sha256"]
 except (ValueError, TypeError, KeyError):
     sys.exit("parent ledger-limit.json unreadable: %s" % limit)
 if recorded != bound:
     sys.exit("parent ledger is bound to call plan %s, this plan continues %s" % (recorded, bound))
+own = limit_doc.get("parent")
+if chain == "continue":
+    # the parent was a continuation: its own parent and the ancestors before it count toward the cap too
+    def count(v):
+        return type(v) is int and v >= 0
+    def sha(v):
+        return type(v) is str and len(v) == 64 and all(c in "0123456789abcdef" for c in v)
+    if not (isinstance(own, dict) and sha(own.get("ledger_sha256")) and count(own.get("calls"))
+            and count(own.get("ancestors", 0))):
+        sys.exit("parent ledger-limit.json does not record its own parent (calls, ancestors): %s" % limit)
+    ancestors = own["calls"] + own.get("ancestors", 0)
+    limit_sha = hashlib.sha256(limit_bytes).hexdigest()
+else:
+    if own is not None:
+        sys.exit("parent ledger is itself a continuation; a plan continuing it must say so (parent_stage)")
+    ancestors, limit_sha = 0, "-"
 data = open(ledger, "rb").read()
-print(sum(b'"kind": "token"' in line for line in data.splitlines()), hashlib.sha256(data).hexdigest())
+print(sum(b'"kind": "token"' in line for line in data.splitlines()), hashlib.sha256(data).hexdigest(),
+      ancestors if chain == "continue" else "-", limit_sha)
 PY
 )
     [ -n "$PARENT_SHA" ] && [ "$PARENT_SHA" != - ] || { echo "parent ledger refused: $PARENT" >&2; exit 2; }
-    [ $((PARENT_CALLS + LIMIT)) -le 40 ] || {
-      echo "$PARENT_CALLS parent calls + $LIMIT is over the absolute cap 40" >&2; exit 2; }
+    if [ "$ANCESTORS" = - ]; then
+      [ $((PARENT_CALLS + LIMIT)) -le 40 ] || {
+        echo "$PARENT_CALLS parent calls + $LIMIT is over the absolute cap 40" >&2; exit 2; }
+    else
+      [ $((ANCESTORS + PARENT_CALLS + LIMIT)) -le 40 ] || {
+        echo "$ANCESTORS ancestor calls + $PARENT_CALLS parent calls + $LIMIT is over the absolute cap 40" >&2; exit 2; }
+    fi
   elif [ "$CONTINUES" != - ]; then
     echo "a continue-plan call plan needs its PARENT_LEDGER_DIR" >&2; exit 2
   fi
@@ -110,12 +146,15 @@ S=/opt/oss-research/src-$C
 mkdir -p -m 0700 "$LEDGER_DIR"
 LEDGER="$LEDGER_DIR/ledger.jsonl"
 BOUND="$LEDGER_DIR/ledger-limit.json"
-PYTHONDONTWRITEBYTECODE=1 python3 -I -B - "$BOUND" "$LEDGER" "$LIMIT" "$PLAN_SHA" "$PARENT_SHA" "$PARENT_CALLS" <<'PY' || exit 3
+PYTHONDONTWRITEBYTECODE=1 python3 -I -B - "$BOUND" "$LEDGER" "$LIMIT" "$PLAN_SHA" "$PARENT_SHA" "$PARENT_CALLS" \
+    "$ANCESTORS" "$PARENT_LIMIT_SHA" <<'PY' || exit 3
 import json, os, sys
-bound, ledger, limit, sha, parent_sha, parent_calls = sys.argv[1:7]
+bound, ledger, limit, sha, parent_sha, parent_calls, ancestors, parent_limit_sha = sys.argv[1:9]
 now = {"limit": int(limit), "call_plan_sha256": None if sha == "null" else sha}
 if parent_sha != "-":
     now["parent"] = {"ledger_sha256": parent_sha, "calls": int(parent_calls)}
+    if ancestors != "-":
+        now["parent"].update(ancestors=int(ancestors), limit_sha256=parent_limit_sha)
 if os.path.lexists(bound):
     try:
         recorded = json.loads(open(bound).read()) if not os.path.islink(bound) else None

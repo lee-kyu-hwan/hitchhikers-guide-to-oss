@@ -3475,6 +3475,94 @@ exit 0
         self.assertEqual(refused.returncode, 2, refused.stderr)
         self.assertEqual(self.limactl_calls(), before)
 
+    def chain(self, parent_plan, remaining=1, name="chain.json", **changes):
+        """A stage.json as continue-plan writes it for a parent that was itself a continuation (#82): bound to
+        that parent's continue stage, every stage before the final already adopted."""
+        plan = {"mode": "extraction-only", "shards": 4, "lenses": 5, "extract": 0, "synthesis": 0,
+                "verify": remaining - 1, "final": 1, "max_model_calls": remaining,
+                "continues": {"extract_stage_sha256": hashlib.sha256(parent_plan.read_bytes()).hexdigest(),
+                              "completed": {"extract": 20, "synthesis": 8, "verify": 5}, "parent_stage": "continue"},
+                "formula": "..."}
+        plan.update(changes)
+        path = self.root / name
+        path.write_text(json.dumps({"stage": "continue", "max_model_calls": remaining, "call_plan": plan}))
+        return path
+
+    def generations(self, grandparent_calls=20, parent_calls=14):
+        """A grandparent ledger (extract plan) and a parent ledger continuing it, both with their calls made."""
+        grandparent_plan = self.parent(calls=grandparent_calls)
+        parent_dir, parent_plan = self.root / "gen2", self.continuation(grandparent_plan, remaining=parent_calls,
+                                                                        name="gen2.json")
+        for _ in range(parent_calls):
+            done = self.call(parent_plan, ledger=parent_dir, parent=self.ledger_dir)
+            self.assertEqual(done.returncode, 0, done.stderr)
+        return parent_dir, parent_plan
+
+    def test_a_third_generation_counts_every_ancestor_call(self):
+        parent_dir, parent_plan = self.generations()
+        before = self.limactl_calls()
+        refused = self.call(self.chain(parent_plan, remaining=7, name="c7.json"), ledger=self.root / "gen3",
+                            parent=parent_dir)
+        self.assertEqual(refused.returncode, 2, refused.stderr)
+        self.assertIn("20 ancestor calls + 14 parent calls + 7 is over the absolute cap 40", refused.stderr)
+        self.assertFalse((self.root / "gen3").exists())
+        self.assertEqual(self.limactl_calls(), before)
+        plan = self.chain(parent_plan, remaining=1)
+        done = self.call(plan, ledger=self.root / "gen3", parent=parent_dir)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        parent_limit = parent_dir / "ledger-limit.json"
+        self.assertEqual(json.loads((self.root / "gen3" / "ledger-limit.json").read_text()), {
+            "limit": 1, "call_plan_sha256": hashlib.sha256(plan.read_bytes()).hexdigest(),
+            "parent": {"ledger_sha256": hashlib.sha256((parent_dir / "ledger.jsonl").read_bytes()).hexdigest(),
+                       "calls": 14, "ancestors": 20,
+                       "limit_sha256": hashlib.sha256(parent_limit.read_bytes()).hexdigest()}})
+        refused = self.call(plan, ledger=self.root / "gen3", parent=parent_dir)
+        self.assertEqual(refused.returncode, 3, refused.stderr)       # 20 + 14 + 1 = 35: the one call is made
+        self.assertEqual(refused.stderr, "refused: the ledger already holds 1 model calls\n")
+        boundary = self.call(self.chain(parent_plan, remaining=6, name="c6.json"), ledger=self.root / "gen3b",
+                             parent=parent_dir)
+        self.assertEqual(boundary.returncode, 0, boundary.stderr)     # 20 + 14 + 6 = 40 is still within the cap
+
+    def test_an_ancestor_record_changed_or_missing_is_refused(self):
+        parent_dir, parent_plan = self.generations(grandparent_calls=3, parent_calls=7)
+        parent_limit = parent_dir / "ledger-limit.json"
+        original = parent_limit.read_text()
+        plan = self.chain(parent_plan, remaining=3)
+        self.assertEqual(self.call(plan, ledger=self.root / "gen3", parent=parent_dir).returncode, 0)
+        before = self.limactl_calls()
+        recorded = json.loads(original)
+        for label, edit in (("fewer ancestor calls", lambda d: d["parent"].update(calls=0)),
+                            ("ancestor ledger swapped", lambda d: d["parent"].update(ledger_sha256="0" * 64))):
+            with self.subTest(label):
+                changed = json.loads(original)
+                edit(changed)
+                parent_limit.write_text(json.dumps(changed) + "\n")
+                refused = self.call(plan, ledger=self.root / "gen3", parent=parent_dir)
+                self.assertEqual(refused.returncode, 3, refused.stderr)
+                self.assertIn("ledger limit", refused.stderr)
+        parent_limit.write_text(original)
+        self.assertEqual(self.call(plan, ledger=self.root / "gen3", parent=parent_dir).returncode, 0)
+        self.assertEqual(self.limactl_calls(), before + 3)
+        cases = {"the parent records no ancestor": {k: v for k, v in recorded.items() if k != "parent"},
+                 "ancestor calls not a count": dict(recorded, parent=dict(recorded["parent"], calls="3")),
+                 "ancestor ledger not a sha": dict(recorded, parent=dict(recorded["parent"], ledger_sha256="x"))}
+        for label, document in cases.items():
+            with self.subTest(label):
+                parent_limit.write_text(json.dumps(document) + "\n")
+                refused = self.call(plan, ledger=self.root / "gen3-new", parent=parent_dir)
+                self.assertEqual(refused.returncode, 2, refused.stderr)
+                self.assertFalse((self.root / "gen3-new").exists())
+        parent_limit.write_text(original)
+        with self.subTest("a plan that does not say its parent was a continuation"):
+            plain = self.continuation(parent_plan, name="plain.json")
+            refused = self.call(plain, ledger=self.root / "gen3-plain", parent=parent_dir)
+            self.assertEqual(refused.returncode, 2, refused.stderr)
+            self.assertIn("itself a continuation", refused.stderr)
+        with self.subTest("a chain plan whose parent continued nothing"):
+            refused = self.call(self.chain(self.root / "parent-stage.json", name="c-root.json"),
+                                ledger=self.root / "gen3-root", parent=self.ledger_dir)
+            self.assertEqual(refused.returncode, 2, refused.stderr)
+
     def test_a_missing_or_malformed_call_plan_is_refused(self):
         link = self.root / "link.json"
         link.symlink_to(self.stage(25))
