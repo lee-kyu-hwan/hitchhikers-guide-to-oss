@@ -275,6 +275,37 @@ revisions, and, for AI stages, the claimed provenance.
    step per repository, and after a merged discovery one assessment and one
    locus-search step per repository, then `record` with one `--assessment` per
    repository. Every step is plan data with `executed: false`.
+8. Analyzer revision drift. The analyzer's revision is a hash over its skill
+   files, so a change to a prompt or a test moves it, and the analyzer's
+   validator accepts only an analysis whose generator is the current revision
+   (`analysis_generated_by must equal the current analysis generator`). An
+   analysis is the output of paid model calls, so an analysis written by an
+   earlier revision is adopted under that recorded revision instead of being
+   thrown away (#266): `adopt-analysis --analysis A --analyzer-source DIR`,
+   where `DIR` is that revision's analyzer skill directory (a caller-chosen
+   trusted root, for example `git archive <commit>` of
+   `analyzing-open-source-pr-patterns`). It is adopted only when all of these
+   hold, and anything else is refused with nothing changed:
+   - the revision computed from `DIR`'s own files equals the revision the
+     analysis records; the analysis' word alone is never taken;
+   - `DIR`'s own validator accepts the analysis, revision check included, so
+     every revision field of the analysis names that one revision;
+   - the current validator's rules accept it with the recorded generator as the
+     expected one, so a rule added since then still applies;
+   - the analysis does not already name the current revision (then
+     `--analyzer-source` is refused; adopt it without the flag).
+
+   The validator itself is not changed or relaxed: the current revision check
+   still refuses the analysis without `--analyzer-source`, and that refusal
+   names both paths, adoption under the recorded revision or regenerating the
+   analysis with the current analyzer. The recorded revision is an input of the
+   checkpoint (`analyzer_source`), so the same bytes without the flag are a
+   different input. The checkpoint, `status` and the report show
+   `analyzer_revision_drift` with both revisions and the source directory, and a
+   reason names them. Later stages are not blocked by the drift: discovery,
+   assessment, locus search and record run as for a current analysis, and the
+   pattern revisions they carry are the recorded one. Regenerating is the other
+   path, with its model cost; this workflow does not choose it for the caller.
 
 ## Digest shard size
 

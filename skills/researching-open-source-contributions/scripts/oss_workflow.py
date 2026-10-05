@@ -1341,6 +1341,68 @@ def current_patterns(analysis: dict) -> List[str]:
     return [p["pattern_id"] for p in analysis.get("patterns", []) if isinstance(p, dict) and p.get("superseded_by") is None]
 
 
+def _recorded_analyzer(source: str):
+    """Load an earlier analyzer's validator from its own skill files (a caller-chosen trusted root).
+
+    Its revision is computed from those files, never taken from the analysis.
+    """
+    directory = Path(os.path.abspath(source))
+    script = directory / "scripts" / "validate_corpus.py"
+    if directory.is_symlink() or script.is_symlink() or not script.is_file():
+        raise WorkflowError("--analyzer-source %s has no scripts/validate_corpus.py (give the earlier analyzer's skill "
+                            "directory, %s)" % (source, SIBLINGS["analyzer"][0]))
+    name = "validate_corpus_recorded_" + sha256_bytes(os.path.realpath(directory).encode("utf-8"))[:16]
+    module = sys.modules.get(name)
+    if module is None:
+        spec = importlib.util.spec_from_file_location(name, script)
+        if spec is None or spec.loader is None:
+            raise WorkflowError("cannot load " + str(script))
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[name] = module
+        try:
+            spec.loader.exec_module(module)
+        except BaseException:
+            sys.modules.pop(name, None)
+            raise
+    try:
+        revision = module._canonical_revision()
+    except OSError as error:
+        raise WorkflowError("--analyzer-source revision could not be computed: %s" % error) from error
+    return module, revision, os.path.realpath(directory)
+
+
+def _validate_analysis(siblings: Siblings, corpus: Path, analysis: Path, references: List[str],
+                       recorded=None) -> Tuple[Optional[str], str]:
+    """(error, validator output). ``recorded`` is (module, revision) of the analyzer that wrote the analysis.
+
+    Under a recorded revision both checks run unchanged: that revision's own
+    validator, with its own revision check, and the current validator's rules
+    with the recorded generator as the expected one. Neither is relaxed.
+    """
+    if recorded is None:
+        code, stdout, stderr = run_main(siblings.validate_corpus.main, [str(corpus), "--analysis-output", str(analysis)] + references)
+        return (None if code == 0 else stderr.strip()), stdout.strip()
+    module, revision = recorded
+    code, stdout, stderr = run_main(module.main, [str(corpus), "--analysis-output", str(analysis)] + references)
+    if code != 0:
+        return "the recorded analyzer's own validator rejected the analysis: " + stderr.strip(), ""
+    current = siblings.validate_corpus
+    corpus_document = json.loads(corpus.read_text(encoding="utf-8"))
+    output = json.loads(analysis.read_text(encoding="utf-8"))
+    repositories = current.normalize_reference_repositories(references[1::2])
+    errors = current._validate_document(corpus_document, "current") + current._validate_analysis_output(
+        corpus_document, output, None, revision, repositories)
+    if errors:
+        return "the current analyzer rules (under the recorded generator) rejected the analysis: " + "; ".join(errors), ""
+    return None, stdout.strip()
+
+
+def _recorded_revision(document: object) -> Optional[str]:
+    generator = document.get("analysis_generated_by") if isinstance(document, dict) else None
+    revision = generator.get("revision") if isinstance(generator, dict) else None
+    return revision if isinstance(revision, str) else None
+
+
 def cmd_adopt_analysis(args, siblings: Siblings, request: dict, state: dict, run: Run) -> dict:
     _check_origin(request, args.origin)
     collect, reason = usable(run, state, "collect")
@@ -1364,30 +1426,55 @@ def cmd_adopt_analysis(args, siblings: Siblings, request: dict, state: dict, run
                 _, digest = copy_input(path, target, "extraction result")
                 inputs["extraction_result_%02d" % index] = {"sha256": digest, "source_path": os.path.abspath(path)}
                 results.append(str(target))
+        analysis = read_json_bytes(data, "analysis")
+        recorded_revision, current_revision = _recorded_revision(analysis), revisions["analyzer"]
+        recorded = drift = None
+        if args.analyzer_source:
+            # An analysis written by an earlier analyzer revision is adopted under that revision (#266).
+            if recorded_revision == current_revision:
+                raise WorkflowError("the analysis names the current analyzer revision; adopt it without --analyzer-source")
+            module, source_revision, source_path = _recorded_analyzer(args.analyzer_source)
+            if source_revision != recorded_revision:
+                raise WorkflowError("--analyzer-source is analyzer revision %s, not the recorded %s"
+                                    % (source_revision, recorded_revision))
+            recorded = (module, source_revision)
+            drift = {"recorded": source_revision, "current": current_revision, "source": source_path}
+            inputs["analyzer_source"] = {"sha256": sha256_bytes(source_revision.encode("utf-8")), "source_path": source_path}
         reused = reuse_if_same(run, state, "analysis", {k: v["sha256"] for k, v in inputs.items()}, revisions)
         if reused is not None and reused["provenance"] == _claimed_provenance(request, args):
-            code, _, stderr = run_main(siblings.validate_corpus.main, [str(corpus), "--analysis-output", str(gen_dir(run, "analysis", reused) / "analysis.json")] + references)
-            if code != 0:
-                raise WorkflowError("reused analysis no longer validates: " + stderr.strip())
-            event(state, "adopt-analysis", "reused", "gen-%03d revalidated" % reused["generation"])
+            error, _ = _validate_analysis(siblings, corpus, gen_dir(run, "analysis", reused) / "analysis.json", references, recorded)
+            if error is not None:
+                raise WorkflowError("reused analysis no longer validates: " + error)
+            event(state, "adopt-analysis", "reused", "gen-%03d revalidated%s" % (
+                reused["generation"], " under the recorded analyzer revision" if recorded else ""))
             return reused
         guard_replace(state, "analysis", args.replace)
         if results:
             code, _, stderr = run_main(siblings.check_extraction.main, [str(corpus)] + results + references)
             if code != 0:
                 raise WorkflowError("check_extraction rejected the extraction results: " + stderr.strip())
-        code, stdout, stderr = run_main(siblings.validate_corpus.main, [str(corpus), "--analysis-output", str(incoming / "analysis.json")] + references)
-        if code != 0:
-            raise WorkflowError("analyzer output validator rejected the analysis: " + stderr.strip())
-        analysis = read_json_bytes(data, "analysis")
+        error, stdout = _validate_analysis(siblings, corpus, incoming / "analysis.json", references, recorded)
+        if error is not None and recorded is None:
+            if recorded_revision is not None and recorded_revision != current_revision:
+                error += ("; the analysis records analyzer revision %s, not the current %s: adopt it under its recorded "
+                          "revision with --analyzer-source DIR (that revision's %s skill files), or regenerate the "
+                          "analysis with the current analyzer" % (recorded_revision, current_revision, SIBLINGS["analyzer"][0]))
+            raise WorkflowError("analyzer output validator rejected the analysis: " + error)
+        if error is not None:
+            raise WorkflowError(error)
         patterns = current_patterns(analysis)
+        reasons = [] if patterns else ["the validated analysis has no current PAT-* pattern"]
+        if drift:
+            reasons.append("analyzer revision drift: adopted under recorded %s, current %s" % (drift["recorded"], drift["current"]))
         generation = {
             "status": "complete" if patterns else "no-patterns",
-            "reasons": [] if patterns else ["the validated analysis has no current PAT-* pattern"],
+            "reasons": reasons,
             "inputs": inputs, "tool_revisions": revisions, "provenance": _claimed_provenance(request, args),
-            "details": {"patterns": patterns, "validator": stdout.strip(),
+            "details": {"patterns": patterns, "validator": stdout,
                         "extraction_results_checked": len(results)},
         }
+        if drift:
+            generation["details"]["analyzer_revision_drift"] = drift
         commit(run, state, "analysis", incoming, generation, args.replace)
         incoming = None
         event(state, "adopt-analysis", generation["status"], "gen-%03d patterns=%d" % (generation["generation"], len(patterns)))
@@ -2409,6 +2496,9 @@ def status_document(run: Run, request: dict, state: dict) -> dict:
     collected = active(state, "collect")
     if collected is not None and collected.get("details", {}).get("collections"):
         stages["collect"]["collections"] = collected["details"]["collections"]
+    analyzed = active(state, "analysis")
+    if analyzed is not None and analyzed.get("details", {}).get("analyzer_revision_drift"):
+        stages["analysis"]["analyzer_revision_drift"] = analyzed["details"]["analyzer_revision_drift"]
     for stage, key in (("discovery", "discoveries"), ("locus-search", "locus_searches")):
         generation = active(state, stage)
         if generation is not None and generation.get("details", {}).get(key):
@@ -2497,6 +2587,11 @@ def render_report(run: Run, request: dict, state: dict) -> str:
     lines += ["", "Tool revisions: " + ", ".join("%s `%s`" % (k, _short(v)) for k, v in sorted(state["skills"]["revisions"].items())), ""]
     lines += ["## AI judgment provenance", "",
               "Origin, model, and effort are caller claims bound to input hashes. They do not prove that a model ran.", ""]
+    drift = status["stages"]["analysis"].get("analyzer_revision_drift")
+    if drift:
+        lines += ["- Analyzer revision drift: the analysis was adopted under its recorded analyzer revision `%s`; the "
+                  "current analyzer is `%s`. It passed that revision's own validator and the current validator's "
+                  "rules; it was not written or checked by the current analyzer's prompts." % (drift["recorded"], drift["current"])]
     for stage in ("analysis", "record"):
         generation = active(state, stage)
         if generation is not None:
@@ -2649,6 +2744,8 @@ def build_parser() -> argparse.ArgumentParser:
     analysis = command("adopt-analysis")
     analysis.add_argument("--analysis", required=True)
     analysis.add_argument("--extraction-result", action="append", default=[])
+    # An analysis of an earlier analyzer revision: that revision's analyzer skill directory (#266).
+    analysis.add_argument("--analyzer-source")
     for sub in (analysis,):
         sub.add_argument("--origin", choices=ORIGINS, required=True)
         sub.add_argument("--model")

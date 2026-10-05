@@ -124,6 +124,15 @@ disk, downstream checkpoints become invalid, and the budget ledger is never
 reset. A modified output, a symlinked generation, or a revision drift blocks
 the stage until you re-adopt it.
 
+An analyzer revision change is different: the analyzer's validator then refuses
+an analysis written by the earlier revision. Re-adopt it under its recorded
+revision with `adopt-analysis --analysis A --analyzer-source DIR`, where `DIR`
+is that revision's analyzer skill directory. Its computed revision must be the
+recorded one, and both that revision's validator and the current rules must
+accept the analysis. The drift is shown in `status` and the report and does not
+block later stages. The other path is regenerating the analysis with the
+current analyzer, which costs model calls.
+
 General Issue sources (`issues`) are `pending-unsupported`. An isolated Issue
 collection entry exists, but its output is not connected to this workflow:
 the Issue corpus is not a pull request corpus and its skill forbids the
