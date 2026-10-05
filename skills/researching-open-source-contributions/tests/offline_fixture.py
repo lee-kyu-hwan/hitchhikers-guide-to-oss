@@ -37,6 +37,7 @@ import importlib.util  # noqa: E402
 import json  # noqa: E402
 import os  # noqa: E402
 from pathlib import Path  # noqa: E402
+import re  # noqa: E402
 import socket  # noqa: E402
 import subprocess  # noqa: E402
 import urllib.parse  # noqa: E402
@@ -225,8 +226,12 @@ class CollectorOpener:
         return collector_tests.FakeHttpResponse(status, headers, body, url=request.full_url)
 
 
-def repository_payload():
-    return {"full_name": REPO, "node_id": REPO_NODE, "default_branch": "main", "archived": False, "disabled": False,
+def repository_node(repository=REPO):
+    return REPO_NODE if repository == REPO else "R_SYNTH_" + re.sub(r"[^A-Z0-9]", "_", repository.split("/")[1].upper())
+
+
+def repository_payload(repository=REPO):
+    return {"full_name": repository, "node_id": repository_node(repository), "default_branch": "main", "archived": False, "disabled": False,
             "fork": False, "has_issues": True, "visibility": "public", "pushed_at": "2026-09-06T00:00:00Z",
             "license": {"spdx_id": "MIT"}, "description": SYNTHETIC + " repository"}
 
@@ -470,42 +475,45 @@ class StrictReplies(dict):
         return dict.__getitem__(self, key)
 
 
-def verifier_replies():
+def verifier_replies(repositories=(REPO,)):
     reply = verifier_tests.fixture_response
     path = vc._request_path
-    root = "/repos/" + REPO
     not_found = {"message": "Not Found"}
     content = CONTRIBUTING_TEXT.encode("utf-8")
-    replies = {
-        path(root, None): reply(repository_payload()),
-        path(root + "/commits/main", None): reply({"sha": HEAD_SHA}),
-        path(root + "/community/profile", None): reply({"files": {
-            "contributing": {"html_url": REPO_URL + "/blob/main/CONTRIBUTING.md"}, "license": {"spdx_id": "MIT"},
-            "readme": None, "code_of_conduct": None, "issue_template": None, "pull_request_template": None}}),
-        path(root + "/private-vulnerability-reporting", None): reply({"enabled": False}),
-        path("/repos/" + OWNER + "/.github", None): reply(not_found, status=404),
-        path("/search/code", {"q": 'repo:%s "%s"' % (REPO, PATTERN_CLUE)}): reply({
-            "total_count": 1, "incomplete_results": False, "items": [{"path": "src/retry.py", "html_url": CODE_HIT_URL}]}),
-    }
-    for policy_path in vc.POLICY_PATHS:
-        key = path(root + "/contents/" + policy_path, {"ref": "main"})
-        if policy_path == "CONTRIBUTING.md":
-            replies[key] = reply({"encoding": "base64", "content": base64.b64encode(content).decode("ascii"),
-                                  "size": len(content), "html_url": REPO_URL + "/blob/main/CONTRIBUTING.md"})
-        else:
-            replies[key] = reply(not_found, status=404)
-    for clue in dict.fromkeys([PATTERN_CLUE] + vc._locus_clues(LOCUS)):
-        for kind in ("issue", "pr"):
-            for state in ("open", "closed"):
-                query = 'repo:%s "%s" is:%s is:%s' % (REPO, clue, kind, state)
-                replies[path("/search/issues", {"q": query})] = reply({"total_count": 0, "incomplete_results": False, "items": []})
+    replies = {path("/repos/" + OWNER + "/.github", None): reply(not_found, status=404)}
+    for repository in repositories:
+        root = "/repos/" + repository
+        url = "https://github.com/" + repository
+        replies.update({
+            path(root, None): reply(repository_payload(repository)),
+            path(root + "/commits/main", None): reply({"sha": HEAD_SHA}),
+            path(root + "/community/profile", None): reply({"files": {
+                "contributing": {"html_url": url + "/blob/main/CONTRIBUTING.md"}, "license": {"spdx_id": "MIT"},
+                "readme": None, "code_of_conduct": None, "issue_template": None, "pull_request_template": None}}),
+            path(root + "/private-vulnerability-reporting", None): reply({"enabled": False}),
+            path("/search/code", {"q": 'repo:%s "%s"' % (repository, PATTERN_CLUE)}): reply({
+                "total_count": 1, "incomplete_results": False,
+                "items": [{"path": "src/retry.py", "html_url": url + "/blob/" + HEAD_SHA + "/src/retry.py"}]}),
+        })
+        for policy_path in vc.POLICY_PATHS:
+            key = path(root + "/contents/" + policy_path, {"ref": "main"})
+            if policy_path == "CONTRIBUTING.md":
+                replies[key] = reply({"encoding": "base64", "content": base64.b64encode(content).decode("ascii"),
+                                      "size": len(content), "html_url": url + "/blob/main/CONTRIBUTING.md"})
+            else:
+                replies[key] = reply(not_found, status=404)
+        for clue in dict.fromkeys([PATTERN_CLUE] + vc._locus_clues(LOCUS)):
+            for kind in ("issue", "pr"):
+                for state in ("open", "closed"):
+                    query = 'repo:%s "%s" is:%s is:%s' % (repository, clue, kind, state)
+                    replies[path("/search/issues", {"q": query})] = reply({"total_count": 0, "incomplete_results": False, "items": []})
     return replies
 
 
 class VerifierWorld:
-    def __init__(self):
+    def __init__(self, repositories=(REPO,)):
         self.calls = []
-        self.replies = StrictReplies(verifier_replies())
+        self.replies = StrictReplies(verifier_replies(repositories))
         self.opener = verifier_tests.fake_opener(self.calls, self.replies)
 
     def main(self, argv):

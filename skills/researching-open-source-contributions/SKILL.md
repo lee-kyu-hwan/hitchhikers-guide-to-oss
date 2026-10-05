@@ -95,7 +95,11 @@ reports. It never opens a network connection or starts a process.
    analysis bundle's assess input, adopted only after its strict check passes
    (the verifier's record gate included). Adopt it through
    `record --assessment X --origin ai [--policy-evidence P]`. `record` runs
-   the verifier's own gate offline. When the caller names no target, write
+   the verifier's own gate offline. One candidate-reads run covers one
+   repository, so for a target of several repositories repeat
+   `--discovery/--manifest`, `--locus-search/--manifest`, and `--assessment`
+   once per repository; assessment, locus search, and record run per
+   repository and the workflow merges them (workflow contract, rule 7). When the caller names no target, write
    `"target": null`: the run collects and analyzes only, the three candidate
    stages are `skipped`, and their commands are refused. Never borrow a source
    repository as a placeholder target.

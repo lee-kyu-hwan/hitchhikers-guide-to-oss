@@ -35,7 +35,9 @@ A request is one JSON object with exactly these keys. Unknown keys are rejected.
   checked. The two lists are independent.
 - `target.discover_request_budget` and `target.locus_request_budget` are at most 60, the candidate-reads
   entry's relay budget limit (`CANDIDATE_READS_MAX_REQUEST_BUDGET`); `init` refuses more, because a discovery or
-  locus search read through that entry could never match a larger request budget at adoption (#82).
+  locus search read through that entry could never match a larger request budget at adoption (#82). Each is the
+  budget of one candidate-reads run, that is one repository's run, also when the target names several
+  repositories (checkpoint rule 7).
 - `target` may be `null` when the caller names no target. That run collects and
   analyzes only: there are no candidate caps, discover/locus budgets, or clone
   flag to state, `discovery`, `locus-search`, and `record` report `skipped`
@@ -195,6 +197,84 @@ revisions, and, for AI stages, the claimed provenance.
    requests) work as for one collection. `status` and `report` show the number
    of collections, the records per repository and the requests per run. `digest`
    and the analyzer see the merged corpus only.
+7. Several target repositories. The candidate-reads entry reads one repository
+   per run, so a target of several repositories arrives as one discovery per
+   repository. `adopt-discovery` takes `--discovery D --manifest M` once per
+   repository, repeated, in any order. One pair keeps the single-document path
+   above (a discovery that leaves target repositories out stays `partial`).
+   Several pairs are adopted only when all of these hold, and any failure is a
+   `scope-conflict` that changes nothing:
+   - every discovery names exactly one repository of `target.repositories`,
+     and together they name each of them once (a missing or repeated
+     repository is refused, never adopted as partial);
+   - every discovery binds the active analysis SHA-256, its `request_budget`
+     equals `target.discover_request_budget`, its clone flag equals the
+     target's, and its verifier manifest has a discover run with the same
+     inputs and the target caps. The inputs other than the repository (analysis,
+     pattern list, budget, clone flag, API version, and the `static_reads` /
+     `static_dirs` of a REST contents run, #256) are the same in every
+     discovery, and every discovery and every manifest names the same verifier
+     `generated_by`;
+   - every discovery passes the verifier's own discovery document check, and
+     its partition covers its repository-pattern combinations exactly once;
+   - the per-run request limits of the discover runs sum to at most
+     `budget.total_api_requests`. This is checked at adoption; the requests
+     actually used enter the ledger as for one document, and a total over
+     `budget.total_api_requests` blocks the stage.
+
+   The originals stay byte for byte under `bundles/NN/` (`discovery.json`,
+   `manifest.json`), recorded as `discovery-NN` and `manifest-NN` in argument
+   order. The stage's `discovery.json` is the merge in target order: the
+   records, `skipped_by_cap` and `failed_scopes` of every repository, the
+   method limitations once each, the inputs with the target's repositories, and
+   `workflow_merge` (each discovery's repository, SHA-256, status, counts, run,
+   request budget and requests used). Each repository's run applied the caps to
+   itself alone, so the target caps are applied again with the verifier's own
+   cap function over the target order: a combination one discover run over the
+   whole target would not have selected moves from `records` or
+   `failed_scopes` to `skipped_by_cap`, listed under `workflow_merge.capped`
+   and the checkpoint's `capped`. The verifier's partition check and discovery
+   document check must accept the merged document. Its status is the worst of
+   the discoveries (`complete`, `partial`, `failed`): one partial repository
+   leaves the stage and the run partial, with a reason per repository that is
+   not complete, and skipped or moved combinations make a complete set partial.
+   Every run of every manifest enters the ledger once.
+
+   Assessment, locus search and record then run per discovery, on that
+   repository's original bytes, because the entry's locus search takes exactly
+   one repository's discovery and an assessment bound to its SHA-256, and the
+   verifier's record binds one discovery, assessment and locus search:
+   - the assessment of a repository is one isolated model call on the assess
+     input of `bundles/NN/discovery.json`, and it leaves out the combinations
+     the merged caps moved (`status` lists them per repository);
+   - `adopt-locus-search` takes `--locus-search L --manifest M` once per
+     discovery. Each is bound to one adopted discovery's SHA-256 and each
+     discovery is searched once; it passes the verifier's own locus-search
+     reader, its run's request limit equals `target.locus_request_budget`, it
+     searches only its discovery's repository and no moved combination, all
+     name the same verifier `generated_by`, and the per-run limits sum to at
+     most `budget.total_api_requests`. The originals stay under `bundles/NN/`,
+     and the status is the worst of them;
+   - `record` takes `--assessment A` once per discovery. Each is bound to one
+     adopted discovery and each discovery is assessed once; its bytes are the
+     ones whose SHA-256 the repository's locus search ran with
+     (`assessment_sha256`), and it assesses no moved combination. The workflow
+     never rewrites an assessment. It runs the verifier's record gate once per
+     repository on that repository's discovery, assessment and locus search
+     (`bundles/NN/` keeps each verifier output and manifest), validates each,
+     and merges the candidates in target order. A `candidate_id` is only unique
+     inside one verifier output, so the merge drops the verifier's placeholder
+     candidates of moved combinations, renumbers `CAN-001` upward across the set
+     (the `VER-<id>-<n>` snapshot ids and `superseded_by` follow; the
+     `candidate_key` is unchanged), and the merged `candidates.json` must pass
+     the verifier's validate. `candidates.md` is the verifier's render of it,
+     and `workflow-merge.json` keeps the id mapping and the dropped
+     placeholders.
+
+   When the target names several repositories, `status` prints one discover
+   step per repository, and after a merged discovery one assessment and one
+   locus-search step per repository, then `record` with one `--assessment` per
+   repository. Every step is plan data with `executed: false`.
 
 ## Digest shard size
 

@@ -1424,13 +1424,19 @@ def cmd_adopt_discovery(args, siblings: Siblings, request: dict, state: dict, ru
     analysis, reason = usable(run, state, "analysis")
     if analysis is None:
         raise WorkflowError("discovery needs a usable analysis: " + reason)
+    if len(args.discovery) != len(args.manifest):
+        raise WorkflowError("pair every --discovery with one --manifest (got %d --discovery, %d --manifest)"
+                            % (len(args.discovery), len(args.manifest)))
+    if len(args.discovery) > 1:
+        return _adopt_discoveries(args, siblings, request, state, run, target, analysis)
+    discovery_path, manifest_path = args.discovery[0], args.manifest[0]
     revisions = siblings.revisions()
     incoming = run.incoming("discovery", state)
     try:
-        data, discovery_sha = copy_input(args.discovery, incoming / "discovery.json", "discovery")
-        manifest_bytes, manifest_sha = copy_input(args.manifest, incoming / "manifest.json", "verifier manifest")
-        inputs = {"discovery": {"sha256": discovery_sha, "source_path": os.path.abspath(args.discovery)},
-                  "manifest": {"sha256": manifest_sha, "source_path": os.path.abspath(args.manifest)}}
+        data, discovery_sha = copy_input(discovery_path, incoming / "discovery.json", "discovery")
+        manifest_bytes, manifest_sha = copy_input(manifest_path, incoming / "manifest.json", "verifier manifest")
+        inputs = {"discovery": {"sha256": discovery_sha, "source_path": os.path.abspath(discovery_path)},
+                  "manifest": {"sha256": manifest_sha, "source_path": os.path.abspath(manifest_path)}}
         reused = reuse_if_same(run, state, "discovery", {k: v["sha256"] for k, v in inputs.items()}, revisions)
         if reused is not None:
             event(state, "adopt-discovery", "reused", "gen-%03d" % reused["generation"])
@@ -1518,13 +1524,21 @@ def cmd_adopt_locus(args, siblings: Siblings, request: dict, state: dict, run: R
     discovery, reason = usable(run, state, "discovery")
     if discovery is None:
         raise WorkflowError("locus-search needs a usable discovery: " + reason)
+    if len(args.locus_search) != len(args.manifest):
+        raise WorkflowError("pair every --locus-search with one --manifest (got %d --locus-search, %d --manifest)"
+                            % (len(args.locus_search), len(args.manifest)))
+    if discovery["details"].get("discoveries"):
+        return _adopt_locus_searches(args, siblings, request, state, run, discovery)
+    if len(args.locus_search) > 1:
+        raise WorkflowError("the active discovery is one document; adopt one --locus-search and --manifest")
+    locus_path, manifest_path = args.locus_search[0], args.manifest[0]
     revisions = siblings.revisions()
     incoming = run.incoming("locus-search", state)
     try:
-        data, locus_sha = copy_input(args.locus_search, incoming / "locus-search.json", "locus search")
-        manifest_bytes, manifest_sha = copy_input(args.manifest, incoming / "manifest.json", "verifier manifest")
-        inputs = {"locus_search": {"sha256": locus_sha, "source_path": os.path.abspath(args.locus_search)},
-                  "manifest": {"sha256": manifest_sha, "source_path": os.path.abspath(args.manifest)}}
+        data, locus_sha = copy_input(locus_path, incoming / "locus-search.json", "locus search")
+        manifest_bytes, manifest_sha = copy_input(manifest_path, incoming / "manifest.json", "verifier manifest")
+        inputs = {"locus_search": {"sha256": locus_sha, "source_path": os.path.abspath(locus_path)},
+                  "manifest": {"sha256": manifest_sha, "source_path": os.path.abspath(manifest_path)}}
         reused = reuse_if_same(run, state, "locus-search", {k: v["sha256"] for k, v in inputs.items()}, revisions)
         if reused is not None:
             event(state, "adopt-locus-search", "reused", "gen-%03d" % reused["generation"])
@@ -1561,6 +1575,357 @@ def cmd_adopt_locus(args, siblings: Siblings, request: dict, state: dict, run: R
         commit(run, state, "locus-search", incoming, generation, args.replace)
         incoming = None
         event(state, "adopt-locus-search", generation["status"], "gen-%03d ledger+%d total=%d" % (generation["generation"], added, total))
+        return generation
+    finally:
+        if incoming is not None and incoming.exists():
+            shutil.rmtree(incoming)
+
+
+# ---------------------------------------------------------------------------
+# Several target repositories: one candidate-reads run per repository
+# ---------------------------------------------------------------------------
+
+
+def _copy_bundles(incoming: Path, columns: Sequence[Tuple[str, str, Sequence[str]]]) -> Tuple[dict, List[Dict[str, bytes]]]:
+    """Copy repeated inputs into ``bundles/NN/`` in argument order; their checkpoint keys are ``<key>-NN``."""
+    inputs: dict = {}
+    raw: List[Dict[str, bytes]] = []
+    for index in range(1, len(columns[0][2]) + 1):
+        folder = incoming / "bundles" / ("%02d" % index)
+        folder.mkdir(parents=True)
+        item = {}
+        for key, filename, paths in columns:
+            source = paths[index - 1]
+            data, digest = copy_input(source, folder / filename, "%s %d" % (key.replace("-", " "), index))
+            inputs["%s-%02d" % (key, index)] = {"sha256": digest, "source_path": os.path.abspath(source)}
+            item[key] = data
+        raw.append(item)
+    return inputs, raw
+
+
+def _int_or_none(value: object) -> Optional[int]:
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def _discovery_bundle(siblings: Siblings, target: dict, analysis_sha: str, current: List[str], index: int,
+                      sha: str, discovery: object, manifest: object) -> Tuple[List[str], dict]:
+    """One repository's discovery, checked on its own; the caller checks the whole set."""
+    label = "discovery %d" % index
+    if not isinstance(discovery, dict) or not isinstance(discovery.get("inputs"), dict):
+        return [label + ": discovery document has no inputs"], {}
+    if not isinstance(manifest, dict) or not isinstance(manifest.get("runs"), list):
+        return [label + ": verifier manifest has no runs list"], {}
+    try:
+        siblings.verifier._validate_discovery_document(discovery)
+    except ValueError as error:
+        return ["%s: verifier rejects the discovery document: %s" % (label, error)], {}
+    declared = discovery["inputs"]
+    repositories = declared["repositories"]
+    if len(repositories) != 1 or not isinstance(repositories[0], str):
+        return ["%s must name exactly one repository (one candidate-reads run), not %s"
+                % (label, json.dumps(repositories))], {}
+    repository = repositories[0]
+    errors = []
+    if repository.lower() not in {item.lower() for item in target["repositories"]}:
+        errors.append("%s covers a repository outside target.repositories: %s" % (label, repository))
+    if declared.get("analysis_sha256") != analysis_sha:
+        errors.append(label + ": inputs.analysis_sha256 is not the active analysis checkpoint")
+    if declared.get("request_budget") != target["discover_request_budget"]:
+        errors.append("%s: request_budget %s differs from target.discover_request_budget %d"
+                      % (label, json.dumps(declared.get("request_budget")), target["discover_request_budget"]))
+    if declared.get("allow_clone") is not target["allow_clone"]:
+        errors.append(label + ": allow_clone differs from target.allow_clone")
+    patterns = declared.get("pattern_ids")
+    if not isinstance(patterns, list) or not all(isinstance(item, str) for item in patterns):
+        errors.append(label + ": inputs.pattern_ids must be a list of pattern ids")
+        patterns = []
+    unknown = sorted(set(patterns) - set(current))
+    if unknown:
+        errors.append("%s names patterns absent from the analysis: %s" % (label, ", ".join(unknown)))
+    run_entry = _manifest_run(manifest, "discover", lambda r: r.get("inputs") == declared)
+    if run_entry is None:
+        errors.append(label + ": verifier manifest has no discover run with these inputs")
+        run_entry = {}
+    budget = run_entry.get("budget") if isinstance(run_entry.get("budget"), dict) else {}
+    if run_entry and (budget.get("per_repo_cap"), budget.get("total_cap")) != (target["max_candidates_per_repo"], target["max_candidates_total"]):
+        errors.append(label + ": discover caps differ from target caps")
+    if run_entry and _int_or_none(budget.get("request_limit")) is None:
+        errors.append(label + ": verifier manifest discover run has no request_limit")
+    seen: Dict[Tuple[str, str], int] = {}
+    for group in ("records", "skipped_by_cap", "failed_scopes"):
+        for item in discovery[group]:
+            key = (item["repository"].lower(), item["pattern_id"])
+            seen[key] = seen.get(key, 0) + 1
+    if set(seen) != {(repository.lower(), pattern) for pattern in patterns} or any(count != 1 for count in seen.values()):
+        errors.append(label + ": partition does not cover every repository-pattern combination exactly once")
+    return errors, {"index": index, "sha256": sha, "repository": repository, "declared": declared,
+                    "patterns": list(patterns), "document": discovery, "manifest": manifest, "run": run_entry,
+                    "budget": budget}
+
+
+def _discoveries_cross_errors(request: dict, target: dict, bundles: List[dict]) -> List[str]:
+    """What only the whole set shows: the target set, one shared scope, one verifier, the summed per-run budgets."""
+    errors: List[str] = []
+    seen: Dict[str, int] = {}
+    for bundle in bundles:
+        key = bundle["repository"].lower()
+        if key in seen:
+            errors.append("repository %s is in more than one discovery (%d and %d)" % (bundle["repository"], seen[key], bundle["index"]))
+        seen.setdefault(key, bundle["index"])
+    missing = [item for item in target["repositories"] if item.lower() not in seen]
+    if missing:
+        errors.append("target repositories without a discovery: " + ", ".join(missing))
+    keys = sorted({key for bundle in bundles for key in bundle["declared"]} - {"repositories"})
+    differing = [key for key in keys if len({json.dumps(bundle["declared"].get(key), sort_keys=True) for bundle in bundles}) > 1]
+    if differing:
+        errors.append("discoveries differ in inputs other than the repository: " + ", ".join(differing))
+    for label, part in (("discovery", "document"), ("verifier manifest", "manifest")):
+        if len({json.dumps(bundle[part].get("generated_by"), sort_keys=True) for bundle in bundles}) > 1:
+            errors.append("discoveries differ in verifier revision (%s generated_by)" % label)
+    limits = sum(_int_or_none(bundle["budget"].get("request_limit")) or 0 for bundle in bundles)
+    if limits > request["budget"]["total_api_requests"]:
+        errors.append("per-run discover request budgets sum to %d, over budget.total_api_requests %d"
+                      % (limits, request["budget"]["total_api_requests"]))
+    return errors
+
+
+def _merge_discoveries(siblings: Siblings, target: dict, bundles: List[dict]) -> Tuple[dict, List[dict], List[dict]]:
+    """One discovery document over the target, in target order, with the target caps applied once more.
+
+    Each repository's run applied the caps to itself alone, so the set can hold
+    more combinations than ``max_candidates_total``. The verifier's own cap
+    function picks the combinations one discover run over the target (in target
+    order) would have kept; the others move to ``skipped_by_cap``, and the
+    verifier's partition check must accept the result.
+    """
+    position = {item.lower(): number for number, item in enumerate(target["repositories"])}
+    ordered = sorted(bundles, key=lambda bundle: position[bundle["repository"].lower()])
+    patterns = ordered[0]["patterns"]
+    universe = [(bundle["repository"], pattern) for bundle in ordered for pattern in patterns]
+    selected, skipped = siblings.verifier._cap_combinations(
+        [bundle["repository"] for bundle in ordered], [{"pattern_id": pattern} for pattern in patterns],
+        target["max_candidates_per_repo"], target["max_candidates_total"])
+    kept = {(repository, str(pattern["pattern_id"])) for repository, pattern in selected}
+    records: List[dict] = []
+    failed: List[dict] = []
+    capped: List[dict] = []
+    for bundle in ordered:
+        for section, into in (("records", records), ("failed_scopes", failed)):
+            for item in bundle["document"][section]:
+                if (item["repository"], item["pattern_id"]) in kept:
+                    into.append(item)
+                else:
+                    capped.append({"discovery": bundle["index"], "repository": item["repository"],
+                                   "pattern_id": item["pattern_id"], "section": section})
+    try:
+        siblings.verifier._validate_discover_partition(universe, selected, records, skipped, failed)
+    except ValueError as error:
+        raise WorkflowError("scope-conflict: the merged discovery breaks the verifier's partition under the target "
+                            "caps: %s" % error) from error
+    limitations: List[str] = []
+    for bundle in ordered:
+        for item in bundle["document"]["method_limitations"]:
+            if item not in limitations:
+                limitations.append(item)
+    summary = [{"index": bundle["index"], "repository": bundle["repository"], "sha256": bundle["sha256"],
+                "status": bundle["document"]["status"], "records": len(bundle["document"]["records"]),
+                "skipped_by_cap": len(bundle["document"]["skipped_by_cap"]),
+                "failed_scopes": len(bundle["document"]["failed_scopes"]), "run_id": bundle["run"].get("run_id"),
+                "request_budget": bundle["budget"].get("request_limit"),
+                "requests_consumed": bundle["budget"].get("requests_consumed")} for bundle in ordered]
+    merged = {
+        "schema_version": "1.0.0", "generated_by": ordered[0]["document"]["generated_by"],
+        "inputs": {key: ([bundle["repository"] for bundle in ordered] if key == "repositories" else value)
+                   for key, value in ordered[0]["declared"].items()},
+        "records": records, "skipped_by_cap": skipped, "failed_scopes": failed, "method_limitations": limitations,
+        "status": max((bundle["document"]["status"] for bundle in ordered), key=COLLECTION_RANK.__getitem__),
+        "workflow_merge": {"merged_by": SKILL_NAME, "discoveries": summary, "capped": capped},
+    }
+    try:
+        siblings.verifier._validate_discovery_document(merged)
+    except ValueError as error:
+        raise WorkflowError("verifier rejects the merged discovery document: %s" % error) from error
+    return merged, summary, capped
+
+
+def _adopt_discoveries(args, siblings: Siblings, request: dict, state: dict, run: Run, target: dict, analysis: dict) -> dict:
+    """Adopt one discovery per target repository as one merged discovery checkpoint.
+
+    The candidate-reads entry reads one repository per run. The originals stay
+    byte for byte under ``bundles/NN/``; ``discovery.json`` is the merge over
+    the target. Assessment, locus search and verifier record then run per
+    repository on the originals, and ``record`` merges their candidates.
+    """
+    revisions = siblings.revisions()
+    incoming = run.incoming("discovery", state)
+    try:
+        inputs, raw = _copy_bundles(incoming, [("discovery", "discovery.json", args.discovery),
+                                               ("manifest", "manifest.json", args.manifest)])
+        reused = reuse_if_same(run, state, "discovery", {k: v["sha256"] for k, v in inputs.items()}, revisions)
+        if reused is not None:
+            event(state, "adopt-discovery", "reused", "gen-%03d" % reused["generation"])
+            return reused
+        guard_replace(state, "discovery", args.replace)
+        analysis_document = json.loads((gen_dir(run, "analysis", analysis) / "analysis.json").read_text(encoding="utf-8"))
+        problems = siblings.verifier.validate_analysis_envelope(analysis_document)
+        if problems:
+            raise WorkflowError("verifier rejects the analysis envelope: " + "; ".join(problems))
+        current = current_patterns(analysis_document)
+        bundles, errors = [], []
+        for index, item in enumerate(raw, 1):
+            found, bundle = _discovery_bundle(
+                siblings, target, analysis["outputs"]["analysis.json"], current, index,
+                inputs["discovery-%02d" % index]["sha256"], read_json_bytes(item["discovery"], "discovery %d" % index),
+                read_json_bytes(item["manifest"], "verifier manifest %d" % index))
+            errors.extend(found)
+            if bundle:
+                bundles.append(bundle)
+        if len(bundles) == len(raw):
+            errors.extend(_discoveries_cross_errors(request, target, bundles))
+        if errors:
+            raise WorkflowError("scope-conflict: " + "; ".join(errors))
+        merged, summary, capped = _merge_discoveries(siblings, target, bundles)
+        write_json_atomic(incoming / "discovery.json", merged)
+        reasons = ["discovery %d (%s): %s" % (item["index"], item["repository"], item["status"])
+                   for item in summary if item["status"] != "complete"]
+        missing_patterns = sorted(set(current) - set(bundles[0]["patterns"]))
+        if missing_patterns:
+            reasons.append("patterns not discovered: " + ", ".join(missing_patterns))
+        if merged["skipped_by_cap"]:
+            reasons.append("skipped by cap: %d combinations" % len(merged["skipped_by_cap"]))
+        if capped:
+            reasons.append("merged caps moved %d combinations to skipped_by_cap" % len(capped))
+        if merged["failed_scopes"]:
+            reasons.append("failed scopes: %d combinations" % len(merged["failed_scopes"]))
+        status = merged["status"]
+        if status == "complete" and reasons:
+            status = "partial"
+        if status != "failed" and not merged["records"]:
+            status, reasons = "no-candidates", reasons + ["discovery produced no repository-pattern record"]
+        generation = {"status": status, "reasons": reasons, "inputs": inputs, "tool_revisions": revisions,
+                      "details": {"records": len(merged["records"]), "skipped_by_cap": len(merged["skipped_by_cap"]),
+                                  "failed_scopes": len(merged["failed_scopes"]), "discoveries": summary,
+                                  "capped": capped}}
+        ledger = [entry for bundle in bundles for entry in _verifier_ledger(request, bundle["manifest"])]
+        added, total = record_ledger(state, "discovery", ledger)
+        violations = budget_violations(request, state)
+        if violations:
+            generation["status"], generation["reasons"] = "blocked", reasons + violations
+        commit(run, state, "discovery", incoming, generation, args.replace)
+        incoming = None
+        event(state, "adopt-discovery", generation["status"], "gen-%03d from %d discoveries ledger+%d total=%d"
+              % (generation["generation"], len(bundles), added, total))
+        return generation
+    finally:
+        if incoming is not None and incoming.exists():
+            shutil.rmtree(incoming)
+
+
+def _adopt_locus_searches(args, siblings: Siblings, request: dict, state: dict, run: Run, discovery: dict) -> dict:
+    """One locus search per adopted discovery, each bound to that repository's original discovery bytes."""
+    target = request["target"]
+    discoveries = discovery["details"]["discoveries"]
+    if len(args.locus_search) == 1:
+        raise WorkflowError("the active discovery merges %d discoveries; adopt one --locus-search per discovery, "
+                            "repeated with its --manifest" % len(discoveries))
+    revisions = siblings.revisions()
+    incoming = run.incoming("locus-search", state)
+    try:
+        inputs, raw = _copy_bundles(incoming, [("locus-search", "locus-search.json", args.locus_search),
+                                               ("manifest", "manifest.json", args.manifest)])
+        reused = reuse_if_same(run, state, "locus-search", {k: v["sha256"] for k, v in inputs.items()}, revisions)
+        if reused is not None:
+            event(state, "adopt-locus-search", "reused", "gen-%03d" % reused["generation"])
+            return reused
+        guard_replace(state, "locus-search", args.replace)
+        by_sha = {item["sha256"]: item for item in discoveries}
+        capped = {(item["repository"], item["pattern_id"]) for item in discovery["details"]["capped"]}
+        errors: List[str] = []
+        searched: Dict[int, int] = {}
+        summary, manifests, generators, limits = [], [], set(), 0
+        for index, item in enumerate(raw, 1):
+            label = "locus search %d" % index
+            document = read_json_bytes(item["locus-search"], label)
+            manifest = read_json_bytes(item["manifest"], "verifier manifest %d" % index)
+            bound = by_sha.get(document.get("discovery_sha256")) if isinstance(document, dict) else None
+            if bound is None:
+                errors.append(label + " is not bound to an adopted discovery")
+                continue
+            if bound["index"] in searched:
+                errors.append("%s is bound to discovery %d, already searched by locus search %d"
+                              % (label, bound["index"], searched[bound["index"]]))
+                continue
+            searched[bound["index"]] = index
+            try:  # the verifier's own locus-search reader, as record uses it
+                siblings.verifier._read_locus_search(str(incoming / "bundles" / ("%02d" % index) / "locus-search.json"),
+                                                     bound["sha256"])
+            except ValueError as error:
+                errors.append("%s: verifier rejects the locus search: %s" % (label, error))
+                continue
+            if not isinstance(manifest, dict) or not isinstance(manifest.get("runs"), list):
+                errors.append(label + ": verifier manifest has no runs list")
+                continue
+            run_entry = _manifest_run(manifest, "locus-search", lambda r: isinstance(r.get("inputs"), dict)
+                                      and r["inputs"].get("discovery_sha256") == bound["sha256"])
+            if run_entry is None:
+                errors.append("%s: verifier manifest has no locus-search run for discovery %d" % (label, bound["index"]))
+                continue
+            budget = run_entry.get("budget") if isinstance(run_entry.get("budget"), dict) else {}
+            if budget.get("request_limit") != target["locus_request_budget"]:
+                errors.append("%s: request budget %s differs from target.locus_request_budget %d"
+                              % (label, json.dumps(budget.get("request_limit")), target["locus_request_budget"]))
+            else:
+                limits += budget["request_limit"]
+            searches = document["searches"]
+            outside = sorted({s["repository"] for s in searches if s["repository"].lower() != bound["repository"].lower()})
+            if outside:
+                errors.append("%s covers repositories other than its discovery's %s: %s"
+                              % (label, bound["repository"], ", ".join(outside)))
+            over = sorted({"%s %s" % (s["repository"], s.get("pattern_id")) for s in searches
+                           if (s["repository"], s.get("pattern_id")) in capped})
+            if over:
+                errors.append("%s searches combinations the merged caps skipped: %s" % (label, ", ".join(over)))
+            if document.get("status") not in ("complete", "partial"):
+                errors.append("%s: unsupported locus-search status %r" % (label, document.get("status")))
+            generators.add(json.dumps(document.get("generated_by"), sort_keys=True))
+            incomplete = sum(1 for s in searches if not s.get("complete"))
+            manifests.append(manifest)
+            summary.append({"index": index, "discovery": bound["index"], "repository": bound["repository"],
+                            "discovery_sha256": bound["sha256"],
+                            "locus_search_sha256": inputs["locus-search-%02d" % index]["sha256"],
+                            "assessment_sha256": run_entry["inputs"].get("assessment_sha256"),
+                            "searches": len(searches), "incomplete": incomplete,
+                            "status": "partial" if incomplete else document.get("status"),
+                            "request_budget": budget.get("request_limit"),
+                            "requests_consumed": budget.get("requests_consumed")})
+        errors.extend("no locus search for discovery %d (%s)" % (item["index"], item["repository"])
+                      for item in discoveries if item["index"] not in searched)
+        if len(generators) > 1:
+            errors.append("locus searches differ in verifier revision (generated_by)")
+        if limits > request["budget"]["total_api_requests"]:
+            errors.append("per-run locus-search request budgets sum to %d, over budget.total_api_requests %d"
+                          % (limits, request["budget"]["total_api_requests"]))
+        if errors:
+            raise WorkflowError("scope-conflict: " + "; ".join(errors))
+        order = {item["index"]: number for number, item in enumerate(discoveries)}
+        summary.sort(key=lambda item: order[item["discovery"]])
+        reasons = ["locus search %d (%s): partial" % (item["index"], item["repository"])
+                   for item in summary if item["status"] != "complete"]
+        incomplete = sum(item["incomplete"] for item in summary)
+        if incomplete:
+            reasons.append("incomplete locus searches: %d" % incomplete)
+        generation = {"status": "partial" if reasons else "complete", "reasons": reasons, "inputs": inputs,
+                      "tool_revisions": revisions,
+                      "details": {"searches": sum(item["searches"] for item in summary), "locus_searches": summary}}
+        ledger = [entry for manifest in manifests for entry in _verifier_ledger(request, manifest)]
+        added, total = record_ledger(state, "locus-search", ledger)
+        violations = budget_violations(request, state)
+        if violations:
+            generation["status"], generation["reasons"] = "blocked", reasons + violations
+        commit(run, state, "locus-search", incoming, generation, args.replace)
+        incoming = None
+        event(state, "adopt-locus-search", generation["status"], "gen-%03d from %d locus searches ledger+%d total=%d"
+              % (generation["generation"], len(summary), added, total))
         return generation
     finally:
         if incoming is not None and incoming.exists():
@@ -1623,11 +1988,16 @@ def cmd_record(args, siblings: Siblings, request: dict, state: dict, run: Run) -
     locus, reason = usable(run, state, "locus-search")
     if locus is None:
         raise WorkflowError("record needs a usable locus search: " + reason)
+    if discovery["details"].get("discoveries"):
+        return _record_per_repository(args, siblings, request, state, run, discovery, locus)
+    if len(args.assessment) > 1:
+        raise WorkflowError("the active discovery is one document; adopt one --assessment")
+    assessment_path = args.assessment[0]
     revisions = siblings.revisions()
     incoming = run.incoming("record", state)
     try:
-        data, assessment_sha = copy_input(args.assessment, incoming / "assessment.json", "assessment")
-        inputs = {"assessment": {"sha256": assessment_sha, "source_path": os.path.abspath(args.assessment)},
+        data, assessment_sha = copy_input(assessment_path, incoming / "assessment.json", "assessment")
+        inputs = {"assessment": {"sha256": assessment_sha, "source_path": os.path.abspath(assessment_path)},
                   "discovery": {"sha256": discovery["outputs"]["discovery.json"], "source_path": "stages/discovery/gen-%03d/discovery.json" % discovery["generation"]},
                   "locus_search": {"sha256": locus["outputs"]["locus-search.json"], "source_path": "stages/locus-search/gen-%03d/locus-search.json" % locus["generation"]}}
         argv_extra = []
@@ -1662,6 +2032,166 @@ def cmd_record(args, siblings: Siblings, request: dict, state: dict, run: Run) -
         commit(run, state, "record", incoming, generation, True)
         incoming = None
         event(state, "record", status, "gen-%03d" % generation["generation"])
+        return generation
+    finally:
+        if incoming is not None and incoming.exists():
+            shutil.rmtree(incoming)
+
+
+def _renumbered_candidates(document: dict, start: int, capped: set, index: int) -> Tuple[List[dict], List[dict], List[dict]]:
+    """One repository's candidates renumbered from ``start``; candidates of combinations the merged caps skipped are dropped.
+
+    ``candidate_id`` (and the ``VER-<id>-<n>`` snapshot ids and ``superseded_by``
+    that follow it) is only unique inside one verifier record output, like a
+    corpus ``pr_id``. ``candidate_key`` is unchanged.
+    """
+    kept = [c for c in document["records"] if (c["repository"], c["pattern_ids"][0]) not in capped]
+    dropped = [{"assessment": index, "candidate_id": c["candidate_id"], "repository": c["repository"],
+                "pattern_id": c["pattern_ids"][0]} for c in document["records"] if c not in kept]
+    local = {c["candidate_id"]: "CAN-%03d" % (start + number) for number, c in enumerate(kept, 1)}
+    renumbered, mapping = [], []
+    for original in kept:
+        candidate = json.loads(json.dumps(original))
+        candidate["candidate_id"] = local[original["candidate_id"]]
+        for position, snapshot in enumerate(candidate["verification_history"], 1):
+            snapshot["verification_id"] = "VER-%s-%d" % (candidate["candidate_id"], position)
+        if candidate.get("superseded_by") is not None:
+            if candidate["superseded_by"] not in local:
+                raise WorkflowError("assessment %d: candidate %s is superseded by %s, which the merge does not keep"
+                                    % (index, original["candidate_id"], candidate["superseded_by"]))
+            candidate["superseded_by"] = local[candidate["superseded_by"]]
+        renumbered.append(candidate)
+        mapping.append({"assessment": index, "repository": candidate["repository"], "from": original["candidate_id"],
+                        "to": candidate["candidate_id"], "candidate_key": candidate["candidate_key"]})
+    return renumbered, mapping, dropped
+
+
+def _record_per_repository(args, siblings: Siblings, request: dict, state: dict, run: Run, discovery: dict, locus: dict) -> dict:
+    """Run the verifier's record once per repository, on that repository's own bytes, and merge the candidates.
+
+    Each assessment is the answer for one repository's discovery and stays byte
+    for byte as given: it must be bound to that discovery and be the assessment
+    the repository's locus search used. The verifier record gate runs unchanged
+    per repository; only its outputs are merged.
+    """
+    discoveries = discovery["details"]["discoveries"]
+    loci = locus["details"].get("locus_searches")
+    if not loci:
+        raise WorkflowError("record needs one locus search per discovery; re-adopt the locus searches")
+    if len(args.assessment) == 1:
+        raise WorkflowError("the active discovery merges %d discoveries; adopt one --assessment per discovery, repeated"
+                            % len(discoveries))
+    revisions = siblings.revisions()
+    incoming = run.incoming("record", state)
+    discovery_dir, locus_dir = gen_dir(run, "discovery", discovery), gen_dir(run, "locus-search", locus)
+    try:
+        inputs, raw = _copy_bundles(incoming, [("assessment", "assessment.json", args.assessment)])
+        inputs["discovery"] = {"sha256": discovery["outputs"]["discovery.json"],
+                               "source_path": "stages/discovery/gen-%03d/discovery.json" % discovery["generation"]}
+        for item in loci:
+            inputs["locus_search-%02d" % item["index"]] = {
+                "sha256": item["locus_search_sha256"],
+                "source_path": "stages/locus-search/gen-%03d/bundles/%02d/locus-search.json" % (locus["generation"], item["index"])}
+        argv_extra = []
+        if args.policy_evidence:
+            argv_extra = ["--policy-evidence", bind_policy_evidence(args.policy_evidence, incoming, inputs)]
+        reused = reuse_if_same(run, state, "record", {k: v["sha256"] for k, v in inputs.items()}, revisions)
+        if reused is not None and reused["provenance"] == _claimed_provenance(request, args):
+            event(state, "record", "reused", "gen-%03d" % reused["generation"])
+            return reused
+        by_sha = {item["sha256"]: item for item in discoveries}
+        locus_for = {item["discovery"]: item for item in loci}
+        capped = {(item["repository"], item["pattern_id"]) for item in discovery["details"]["capped"]}
+        errors: List[str] = []
+        assigned: Dict[int, int] = {}
+        documents: Dict[int, dict] = {}
+        for index, item in enumerate(raw, 1):
+            label = "assessment %d" % index
+            document = read_json_bytes(item["assessment"], label)
+            bound = by_sha.get(document.get("discovery_sha256")) if isinstance(document, dict) else None
+            if bound is None:
+                errors.append(label + " is not bound to an adopted discovery")
+                continue
+            if bound["index"] in assigned:
+                errors.append("%s is bound to discovery %d, already assessed by assessment %d"
+                              % (label, bound["index"], assigned[bound["index"]]))
+                continue
+            assigned[bound["index"]] = index
+            documents[index] = document
+            used = locus_for[bound["index"]]
+            if inputs["assessment-%02d" % index]["sha256"] != used["assessment_sha256"]:
+                errors.append("%s is not the assessment that locus search %d used" % (label, used["index"]))
+            entries = document.get("assessments") if isinstance(document.get("assessments"), list) else []
+            over = sorted({"%s %s" % (a.get("repository"), a.get("pattern_id")) for a in entries
+                           if isinstance(a, dict) and (a.get("repository"), a.get("pattern_id")) in capped})
+            if over:
+                errors.append("%s assesses combinations the merged caps skipped: %s" % (label, ", ".join(over)))
+        errors.extend("no assessment for discovery %d (%s)" % (item["index"], item["repository"])
+                      for item in discoveries if item["index"] not in assigned)
+        if errors:
+            raise WorkflowError("scope-conflict: " + "; ".join(errors))
+
+        merged: List[dict] = []
+        mapping: List[dict] = []
+        dropped: List[dict] = []
+        generators, per_repository, outputs, partial, uncovered = set(), [], [], False, 0
+        for item in discoveries:  # target order
+            index, used = assigned[item["index"]], locus_for[item["index"]]
+            folder = incoming / "bundles" / ("%02d" % index)
+            locus_path = locus_dir / "bundles" / ("%02d" % used["index"]) / "locus-search.json"
+            shutil.copyfile(locus_dir / "bundles" / ("%02d" % used["index"]) / "manifest.json", folder / "manifest.json")
+            code, stdout, stderr = run_main(siblings.verifier.main, [
+                "record", "--discovery", str(discovery_dir / "bundles" / ("%02d" % item["index"]) / "discovery.json"),
+                "--assessment", str(folder / "assessment.json"), "--output", str(folder / "candidates.json"),
+                "--manifest", str(folder / "manifest.json"), "--markdown-output", str(folder / "candidates.md"),
+                "--locus-search", str(locus_path)] + argv_extra, opener=_refuse_http)
+            if code not in (0, 3):
+                raise WorkflowError("verifier record rejected assessment %d (%s) (exit %d): %s"
+                                    % (index, item["repository"], code, stderr.strip()))
+            check, _, check_err = run_main(siblings.verifier.main, ["validate", "--candidates", str(folder / "candidates.json")],
+                                           opener=_refuse_http)
+            if check != 0:
+                raise WorkflowError("verifier validate rejected the candidates of assessment %d: %s" % (index, check_err.strip()))
+            document = json.loads((folder / "candidates.json").read_text(encoding="utf-8"))
+            generators.add(json.dumps(document.get("generated_by"), sort_keys=True))
+            renumbered, moved, gone = _renumbered_candidates(document, len(merged), capped, index)
+            merged.extend(renumbered)
+            mapping.extend(moved)
+            dropped.extend(gone)
+            searched = {(s.get("pattern_id"), str(s.get("repository", "")).lower(), s.get("locus"))
+                        for s in json.loads(locus_path.read_text(encoding="utf-8")).get("searches", [])}
+            missing = sum(1 for a in documents[index].get("assessments", []) if isinstance(a, dict) and a.get("locus") and
+                          (a.get("pattern_id"), str(a.get("repository", "")).lower(), a.get("locus")) not in searched)
+            uncovered += missing
+            partial = partial or code == 3
+            outputs.append(stdout.strip())
+            per_repository.append({"assessment": index, "discovery": item["index"], "repository": item["repository"],
+                                   "locus_search": used["index"], "candidates": len(renumbered), "verifier_exit": code})
+        if len(generators) > 1:
+            raise WorkflowError("the per-repository verifier records differ in verifier revision (generated_by)")
+        write_json_atomic(incoming / "candidates.json", {"schema_version": "1.0.0", "generated_by": json.loads(generators.pop()),
+                                                         "records": merged})
+        check, _, check_err = run_main(siblings.verifier.main, ["validate", "--candidates", str(incoming / "candidates.json")],
+                                       opener=_refuse_http)
+        if check != 0:
+            raise WorkflowError("verifier validate rejected the merged candidates: " + check_err.strip())
+        code, _, stderr = run_main(siblings.verifier.main, ["render", "--candidates", str(incoming / "candidates.json"),
+                                                             "--output", str(incoming / "candidates.md")], opener=_refuse_http)
+        if code != 0:
+            raise WorkflowError("verifier render rejected the merged candidates: " + stderr.strip())
+        write_json_atomic(incoming / "workflow-merge.json", {"merged_by": SKILL_NAME, "repositories": per_repository,
+                                                             "candidate_ids": mapping, "dropped_capped": dropped})
+        reasons = ["assessed loci without a locus search: %d" % uncovered] if uncovered else []
+        if dropped:
+            reasons.append("candidates of combinations the merged caps skipped, dropped: %d" % len(dropped))
+        status = ("partial" if partial or uncovered or locus["status"] == "partial" or discovery["status"] == "partial"
+                  else "complete")
+        generation = {"status": status, "reasons": reasons, "inputs": inputs, "tool_revisions": revisions,
+                      "provenance": _claimed_provenance(request, args),
+                      "details": {"verifier": outputs, "records": len(merged), "repositories": per_repository}}
+        commit(run, state, "record", incoming, generation, True)
+        incoming = None
+        event(state, "record", status, "gen-%03d from %d repositories" % (generation["generation"], len(per_repository)))
         return generation
     finally:
         if incoming is not None and incoming.exists():
@@ -1738,18 +2268,34 @@ def next_steps(run: Run, request: dict, state: dict) -> List[dict]:
     if analysis["status"] == "no-patterns":
         return []
     if active(state, "discovery") is None:
-        argv = ["verify_candidates.py", "discover", "--analysis", "stages/analysis/gen-%03d/analysis.json" % analysis["generation"]]
-        for repository in target["repositories"]:
-            argv += ["--repo", repository]
-        argv += ["--max-candidates-per-repo", str(target["max_candidates_per_repo"]),
-                 "--max-candidates-total", str(target["max_candidates_total"]),
-                 "--request-budget", str(target["discover_request_budget"]),
-                 "--output", "<ISOLATED_OUTPUT>/discovery.json", "--manifest", "<ISOLATED_OUTPUT>/manifest.json"]
-        return [{"stage": "discovery", "kind": "external-network-step", "executed": False, "argv": argv, "note": unverified_note,
+        def discover_argv(repositories):
+            argv = ["verify_candidates.py", "discover", "--analysis", "stages/analysis/gen-%03d/analysis.json" % analysis["generation"]]
+            for repository in repositories:
+                argv += ["--repo", repository]
+            return argv + ["--max-candidates-per-repo", str(target["max_candidates_per_repo"]),
+                           "--max-candidates-total", str(target["max_candidates_total"]),
+                           "--request-budget", str(target["discover_request_budget"]),
+                           "--output", "<ISOLATED_OUTPUT>/discovery.json", "--manifest", "<ISOLATED_OUTPUT>/manifest.json"]
+        if len(target["repositories"]) > 1:
+            # The candidate-reads entry reads one repository per run.
+            then = ("adopt-discovery with --discovery ... --manifest ... repeated once per repository (%d), in any "
+                    "order; the target caps are applied again over the set" % len(target["repositories"]))
+            return [{"stage": "discovery", "repository": repository, "kind": "external-network-step", "executed": False,
+                     "argv": discover_argv([repository]), "note": unverified_note, "then": then}
+                    for repository in target["repositories"]]
+        return [{"stage": "discovery", "kind": "external-network-step", "executed": False,
+                 "argv": discover_argv(target["repositories"]), "note": unverified_note,
                  "then": "adopt-discovery --discovery ... --manifest ..."}]
     discovery = active(state, "discovery")
     if discovery["status"] == "no-candidates":
         return []
+    bundles = discovery["details"].get("discoveries")
+    record_step = {"stage": "record", "kind": "local", "executed": False, "command": "record --assessment ... --origin ai"}
+    if bundles:
+        record_step["command"] = ("record --assessment ... --origin ai, with --assessment once per repository (%d), "
+                                  "each the one its locus search used" % len(bundles))
+    if active(state, "locus-search") is None and bundles:
+        return _per_repository_steps(analysis, discovery, target, unverified_note) + [record_step]
     if active(state, "locus-search") is None:
         # assess -> locus-search -> record (#259): the assess input is the analysis bundle's (stage_inputs.py,
         # docs/research/oss-e2e-2026-09-28), answered by one isolated model call and checked strictly before adoption.
@@ -1772,10 +2318,43 @@ def next_steps(run: Run, request: dict, state: dict) -> List[dict]:
                           "--manifest", "<copy of stages/discovery/gen-%03d/manifest.json>" % discovery["generation"],
                           "--request-budget", str(target["locus_request_budget"])],
                  "then": "adopt-locus-search --locus-search ... --manifest ..."},
-                {"stage": "record", "kind": "local", "executed": False, "command": "record --assessment ... --origin ai"}]
+                record_step]
     if active(state, "record") is None:
-        return [{"stage": "record", "kind": "local", "executed": False, "command": "record --assessment ... --origin ai"}]
+        return [record_step]
     return []
+
+
+def _per_repository_steps(analysis: dict, discovery: dict, target: dict, note: str) -> List[dict]:
+    """Assessment and locus search per repository: each on that repository's own discovery bytes (bundles/NN)."""
+    steps, loci = [], []
+    for bundle in discovery["details"]["discoveries"]:
+        base = "stages/discovery/gen-%03d/bundles/%02d/" % (discovery["generation"], bundle["index"])
+        left_out = ["%s %s" % (item["repository"], item["pattern_id"]) for item in discovery["details"]["capped"]
+                    if item["discovery"] == bundle["index"]]
+        detail = ("the assessment of %s (%s) is AI research and never runs in this session: one isolated model call "
+                  "per repository answers that discovery's assess input, through the research launcher's one measured "
+                  "read-only launch with the user's approval. No isolated model has returned an assessment yet; only "
+                  "an assessment that already exists can be recorded" % (base + "discovery.json", bundle["repository"]))
+        if left_out:
+            detail += "; leave out the combinations the merged caps skipped: " + ", ".join(left_out)
+        steps.append({"stage": "assessment", "repository": bundle["repository"], "kind": "awaiting-ai", "executed": False,
+                      "argv": ["stage_inputs.py", "assess-inputs",
+                               "--analysis", "stages/analysis/gen-%03d/analysis.json" % analysis["generation"],
+                               "--discovery", base + "discovery.json", "--out", "<HOST_INPUT>/assess-%02d" % bundle["index"]],
+                      "detail": detail,
+                      "then": "verify_e2e_result.py --answer-kind assess --discovery %sdiscovery.json --input-scope ... "
+                              "--adopt-to ... (a ready status passes only with --locus-search of its loci); only the "
+                              "adopted answer is that repository's assessment" % base})
+        loci.append({"stage": "locus-search", "repository": bundle["repository"], "kind": "external-network-step",
+                     "executed": False, "note": note,
+                     "argv": ["verify_candidates.py", "locus-search", "--discovery", base + "discovery.json",
+                              "--assessment", "<assessment of %s>" % bundle["repository"],
+                              "--output", "<ISOLATED_OUTPUT>/locus-search.json",
+                              "--manifest", "<copy of %smanifest.json>" % base,
+                              "--request-budget", str(target["locus_request_budget"])],
+                     "then": "adopt-locus-search with --locus-search ... --manifest ... repeated once per repository (%d)"
+                             % len(discovery["details"]["discoveries"])})
+    return steps + loci
 
 
 def overall(run: Run, request: dict, state: dict) -> Tuple[str, str]:
@@ -1830,6 +2409,12 @@ def status_document(run: Run, request: dict, state: dict) -> dict:
     collected = active(state, "collect")
     if collected is not None and collected.get("details", {}).get("collections"):
         stages["collect"]["collections"] = collected["details"]["collections"]
+    for stage, key in (("discovery", "discoveries"), ("locus-search", "locus_searches")):
+        generation = active(state, stage)
+        if generation is not None and generation.get("details", {}).get(key):
+            stages[stage][key] = generation["details"][key]
+            if stage == "discovery":
+                stages[stage]["capped"] = generation["details"]["capped"]
     ledger_total = sum(e["requests"] for e in state["ledger"])
     return {
         "run_id": state["run_id"], "mode": request["mode"], "outcome": outcome, "completeness": completeness,
@@ -1908,6 +2493,7 @@ def render_report(run: Run, request: dict, state: dict) -> str:
         lines.append("")
         lines.append("Requests across the collections: %d of a summed per-run budget of %d."
                      % (sum(item["request_count"] for item in collections), sum(item["request_budget"] for item in collections)))
+    lines += _candidate_reads_section(status)
     lines += ["", "Tool revisions: " + ", ".join("%s `%s`" % (k, _short(v)) for k, v in sorted(state["skills"]["revisions"].items())), ""]
     lines += ["## AI judgment provenance", "",
               "Origin, model, and effort are caller claims bound to input hashes. They do not prove that a model ran.", ""]
@@ -1954,6 +2540,30 @@ def render_report(run: Run, request: dict, state: dict) -> str:
                         "comments; tracker association is not upstream role evidence, and unresolved pull requests keep "
                         "an `unknown` state."]
     return "\n".join(lines)
+
+
+def _candidate_reads_section(status: dict) -> List[str]:
+    """Discovery and locus search per target repository, when they arrived as one run per repository."""
+    discoveries = status["stages"]["discovery"].get("discoveries")
+    if not discoveries:
+        return []
+    loci = {item["discovery"]: item for item in status["stages"]["locus-search"].get("locus_searches") or []}
+    lines = ["", "## Candidate reads by repository", "",
+             "The discovery stage was adopted from %d discoveries, one per target repository; assessment, locus "
+             "search, and verifier record run per repository and `record` merges the candidates." % len(discoveries), "",
+             "| # | Repository | Discovery | Records / skipped by cap / failed (its own run) | Requests / budget | Locus search | Locus requests / budget |",
+             "| --- | --- | --- | --- | --- | --- | --- |"]
+    for item in discoveries:
+        locus = loci.get(item["index"])
+        lines.append("| %d | `%s` | %s | %d / %d / %d | %s / %s | %s | %s |" % (
+            item["index"], item["repository"], item["status"], item["records"], item["skipped_by_cap"], item["failed_scopes"],
+            item["requests_consumed"], item["request_budget"],
+            "-" if locus is None else "%s (%d searches)" % (locus["status"], locus["searches"]),
+            "-" if locus is None else "%s / %s" % (locus["requests_consumed"], locus["request_budget"])))
+    capped = status["stages"]["discovery"].get("capped") or []
+    lines += ["", "Moved to skipped_by_cap by the target caps over the set: %s."
+              % (", ".join("`%s` %s" % (item["repository"], item["pattern_id"]) for item in capped) or "none")]
+    return lines
 
 
 def _candidate_sections(run: Run, state: dict, request: dict) -> List[str]:
@@ -2044,16 +2654,17 @@ def build_parser() -> argparse.ArgumentParser:
         sub.add_argument("--model")
         sub.add_argument("--effort")
         sub.add_argument("--replace", action="store_true")
+    # One target repository per candidate-reads run: repeat the pair once per repository.
     discovery = command("adopt-discovery")
-    discovery.add_argument("--discovery", required=True)
-    discovery.add_argument("--manifest", required=True)
+    discovery.add_argument("--discovery", required=True, action="append")
+    discovery.add_argument("--manifest", required=True, action="append")
     discovery.add_argument("--replace", action="store_true")
     locus = command("adopt-locus-search")
-    locus.add_argument("--locus-search", required=True)
-    locus.add_argument("--manifest", required=True)
+    locus.add_argument("--locus-search", required=True, action="append")
+    locus.add_argument("--manifest", required=True, action="append")
     locus.add_argument("--replace", action="store_true")
     record = command("record")
-    record.add_argument("--assessment", required=True)
+    record.add_argument("--assessment", required=True, action="append")
     record.add_argument("--policy-evidence")
     record.add_argument("--origin", choices=ORIGINS, required=True)
     record.add_argument("--model")
