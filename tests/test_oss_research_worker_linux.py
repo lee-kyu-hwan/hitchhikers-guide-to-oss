@@ -3284,11 +3284,36 @@ exit 0
         path.write_text(json.dumps({"stage": "extract", "max_model_calls": total, "call_plan": plan}))
         return path
 
-    def call(self, plan=None, kind="token"):
+    def continuation(self, parent_plan, remaining=7, name="continue.json", **changes):
+        """A stage.json as continue-plan writes it: the stages not yet run, bound to the parent's extract stage."""
+        synthesis = remaining - 5 - 1
+        plan = {"mode": "extraction-only", "shards": 4, "lenses": 5, "extract": 0, "synthesis": synthesis,
+                "synthesis_groups": max(synthesis - 1, 1), "verify": 5, "final": 1, "max_model_calls": remaining,
+                "continues": {"extract_stage_sha256": hashlib.sha256(parent_plan.read_bytes()).hexdigest(),
+                              "completed": {"extract": 20}}, "formula": "..."}
+        plan.update(changes)
+        path = self.root / name
+        path.write_text(json.dumps({"stage": "continue", "max_model_calls": remaining, "call_plan": plan}))
+        return path
+
+    def call(self, plan=None, kind="token", ledger=None, parent=None):
         self.number += 1
-        argv = ["bash", str(self.harness), str(self.ledger_dir), "call-%d" % self.number, str(self.prompt),
-                "0" * 40, kind, str(self.credential)] + ([] if plan is None else [str(plan)])
+        argv = ["bash", str(self.harness), str(ledger or self.ledger_dir), "call-%d" % self.number, str(self.prompt),
+                "0" * 40, kind, str(self.credential)] + ([] if plan is None else [str(plan)]) \
+            + ([] if parent is None else [str(parent)])
         return subprocess.run(argv, capture_output=True, text=True, timeout=60)
+
+    def parent(self, calls=5, failed=0):
+        """A parent ledger (self.ledger_dir) bound to an extract stage.json, with ``calls`` token calls."""
+        plan = self.stage(30, name="parent-stage.json")
+        good = self.credential.read_text()
+        for number in range(calls):
+            if number >= calls - failed:
+                self.credential.write_text("SUMMARY\n")      # the log holds the credential value: a failed call
+            self.assertIn(self.call(plan).returncode, (0, 5))
+        self.credential.write_text(good)
+        self.assertEqual(self.token_lines(), calls)
+        return plan
 
     def token_lines(self):
         if not self.ledger.exists():
@@ -3370,6 +3395,85 @@ exit 0
         refused = self.call(self.stage(25))
         self.assertEqual(refused.returncode, 3, refused.stderr)
         self.assertEqual(self.token_lines(), 1)
+
+    def test_a_child_ledger_continues_its_parent_and_binds_the_parent_ledger(self):
+        parent_plan = self.parent(calls=5, failed=1)
+        before = self.ledger.read_bytes()
+        child, plan = self.root / "child", self.continuation(parent_plan, remaining=7)
+        for _ in range(7):
+            done = self.call(plan, ledger=child, parent=self.ledger_dir)
+            self.assertEqual(done.returncode, 0, done.stderr)
+        refused = self.call(plan, ledger=child, parent=self.ledger_dir)
+        self.assertEqual(refused.returncode, 3, refused.stderr)
+        self.assertEqual(refused.stderr, "refused: the ledger already holds 7 model calls\n")
+        self.assertEqual(json.loads((child / "ledger-limit.json").read_text()), {
+            "limit": 7, "call_plan_sha256": hashlib.sha256(plan.read_bytes()).hexdigest(),
+            "parent": {"ledger_sha256": hashlib.sha256(before).hexdigest(), "calls": 5}})
+        self.assertEqual(self.ledger.read_bytes(), before)
+
+    def test_the_parent_calls_and_the_child_limit_stay_within_forty(self):
+        parent_plan = self.parent(calls=5, failed=1)           # the failed parent call counts too
+        before = self.limactl_calls()
+        refused = self.call(self.continuation(parent_plan, remaining=36), ledger=self.root / "child",
+                            parent=self.ledger_dir)
+        self.assertEqual(refused.returncode, 2, refused.stderr)
+        self.assertIn("5 parent calls + 36 is over the absolute cap 40", refused.stderr)
+        self.assertFalse((self.root / "child").exists())
+        self.assertEqual(self.limactl_calls(), before)
+        done = self.call(self.continuation(parent_plan, remaining=35, name="c35.json"), ledger=self.root / "child",
+                         parent=self.ledger_dir)
+        self.assertEqual(done.returncode, 0, done.stderr)
+
+    def test_a_parent_changed_after_the_child_started_is_refused(self):
+        parent_plan = self.parent(calls=3)
+        child, plan = self.root / "child", self.continuation(parent_plan)
+        self.assertEqual(self.call(plan, ledger=child, parent=self.ledger_dir).returncode, 0)
+        before = self.limactl_calls()
+        with self.subTest("no parent on a later call"):
+            refused = self.call(plan, ledger=child)
+            self.assertEqual(refused.returncode, 2, refused.stderr)     # a continuation plan needs its parent
+        original = self.ledger.read_bytes()
+        for label, changed in (("parent grew", original + original.splitlines(True)[0]),
+                               ("parent edited", original.replace(b'"call-1"', b'"call-9"', 1))):
+            with self.subTest(label):
+                self.ledger.write_bytes(changed)
+                refused = self.call(plan, ledger=child, parent=self.ledger_dir)
+                self.assertEqual(refused.returncode, 3, refused.stderr)
+                self.assertIn("ledger limit", refused.stderr)
+        self.ledger.write_bytes(original)
+        self.assertEqual(self.call(plan, ledger=child, parent=self.ledger_dir).returncode, 0)
+        self.assertEqual(self.limactl_calls(), before + 3)
+
+    def test_a_missing_or_mismatched_parent_is_refused_before_anything_starts(self):
+        parent_plan = self.parent(calls=2)
+        plan = self.continuation(parent_plan)
+        empty = self.root / "empty"
+        empty.mkdir()
+        no_limit = self.root / "no-limit"
+        no_limit.mkdir()
+        shutil.copy(self.ledger, no_limit / "ledger.jsonl")
+        link = self.root / "link"
+        link.symlink_to(self.ledger_dir)
+        before = self.limactl_calls()
+        cases = {"no such directory": (plan, self.root / "absent"), "no ledger": (plan, empty),
+                 "no recorded limit": (plan, no_limit), "a link": (plan, link),
+                 "the child itself": (plan, self.root / "child"),
+                 "plan of another extract stage": (self.continuation(self.stage(30, name="other.json", formula="other"), name="o.json"),
+                                                   self.ledger_dir),
+                 "an extract plan with a parent": (self.stage(13, name="s13.json"), self.ledger_dir),
+                 "extract still planned": (self.continuation(parent_plan, name="e.json", extract=1, max_model_calls=8),
+                                           self.ledger_dir),
+                 "nothing recorded as completed": (self.continuation(parent_plan, name="n.json", continues={}),
+                                                   self.ledger_dir)}
+        for label, (child_plan, parent) in cases.items():
+            with self.subTest(label):
+                (self.root / "child").mkdir(exist_ok=True) if label == "the child itself" else None
+                refused = self.call(child_plan, ledger=self.root / "child", parent=parent)
+                self.assertEqual(refused.returncode, 2, refused.stderr)
+                self.assertFalse((self.root / "child" / "ledger-limit.json").exists())
+        refused = self.call(plan)                       # a continuation plan without its parent
+        self.assertEqual(refused.returncode, 2, refused.stderr)
+        self.assertEqual(self.limactl_calls(), before)
 
     def test_a_missing_or_malformed_call_plan_is_refused(self):
         link = self.root / "link.json"

@@ -7,6 +7,8 @@ script only moves bytes between that run and one input directory per isolated mo
 call, and assembles the final analysis envelope deterministically:
 
   extract-inputs   RUN → OUT/extract-<lens>/task.txt           (5 independent calls)
+  continue-plan    RUN + adopted extract results + their extract stage → OUT/stage.json
+                   (no prompt: the call plan of the stages not yet run, #82)
   synthesis-input  RUN + extract results → OUT/task.txt        (1 call: candidates)
   verify-inputs    RUN + synthesis answer → OUT/verify-<id>/task.txt  (k calls, k may be 0)
   final-input      RUN + all answers → OUT/task.txt            (1 call: judgment fields)
@@ -678,9 +680,11 @@ def cmd_synthesis_merge_input(context: Context, args) -> dict:
     return summary
 
 
-def cmd_synthesis_input(context: Context, args) -> dict:
+def checked_extract_answers(context: Context, paths: list[str], stage: str) -> tuple[list[str], dict, dict, int]:
+    """Every extract answer of the run, each its lens object within the caps, quotes checked, and the final
+    prompt's projection with those quotes within the budget."""
     stems = context.extract_stems()
-    results = load_results(args.extract_result, stems, "extract result")
+    results = load_results(paths, stems, "extract result")
     for stem, (_, document) in results.items():
         lens = EXTRACT_STEM.fullmatch(stem).group(1)
         if set(document) != {"lens", "patterns", "observations", "rejected"} or document["lens"] != lens:
@@ -689,11 +693,16 @@ def cmd_synthesis_input(context: Context, args) -> dict:
             if not isinstance(document[key], list) or len(document[key]) > cap:
                 raise StageError("extract result %s may hold at most %d %s" % (stem, cap, key))
     report = check_quotes(context, [path for path, _ in results.values()])
-    compact = compact_report(report)
-    projected = len(final_prompt_text(context, [], {}, compact).encode("utf-8"))
+    projected = len(final_prompt_text(context, [], {}, compact_report(report)).encode("utf-8"))
     if projected > PROMPT_MAX_BYTES:
-        raise budget_refusal("synthesis-input", projected, "digest and the verified extract quotes alone"
+        raise budget_refusal(stage, projected, "digest and the verified extract quotes alone"
                              if not context.reduced else "PR index and the verified extract quotes alone")
+    return stems, results, report, projected
+
+
+def cmd_synthesis_input(context: Context, args) -> dict:
+    stems, results, report, projected = checked_extract_answers(context, args.extract_result, "synthesis-input")
+    compact = compact_report(report)
     if context.reduced:
         return reduced_synthesis_input(context, args, stems, results, report, projected)
     text = read_bounded(PROMPTS / "synthesize.md", PROMPT_MAX_BYTES, "synthesis template").decode("utf-8")
@@ -711,6 +720,87 @@ def cmd_synthesis_input(context: Context, args) -> dict:
     entry["result_name"] = "synthesis.result.json"
     summary = {"stage": "synthesis", "calls": [entry], "quotes": report["totals"],
                "clean_results": report["clean_results"], "final_projection_bytes": projected}
+    write_json(out / "stage.json", summary)
+    return summary
+
+
+def adopted_extract_answer(context: Context, stem: str, path: str, prompt_sha: str, records: Path) -> dict:
+    """One adopted extract answer, bound to the prompt its extract stage recorded: the strict verdict of its call
+    (ok, strict limits, an extract answer, P3 the prompt sha, P4 PASS, adopted under this file name) and the
+    picked-up worker manifest (that prompt sha, and this answer's bytes as the report)."""
+    answer = read_bounded(Path(path), ANSWER_MAX_BYTES, "extract result")
+    verdict = read_json(records / stem / "verdict.json", ANSWER_MAX_BYTES, "verdict of " + stem)
+    manifest = read_json(records / stem / "result" / "manifest.json", ANSWER_MAX_BYTES, "manifest of " + stem)
+    if not isinstance(verdict, dict) or not isinstance(manifest, dict) or not isinstance(verdict.get("items"), list):
+        raise StageError("the record of %s is not a verdict and a worker manifest" % stem)
+    items = {item.get("id"): item for item in verdict["items"] if isinstance(item, dict)}
+    problems = []
+    if verdict.get("ok") is not True or verdict.get("limits") != "strict" or verdict.get("answer_kind") != "extract":
+        problems.append("the verdict is not an ok strict extract verdict")
+    if items.get("P3-prompt-sha256", {}).get("detail") != prompt_sha:
+        problems.append("the verdict checked another prompt")
+    if items.get("P4-prompt-binding", {}).get("status") != "PASS":
+        problems.append("the verdict did not pass the prompt binding")
+    adopted = verdict.get("adopted_to")
+    if not isinstance(adopted, str) or Path(adopted).name != Path(path).name:
+        problems.append("the verdict adopted another file (%r)" % (adopted,))
+    if manifest.get("prompt_sha256") != prompt_sha:
+        problems.append("the worker manifest records another prompt")
+    answer_sha = hashlib.sha256(answer).hexdigest()
+    if manifest.get("report_sha256") != answer_sha:
+        problems.append("the answer bytes are not the report the worker manifest records")
+    if problems:
+        raise StageError("the adopted answer %s is not bound to its recorded prompt: %s" % (stem, "; ".join(problems)))
+    return {"stem": stem, "result_name": Path(path).name, "answer_sha256": answer_sha, "prompt_sha256": prompt_sha}
+
+
+def cmd_continue_plan(context: Context, args) -> dict:
+    """The stages not yet run of a run whose extract answers were all adopted (#82): a new call plan with
+    extract 0, bound to the extract stage.json that made the prompts (and that the parent ledger is bound to)."""
+    try:
+        data = read_bounded(Path(args.extract_stage) / "stage.json", PROMPT_MAX_BYTES, "extract stage")
+        try:
+            recorded = json.loads(data.decode("utf-8"), object_pairs_hook=_unique_object, parse_constant=_refuse_constant)
+        except (UnicodeDecodeError, ValueError) as error:
+            raise StageError("the extract stage.json is not one strict JSON document: %s" % error) from error
+        if not isinstance(recorded, dict) or recorded.get("stage") != "extract":
+            raise StageError("that stage.json is not an extract stage")
+        calls = recorded.get("calls")
+        if not isinstance(calls, list) or not all(isinstance(call, dict) and isinstance(call.get("input_dir"), str)
+                                                  and isinstance(call.get("sha256"), str) for call in calls):
+            raise StageError("the extract stage.json holds no calls")
+        prompts = {call["input_dir"]: call["sha256"] for call in calls}
+        if sorted(prompts) != context.extract_stems() or len(prompts) != len(calls):
+            raise StageError("the extract stage.json calls are not this run's extract prompts")
+        written = {stem: hashlib.sha256(text.encode("utf-8")).hexdigest()
+                   for stem, text in context.extract_prompt_texts().items()}
+        changed = [stem for stem in sorted(prompts) if prompts[stem] != written[stem]]
+        if changed:
+            raise StageError("the extract stage.json records other prompts than this run's analyzer writes: %s"
+                             % ", ".join(changed))
+    except StageError as error:
+        raise StageError("continue-plan: %s" % error) from error
+    stems, results, report, projected = checked_extract_answers(context, args.extract_result, "continue-plan")
+    try:
+        answers = [adopted_extract_answer(context, stem, results[stem][0], prompts[stem], Path(args.records))
+                   for stem in stems]
+        groups = len(plan_synthesis_groups(context, results, report, stems)) if context.reduced else 1
+    except StageError as error:
+        raise StageError("continue-plan: %s" % error) from error
+    synthesis = 1 if groups == 1 else groups + 1
+    total = synthesis + MAX_CANDIDATES + 1
+    lenses = len(context.siblings.build_prompts.LENSES)
+    plan = {"mode": context.mode,
+            "continues": {"extract_stage_sha256": hashlib.sha256(data).hexdigest(), "completed": {"extract": len(stems)}},
+            "shards": context.shards, "lenses": lenses, "extract": 0, "synthesis": synthesis,
+            "synthesis_groups": groups, "verify": MAX_CANDIDATES, "final": 1, "max_model_calls": total,
+            "formula": "%d extract calls done; %s + %d (verify, at most max_candidates) + 1 (final) = %d"
+                       % (len(stems), "1 (synthesis)" if groups == 1 else "%d (synthesis: %d group calls + 1 merge)"
+                          % (synthesis, groups), MAX_CANDIDATES, total),
+            "inputs": {"max_candidates": MAX_CANDIDATES, "max_synthesis_groups": MAX_SYNTHESIS_GROUPS}}
+    out = new_directory(args.out)
+    summary = {"stage": "continue", "mode": context.mode, "answers": answers, "max_model_calls": total,
+               "call_plan": plan, "final_projection_bytes": projected}
     write_json(out / "stage.json", summary)
     return summary
 
@@ -1026,6 +1116,13 @@ def build_parser() -> argparse.ArgumentParser:
         return sub
 
     command("extract-inputs").add_argument("--out", required=True)
+    resume = command("continue-plan")
+    resume.add_argument("--extract-stage", required=True,
+                        help="the extract-inputs output directory whose stage.json made the adopted answers' prompts")
+    resume.add_argument("--extract-result", action="append", required=True)
+    resume.add_argument("--records", required=True,
+                        help="directory with <stem>/verdict.json (strict) and <stem>/result/manifest.json per call")
+    resume.add_argument("--out", required=True)
     synthesis = command("synthesis-input")
     synthesis.add_argument("--extract-result", action="append", required=True)
     synthesis.add_argument("--out", required=True)
@@ -1053,6 +1150,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 HANDLERS = {
     "extract-inputs": cmd_extract_inputs,
+    "continue-plan": cmd_continue_plan,
     "synthesis-input": cmd_synthesis_input,
     "synthesis-merge-input": cmd_synthesis_merge_input,
     "verify-inputs": cmd_verify_inputs,

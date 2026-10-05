@@ -104,6 +104,22 @@ class ReducedCase(unittest.TestCase):
         return len(stage_inputs.synthesis_group_text(
             self.context, results, report, stems, stage_inputs.group_note(99, 99, stems) if note else None).encode("utf-8"))
 
+    def cap_for_groups(self, wanted, pad):
+        """The smallest prompt cap (in 10-byte steps) at which the padded answers make exactly ``wanted`` groups."""
+        paths = self.extract_args(pad)[1::2]
+        results = stage_inputs.load_results(paths, self.context.extract_stems(), "extract result")
+        report = stage_inputs.check_quotes(self.context, [path for path, _ in results.values()])
+        stems = self.context.extract_stems()
+        for cap in range(self.group_size([], pad), self.group_size(list(LENSES), pad) + 10, 10):
+            with mock.patch.object(stage_inputs, "PROMPT_MAX_BYTES", cap), \
+                    mock.patch.object(stage_inputs, "MAX_SYNTHESIS_GROUPS", 99):
+                try:
+                    if len(stage_inputs.plan_synthesis_groups(self.context, results, report, stems)) == wanted:
+                        return cap
+                except stage_inputs.StageError:
+                    continue
+        self.fail("no cap makes %d groups" % wanted)
+
     def stage(self, *argv, code=0):
         got, summary, stderr = stage(*argv)
         self.assertEqual(code, got, stderr)
@@ -163,6 +179,14 @@ class PlanTests(ReducedCase):
                          {k: v for k, v in plan.items() if k not in ("formula", "inputs")})
         self.assertIn("synthesis", plan["formula"])
         self.assertNotIn("status", summary["final_budget"])
+
+    def test_the_group_limit_is_eight_so_extract_inputs_plans_nine_synthesis_calls(self):
+        self.assertEqual(8, stage_inputs.LIMITS["max_synthesis_groups"])
+        self.assertEqual(8, stage_inputs.MAX_SYNTHESIS_GROUPS)
+        summary, _ = self.stage("extract-inputs", "--run-dir", self.run, "--out", str(self.root / "x"))
+        self.assertEqual(9, summary["call_plan"]["synthesis"])
+        self.assertEqual(8, summary["call_plan"]["synthesis_groups_max"])
+        self.assertEqual(3 * 5 + 9 + 5 + 1, summary["max_model_calls"])
 
     def test_the_overflow_flag_is_gone(self):
         self.stage("extract-inputs", "--run-dir", self.run, "--allow-final-overflow", "--out", str(self.root / "x"), code=2)
@@ -238,12 +262,32 @@ class SynthesisTests(ReducedCase):
                 self.assertLessEqual(call["bytes"], cap)
             self.assertEqual(sorted(self.context.extract_stems()), sorted(s for g in summary["groups"] for s in g["stems"]))
 
+    def test_seven_groups_are_within_the_limit_of_eight_and_their_merge_is_checked_against_the_cap(self):
+        pad = 1000
+        cap = self.cap_for_groups(7, pad)
+        with mock.patch.object(stage_inputs, "PROMPT_MAX_BYTES", cap):
+            summary, _ = self.build(pad=pad, name="g")
+        self.assertEqual(7, len(summary["groups"]))
+        self.assertEqual(8, summary["synthesis_calls"])
+        self.assertTrue(all(call["bytes"] <= cap for call in summary["calls"]))
+        results = [self.synthesis_answer(sorted(group["keys"])[:2], name=group["input_dir"] + ".result.json")
+                   for group in summary["groups"]]
+        merge = [item for path in results for item in ("--group-result", path)]
+        argv = ("synthesis-merge-input", "--run-dir", self.run, "--synthesis-stage", str(self.root / "g"), *merge,
+                *self.extract_args(pad))
+        merged, _ = self.stage(*argv, "--out", str(self.root / "m"))
+        self.assertEqual(8, merged["synthesis_calls"])
+        self.assertLessEqual(merged["calls"][0]["bytes"], CAP)
+        with mock.patch.object(stage_inputs, "PROMPT_MAX_BYTES", merged["calls"][0]["bytes"] - 1):
+            self.stage(*argv, "--out", str(self.root / "over"), code=2)
+        self.assertFalse((self.root / "over").exists())
+
     def test_too_many_groups_and_an_answer_too_large_alone_are_refused_before_anything_is_written(self):
-        cap = self.group_size(["blind"], 1000) - 200
-        with mock.patch.object(stage_inputs, "PROMPT_MAX_BYTES", cap):       # single-answer groups: more than the limit of 3
+        cap = self.cap_for_groups(11, 1000)
+        with mock.patch.object(stage_inputs, "PROMPT_MAX_BYTES", cap):       # single-answer groups: more than the limit of 8
             _, stderr = self.stage("synthesis-input", "--run-dir", self.run, *self.extract_args(1000),
                                    "--out", str(self.root / "many"), code=2)
-            self.assertIn("groups", stderr)
+            self.assertIn("need 11 synthesis groups, over the limit of 8", stderr)
             self.assertFalse((self.root / "many").exists())
             _, stderr = self.stage("synthesis-input", "--run-dir", self.run, *self.extract_args(9000),
                                    "--out", str(self.root / "big"), code=2)

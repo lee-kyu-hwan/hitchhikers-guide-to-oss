@@ -2,6 +2,7 @@
 # #78 analysis: one isolated model call from the host (macOS), with a ledger.
 #
 #   bash analysis_call.sh LEDGER_DIR NAME PROMPT_FILE COMMIT KIND [CREDENTIAL_FILE] [CALL_PLAN_FILE]
+#                         [PARENT_LEDGER_DIR]
 #
 # KIND token   : a real call. CREDENTIAL_FILE is the approved dedicated oauth-token; it reaches the
 #                guest only as non-PTY stdin of model_once.sh (run tmpfs + reaper), never argv or log.
@@ -14,6 +15,16 @@
 #                and the file's sha256 in LEDGER_DIR/ledger-limit.json; a later call whose limit or sha
 #                differs (another plan, an edited file, no plan) is refused (exit 3).
 #
+# PARENT_LEDGER_DIR: continue a ledger whose adopted extract answers are reused (#82). CALL_PLAN_FILE
+#                is then the stage.json of stage_inputs.py continue-plan: extract 0, the stages not yet
+#                run, and call_plan.continues naming the extract stage.json the parent ledger is bound
+#                to (its ledger-limit.json call_plan_sha256). The parent must hold ledger.jsonl and
+#                ledger-limit.json and must not be LEDGER_DIR; its token calls (failed ones too) plus
+#                this limit must stay within the absolute cap 40 (else exit 2). The first call records
+#                the parent ledger's sha256 and call count in LEDGER_DIR/ledger-limit.json; a later call
+#                finding the parent changed (grown or edited) is refused (exit 3). A continuation plan
+#                without a parent, or a parent with an extract plan, is refused (exit 2).
+#
 # Steps: refuse when LEDGER_DIR/ledger.jsonl already holds the limit of calls (started calls count,
 # failed ones too); stage PROMPT_FILE root-only in the guest (/var/lib/oss-research-staging/<NAME>/task.txt,
 # root 0700/0600); run model_once.sh (egress pin for token, none for sentinel); show the log only
@@ -23,14 +34,15 @@
 # judge exits, harness SUMMARY, unit. It never retries and never edits a prompt or an answer.
 set -u
 LEDGER_DIR="$1"; NAME="$2"; PROMPT_FILE="$3"; C="$4"; KIND="$5"; CREDENTIAL="${6:-}"; CALL_PLAN="${7:-}"
+PARENT="${8:-}"
 case "$KIND" in token|sentinel) ;; *) echo "KIND must be token or sentinel" >&2; exit 2;; esac
 [[ "$NAME" =~ ^[a-z0-9][a-z0-9-]{0,40}$ ]] || { echo "NAME must be [a-z0-9-]" >&2; exit 2; }
 [ -f "$CREDENTIAL" ] && [ ! -L "$CREDENTIAL" ] || { echo "credential file missing" >&2; exit 2; }
 [ -f "$PROMPT_FILE" ] && [ ! -L "$PROMPT_FILE" ] || { echo "prompt file missing or a link" >&2; exit 2; }
-LIMIT=12; PLAN_SHA=null
+LIMIT=12; PLAN_SHA=null; CONTINUES=-; PARENT_SHA=-; PARENT_CALLS=-
 if [ $# -ge 7 ]; then
   [ -f "$CALL_PLAN" ] && [ ! -L "$CALL_PLAN" ] || { echo "call plan file missing or a link" >&2; exit 2; }
-  read -r LIMIT PLAN_SHA < <(PYTHONDONTWRITEBYTECODE=1 python3 -I -B - "$CALL_PLAN" <<'PY'
+  read -r LIMIT PLAN_SHA CONTINUES < <(PYTHONDONTWRITEBYTECODE=1 python3 -I -B - "$CALL_PLAN" <<'PY'
 import hashlib, json, sys
 data = open(sys.argv[1], "rb").read()
 def whole(v):
@@ -40,18 +52,56 @@ try:
     plan = stage["call_plan"]
     total = plan["max_model_calls"]
     parts = [plan[k] for k in ("shards", "lenses", "extract", "synthesis", "verify", "final")]
-    ok = all(whole(v) and v >= 0 for v in parts + [total]) and total >= 1 \
-        and plan["extract"] == plan["shards"] * plan["lenses"] and plan["final"] == 1 \
+    planned = plan["shards"] * plan["lenses"]
+    continues = "-"
+    if "continues" in plan:
+        # continue-plan: the extract calls were made under the parent ledger; only the later stages remain.
+        bound, done = plan["continues"]["extract_stage_sha256"], plan["continues"]["completed"]["extract"]
+        ok = plan["extract"] == 0 and whole(done) and done == planned >= 1 and type(bound) is str \
+            and len(bound) == 64 and all(c in "0123456789abcdef" for c in bound)
+        continues = bound
+    else:
+        ok = plan["extract"] == planned
+    ok = ok and all(whole(v) and v >= 0 for v in parts + [total]) and total >= 1 and plan["final"] == 1 \
         and total == plan["extract"] + plan["synthesis"] + plan["verify"] + plan["final"] \
         and stage.get("max_model_calls", total) == total and whole(stage.get("max_model_calls", total))
-except (ValueError, TypeError, KeyError):
+except (ValueError, TypeError, KeyError, AttributeError):
     ok = False
 if ok:
-    print(total, hashlib.sha256(data).hexdigest())
+    print(total, hashlib.sha256(data).hexdigest(), continues)
 PY
 )
   [ -n "$PLAN_SHA" ] && [ "$PLAN_SHA" != null ] || { echo "call plan malformed: $CALL_PLAN" >&2; exit 2; }
   [ "$LIMIT" -le 40 ] || { echo "call plan of $LIMIT calls is over the absolute cap 40" >&2; exit 2; }
+  if [ $# -ge 8 ]; then
+    [ "$CONTINUES" != - ] || { echo "a parent ledger needs a continue-plan call plan (call_plan.continues)" >&2; exit 2; }
+    read -r PARENT_CALLS PARENT_SHA < <(PYTHONDONTWRITEBYTECODE=1 python3 -I -B - "$PARENT" "$LEDGER_DIR" "$CONTINUES" <<'PY'
+import hashlib, json, os, sys
+parent, child, bound = sys.argv[1:4]
+def regular(path):
+    return os.path.isfile(path) and not os.path.islink(path)
+if not parent or os.path.islink(parent) or not os.path.isdir(parent) \
+        or os.path.realpath(parent) == os.path.realpath(child):
+    sys.exit("parent ledger directory missing, a link, or the ledger itself: %s" % parent)
+ledger, limit = os.path.join(parent, "ledger.jsonl"), os.path.join(parent, "ledger-limit.json")
+if not regular(ledger) or not regular(limit):
+    sys.exit("parent ledger directory must hold ledger.jsonl and ledger-limit.json: %s" % parent)
+try:
+    recorded = json.loads(open(limit).read())["call_plan_sha256"]
+except (ValueError, TypeError, KeyError):
+    sys.exit("parent ledger-limit.json unreadable: %s" % limit)
+if recorded != bound:
+    sys.exit("parent ledger is bound to call plan %s, this plan continues %s" % (recorded, bound))
+data = open(ledger, "rb").read()
+print(sum(b'"kind": "token"' in line for line in data.splitlines()), hashlib.sha256(data).hexdigest())
+PY
+)
+    [ -n "$PARENT_SHA" ] && [ "$PARENT_SHA" != - ] || { echo "parent ledger refused: $PARENT" >&2; exit 2; }
+    [ $((PARENT_CALLS + LIMIT)) -le 40 ] || {
+      echo "$PARENT_CALLS parent calls + $LIMIT is over the absolute cap 40" >&2; exit 2; }
+  elif [ "$CONTINUES" != - ]; then
+    echo "a continue-plan call plan needs its PARENT_LEDGER_DIR" >&2; exit 2
+  fi
 fi
 W=/Users/lee-kyu-hwan/.oss-research-vm
 L() { env -i HOME="$W/home" LIMA_HOME="$W/lima" TMPDIR="$W/tmp" PATH="$W/tool/bin:/usr/bin:/bin:/usr/sbin:/sbin" "$W/tool/bin/limactl" "$@"; }
@@ -60,10 +110,12 @@ S=/opt/oss-research/src-$C
 mkdir -p -m 0700 "$LEDGER_DIR"
 LEDGER="$LEDGER_DIR/ledger.jsonl"
 BOUND="$LEDGER_DIR/ledger-limit.json"
-PYTHONDONTWRITEBYTECODE=1 python3 -I -B - "$BOUND" "$LEDGER" "$LIMIT" "$PLAN_SHA" <<'PY' || exit 3
+PYTHONDONTWRITEBYTECODE=1 python3 -I -B - "$BOUND" "$LEDGER" "$LIMIT" "$PLAN_SHA" "$PARENT_SHA" "$PARENT_CALLS" <<'PY' || exit 3
 import json, os, sys
-bound, ledger, limit, sha = sys.argv[1:5]
+bound, ledger, limit, sha, parent_sha, parent_calls = sys.argv[1:7]
 now = {"limit": int(limit), "call_plan_sha256": None if sha == "null" else sha}
+if parent_sha != "-":
+    now["parent"] = {"ledger_sha256": parent_sha, "calls": int(parent_calls)}
 if os.path.lexists(bound):
     try:
         recorded = json.loads(open(bound).read()) if not os.path.islink(bound) else None
