@@ -772,7 +772,11 @@ class Run928InputTests(unittest.TestCase):
 
     Except the extract inputs: the bundle now states run_limits.json's count limits in them (#82). The
     analyzer's prompt without limits (the digest's) is still the evidence's byte for byte, and the bundle's
-    extract inputs are pinned by sha256 below."""
+    extract inputs are pinned by sha256 below.
+
+    And the final input: finalize.md now holds one more line, the rule that a quote keeps the source's double
+    quotes and backslashes (#82; the 2026-10-05 r5 final answer copied the JSON notation \\" into a quote).
+    Without that line the final input is still the evidence's byte for byte, and with it it is pinned below."""
 
     # sha256 of the bundle's extract inputs for this run, with the count rule of run_limits.json (5/20/20).
     EXTRACT_SHA256 = {
@@ -782,6 +786,9 @@ class Run928InputTests(unittest.TestCase):
         "review": "07136757ee204700abacbfdffe93405b58824cda12650352cec7f07abd50f2a7",
         "structure": "26c3c9e62d97ee463663e32eb6acc3f2a01d8c4aca28b44901b0efac9dae07d5",
     }
+
+    # sha256 of the bundle's final input for this run, with finalize.md's quote rule (60,093 B).
+    FINAL_SHA256 = "fa9f21f62b7f8553bdb373352e3a90fb0ab3dfd34171cb6ae5f9ffb263b43f4e"
 
     def setUp(self):
         self.root = Path(tempfile.mkdtemp())
@@ -828,7 +835,13 @@ class Run928InputTests(unittest.TestCase):
         code, _, stderr = stage("final-input", "--run-dir", self.run, "--synthesis", synthesis, *extract, *verify,
                                 "--out", str(self.root / "final"))
         self.assertEqual(code, 0, stderr)
-        self.same(self.root / "final/final/task.txt", self.analysis / "in-final/final/task.txt")
+        built = (self.root / "final/final/task.txt").read_bytes()
+        rule = [line for line in (HERE / "prompts" / "finalize.md").read_text(encoding="utf-8").splitlines(True)
+                if "JSON 표기" in line]
+        self.assertEqual(1, len(rule))
+        self.assertEqual((self.analysis / "in-final/final/task.txt").read_bytes(),
+                         built.replace(rule[0].encode("utf-8"), b"", 1))
+        self.assertEqual(self.FINAL_SHA256, hashlib.sha256(built).hexdigest())
 
 
 if __name__ == "__main__":

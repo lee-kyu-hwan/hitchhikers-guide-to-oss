@@ -71,13 +71,52 @@ CASES = [
 ]
 
 
+# A corpus sentence (npm-eslint-markdown#677 in corpus-min.json) that holds double quotes, and the same sentence
+# with each " written as the JSON notation \" (what the 2026-10-05 r5 final answer did): still refused, never
+# normalized, and the R5 detail says the quote carries a JSON escape (#82).
+SOURCE = 'Sourced from <a href="https://github.com/editorconfig-checker/editorconfig-checker.javascript/releases">'
+BACKSLASHED = SOURCE.replace('"', '\\"')
+
+
+def final_quoting(quote):
+    answer = json.loads(json.dumps(kinds.GOOD["final"]))
+    answer["patterns"][0]["confidence"]["evidence"] = ['%s "%s"' % (kinds.PR_OF[KEY], quote)]
+    return answer
+
+
+ESCAPE_CASES = [
+    # label, answer quote, listed quote (None: no --input-scope), code, statuses, R5 detail holds "JSON escape"
+    ("escape/the source text with its double quotes passes", SOURCE, SOURCE, 0, {"R5": "PASS", "Q1": "PASS"}, False),
+    ("escape/a backslash before each double quote fails and the reason says so", BACKSLASHED, SOURCE, 1,
+     {"R5": "FAIL", "class": "invalid"}, True),
+    ("escape/an unlisted quote fails without the escape reason", SOURCE, "another verified sentence", 1,
+     {"R5": "FAIL"}, False),
+    ("escape/without a scope the escaped quote fails the corpus check", BACKSLASHED, None, 1, {"Q1": "FAIL"}, None),
+]
+
+
+def run_escape_case(quote, listed, code, expect, escape_reason):
+    with tempfile.TemporaryDirectory(prefix="e2e-escape-") as t:
+        tmp = Path(t)
+        extra = [] if listed is None else scope(tmp, keys=KEYS, quotes=[{"pr": KEY, "quote": listed}])
+        rc, items, doc = kinds.verdict(tmp, kinds.make(tmp, "final", answer=final_quoting(quote)), "final", extra)
+        detail = next((i["detail"] for i in doc.get("items", []) if i["id"] == "R5-input-scope"), "")
+        ok = rc == code and all(items.get(k) == v for k, v in expect.items()) \
+            and (escape_reason is None or ("JSON escape" in detail) == escape_reason)
+        return ok, rc, {**{k: items.get(k) for k in expect}, "R5 detail": detail[:90]}
+
+
 def main():
     fails = 0
     for label, kind, answer, scope_args, code, expect in CASES:
         ok, rc, got = run_case(kind, answer, scope_args, code, expect)
         fails += not ok
         print("%s %s rc=%d %s" % ("PASS" if ok else "FAIL", label, rc, got))
-    print("cases=%d failures=%d (mock, corpus %s)" % (len(CASES), fails, kinds.CORPUS.name))
+    for label, quote, listed, code, expect, escape_reason in ESCAPE_CASES:
+        ok, rc, got = run_escape_case(quote, listed, code, expect, escape_reason)
+        fails += not ok
+        print("%s %s rc=%d %s" % ("PASS" if ok else "FAIL", label, rc, got))
+    print("cases=%d failures=%d (mock, corpus %s)" % (len(CASES) + len(ESCAPE_CASES), fails, kinds.CORPUS.name))
     return 1 if fails else 0
 
 

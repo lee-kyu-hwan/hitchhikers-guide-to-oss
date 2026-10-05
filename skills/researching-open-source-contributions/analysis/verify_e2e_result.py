@@ -318,8 +318,18 @@ def scope_problems(kind: str, answer: dict, quote_doc: dict, scope: dict) -> lis
         return ["names PRs whose section was not in its prompt: " + ", ".join(outside)] if outside else []
     allowed = {(item["pr"], item["quote"]) for item in scope.get("quotes", [])}
     outside = [item for item in quote_doc["quotes"] if (item["pr"], item["quote"]) not in allowed]
-    return ["%d pattern quote(s) are not among the verified quotes its input listed (first: %s %r)"
-            % (len(outside), outside[0]["pr"], outside[0]["quote"][:60])] if outside else []
+    if not outside:
+        return []
+    problems = ["%d pattern quote(s) are not among the verified quotes its input listed (first: %s %r)"
+                % (len(outside), outside[0]["pr"], outside[0]["quote"][:60])]
+    # Only a reason, never a match: a quote that equals a listed one once its JSON escapes are taken out still
+    # fails (the r5 final answer wrote \" for a source "; #82).
+    escaped = [item for item in outside
+               if (item["pr"], item["quote"].replace('\\"', '"').replace("\\\\", "\\")) in allowed]
+    if escaped:
+        problems.append("%d of them carry a JSON escape (\\\" or \\\\) the source text does not have (first: %s %r)"
+                        % (len(escaped), escaped[0]["pr"], escaped[0]["quote"][:60]))
+    return problems
 
 
 def verify(run_dir: Path, corpus: Path, prompt: Path, limits: dict, kind: str = "extract",

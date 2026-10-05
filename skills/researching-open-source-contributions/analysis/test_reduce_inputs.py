@@ -283,9 +283,11 @@ class SynthesisTests(ReducedCase):
         self.assertFalse((self.root / "over").exists())
 
     def test_too_many_groups_and_an_answer_too_large_alone_are_refused_before_anything_is_written(self):
-        cap = self.cap_for_groups(11, 1000)
+        # pad 1200 (was 1000): the escape rule made finalize-reduced.md longer, and at the 11-group cap of pad 1000
+        # (9,850 B) the final projection (template, PR index, quotes; no pad) came first at 9,881 B (#82).
+        cap = self.cap_for_groups(11, 1200)
         with mock.patch.object(stage_inputs, "PROMPT_MAX_BYTES", cap):       # single-answer groups: more than the limit of 8
-            _, stderr = self.stage("synthesis-input", "--run-dir", self.run, *self.extract_args(1000),
+            _, stderr = self.stage("synthesis-input", "--run-dir", self.run, *self.extract_args(1200),
                                    "--out", str(self.root / "many"), code=2)
             self.assertIn("need 11 synthesis groups, over the limit of 8", stderr)
             self.assertFalse((self.root / "many").exists())
@@ -675,6 +677,20 @@ class MinimalFinalTests(LensQuoteCase):
                           *[item for path in verify for item in ("--verify-result", path)],
                           "--out", str(self.root / out), code=code)
 
+    def quote_report(self, text):
+        """The final input's quote report: one JSON line per key, the verified quotes as source text (#82)."""
+        head = "=== 인용 확인 보고서 ===\n"
+        start = text.index(head) + len(head)
+        body = text[start:text.index("\n=== 인용 확인 보고서 끝 ===", start)]
+        report = {}
+        for line in body.split("\n"):
+            if line.startswith("verified_evidence:"):
+                break
+            key, value = line.split(": ", 1)
+            report[key] = json.loads(value)
+        report["verified_evidence"] = stage_inputs.parse_quote_lines(body)
+        return report
+
     def first_quote(self, key, broken=()):
         """The first verified extract quote of a key: stems in order (blind first), each answer in its own order."""
         for stem in self.context.extract_stems():
@@ -687,7 +703,7 @@ class MinimalFinalTests(LensQuoteCase):
         built = self.built()
         summary, _ = self.final(built)
         text = self.prompt("f", "final", "task.txt")
-        report = self.section(text, "인용 확인 보고서")
+        report = self.quote_report(text)
         keys = self.keys()
         expected = []
         for key in (keys[0], keys[1], keys[2], keys[3], keys[5]):           # C1 then C2, each PR once
@@ -710,7 +726,7 @@ class MinimalFinalTests(LensQuoteCase):
         keys = self.keys()
         built = self.built(broken={(lens, keys[5]) for lens in LENSES})
         self.final(built)
-        report = self.section(self.prompt("f", "final", "task.txt"), "인용 확인 보고서")
+        report = self.quote_report(self.prompt("f", "final", "task.txt"))
         self.assertEqual([{"candidate": "C2", "pr": keys[5]}], report["no_quote"])
         self.assertNotIn(keys[5], [item["pr"] for item in report["verified_evidence"]])
 

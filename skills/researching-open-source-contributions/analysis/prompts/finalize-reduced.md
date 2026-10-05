@@ -1,6 +1,6 @@
 너는 분석 결과를 확정하는 조정자다. 아래 PR 색인, 인용 확인 보고서, 후보, 반박 검증 결과만 근거로 PR 별 판단과 채택 패턴을 쓴다. 파일을 더 찾거나 다른 자료를 쓰지 마라.
 
-이번 입력에는 PR 본문·diff·코멘트가 없다(PR 이 많아 한 호출에 들어가지 않는다). PR 색인(키·PR-* id·저장소·번호·제목·outcome·변경 파일 수·URL)과 인용 확인 보고서의 `verified_evidence`에 있는 것만 사실(`fact`)로 쓴다. `verified_evidence` 는 후보가 가리킨 PR 하나마다 추출 단계에서 원문과 대조된 첫 인용 1개와, 반박 검증 답이 인용해 원문과 대조된 인용 전부다. 추출 단계에 확인된 인용이 없는 (후보, PR)은 `no_quote` 에 적었다(인용 없음, 그 PR 은 확인된 근거가 아니다). 그 밖의 내용은 지어내지 말고 `basis` 를 `inference` 나 `unknown` 으로 둔다. 인용은 `verified_evidence` 의 `quote` 를 글자 그대로 복사한 것만 쓴다. 거기 없는 문장은 인용이 될 수 없다.
+이번 입력에는 PR 본문·diff·코멘트가 없다(PR 이 많아 한 호출에 들어가지 않는다). PR 색인(키·PR-* id·저장소·번호·제목·outcome·변경 파일 수·URL)과 인용 확인 보고서의 `verified_evidence`에 있는 것만 사실(`fact`)로 쓴다. `verified_evidence` 는 후보가 가리킨 PR 하나마다 추출 단계에서 원문과 대조된 첫 인용 1개와, 반박 검증 답이 인용해 원문과 대조된 인용 전부다. 추출 단계에 확인된 인용이 없는 (후보, PR)은 `no_quote` 에 적었다(인용 없음, 그 PR 은 확인된 근거가 아니다). 그 밖의 내용은 지어내지 말고 `basis` 를 `inference` 나 `unknown` 으로 둔다. `verified_evidence` 는 항목마다 머리줄 `- PR-* 키` 다음 줄부터 다음 머리줄 전까지가 원문 인용 그대로다(JSON 이스케이프 없음). 인용은 그 원문을 글자 그대로 복사한 것만 쓴다. 거기 없는 문장은 인용이 될 수 없다.
 
 네가 쓰는 것은 판단 필드뿐이다. corpus 레코드, `files_changed`, `evidence_manifest`, `license_spdx`, revision·시각, 패턴의 `generated_by`·`source_licenses`·history 는 호스트가 corpus 에서 기계적으로 채운다. **이 필드들을 출력하면 거부된다.**
 
@@ -24,6 +24,7 @@ PR 별 판단(`records`, 아래 PR 목록의 모든 `pr_id` 를 정확히 한 �
 - `pattern_id` 는 `PAT-001` 부터 순서대로, `description` 은 검증자의 `revised_statement` 다.
 - `evidence_pr_ids` 는 뒷받침하는 PR 의 PR-* id 다.
 - `confidence.evidence` 에는 근거 PR 마다 `PR-001 "<확인된 인용 그대로>"` 형태의 항목을 하나 이상 넣는다. 인용은 `verified_evidence` 에서 글자 그대로 복사한다. 근거 PR 이 아닌 PR 은 인용하지 마라.
+- 인용 안의 큰따옴표 `"` 와 백슬래시 `\` 는 원문 글자 그대로다. 인용 확인 보고서의 인용은 원문 그대로 적혀 있다. 후보·반박 검증 같은 JSON 블록에 보이는 `\"`·`\\` 는 JSON 표기일 뿐 원문 글자가 아니므로 인용에 옮기지 마라. 출력도 JSON 이므로 JSON 문자열 규칙대로 한 번만 이스케이프한다. 예: 원문이 `set the "strict" option` 이면 출력 JSON 에는 `"PR-001 \"set the \"strict\" option\""` 로 쓴다(디코드하면 `PR-001 "set the "strict" option"`). `\\\"strict\\\"` 처럼 백슬래시를 인용 글자로 남기면 그 인용은 원문과 달라 답 전체가 거부된다.
 - `applicability`, `counterconditions`, `search_clues`, `expected_tests`, `maintainer_judgment_required` 는 문자열 배열이다.
 - `provenance_mode` 는 `independent-reimplementation` 이다.
 - **채택할 후보가 없으면 `patterns` 는 빈 배열이다. 이것은 정상 결과다.**

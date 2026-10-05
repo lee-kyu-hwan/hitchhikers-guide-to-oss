@@ -22,6 +22,7 @@ PR 별 판단(`records`, 아래 PR 목록의 모든 `pr_id` 를 정확히 한 �
 - `pattern_id` 는 `PAT-001` 부터 순서대로, `description` 은 검증자의 `revised_statement` 다.
 - `evidence_pr_ids` 는 뒷받침하는 PR 의 PR-* id 다.
 - `confidence.evidence` 에는 근거 PR 마다 `PR-001 "<확인된 인용 그대로>"` 형태의 항목을 하나 이상 넣는다. 인용은 `verified_evidence` 에서 글자 그대로 복사한다. 근거 PR 이 아닌 PR 은 인용하지 마라.
+- 인용 안의 큰따옴표 `"` 와 백슬래시 `\` 는 원문 글자 그대로다(다이제스트에 보이는 글자). 인용 확인 보고서·후보·반박 검증 같은 JSON 블록에 보이는 `\"`·`\\` 는 JSON 표기일 뿐 원문 글자가 아니므로 인용에 옮기지 마라. 출력도 JSON 이므로 JSON 문자열 규칙대로 한 번만 이스케이프한다. 예: 원문이 `set the "strict" option` 이면 출력 JSON 에는 `"PR-001 \"set the \"strict\" option\""` 로 쓴다(디코드하면 `PR-001 "set the "strict" option"`). `\\\"strict\\\"` 처럼 백슬래시를 인용 글자로 남기면 그 인용은 원문과 달라 답 전체가 거부된다.
 - `applicability`, `counterconditions`, `search_clues`, `expected_tests`, `maintainer_judgment_required` 는 문자열 배열이다.
 - `provenance_mode` 는 `independent-reimplementation` 이다.
 - **채택할 후보가 없으면 `patterns` 는 빈 배열이다. 이것은 정상 결과다.**

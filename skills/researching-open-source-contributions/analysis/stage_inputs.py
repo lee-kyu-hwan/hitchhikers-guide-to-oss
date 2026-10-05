@@ -393,14 +393,52 @@ def final_prompt_text(context: "Context", candidates: list, verify: dict, report
     return legacy_final_prompt_text(context, candidates, verify, report)
 
 
+QUOTE_HEAD = re.compile(r"- (PR-[0-9]+) (\S+)")
+
+
+def quote_report_text(report: dict) -> str:
+    """The quote report of the extraction-only final input, its verified quotes as the source text.
+
+    In a JSON block a source " reads \\" and a source \\ reads \\\\; the 2026-10-05 r5 final answer copied that
+    notation into a quote, which then matched neither its input nor the corpus (#82). So every key but
+    verified_evidence stays one JSON line, and each verified quote is a head line ``- <PR-* id> <key>`` followed
+    by the quote exactly as the source has it. A quote whose lines could be read another way (a line that looks
+    like a head line, or a trailing newline) is refused, never cut or re-quoted."""
+    lines = ["%s: %s" % (key, json.dumps(value, ensure_ascii=False))
+             for key, value in report.items() if key != "verified_evidence"]
+    lines.append("verified_evidence: 항목마다 머리줄 `- <PR-* id> <키>` 다음 줄부터 다음 머리줄 전까지가 원문 인용 "
+                 "그대로다(JSON 이스케이프 없음).")
+    for item in report["verified_evidence"]:
+        quote = item["quote"]
+        if not quote or quote.endswith("\n") or any(QUOTE_HEAD.fullmatch(line) for line in quote.split("\n")):
+            raise StageError("verified quote of %s cannot be listed unambiguously as source text; refused, not cut"
+                             % item["pr"])
+        lines += ["- %s %s" % (item["pr_id"], item["pr"]), quote]
+    return "\n".join(lines)
+
+
+def parse_quote_lines(text: str) -> list:
+    """The verified quotes of a quote_report_text block, in order: [{"pr_id", "pr", "quote"}]."""
+    found, current = [], None
+    for line in text.split("\n"):
+        head = QUOTE_HEAD.fullmatch(line)
+        if head:
+            current = {"pr_id": head.group(1), "pr": head.group(2), "lines": []}
+            found.append(current)
+        elif current is not None:
+            current["lines"].append(line)
+    return [{"pr_id": item["pr_id"], "pr": item["pr"], "quote": "\n".join(item["lines"])} for item in found]
+
+
 def reduced_final_prompt_text(context: "Context", candidates: list, verify: dict, report: dict) -> str:
-    """Extraction-only final: the PR index, the candidates, the verify answers and the verified quotes."""
+    """Extraction-only final: the PR index, the candidates, the verify answers and the verified quotes
+    (as the source text, quote_report_text)."""
     text = read_bounded(PROMPTS / "finalize-reduced.md", PROMPT_MAX_BYTES, "finalize template").decode("utf-8")
     text += block("PR 색인", context.pr_index())
     text += block("후보", candidates)
     for stem in sorted(verify):
         text += block("반박 검증 " + stem, verify[stem])
-    text += block("인용 확인 보고서", report)
+    text += block("인용 확인 보고서", quote_report_text(report))
     return text
 
 
