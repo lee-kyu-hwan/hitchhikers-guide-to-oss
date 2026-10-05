@@ -36,6 +36,9 @@
 #                so the counts above are the whole chain. A parent another ledger already continues is refused
 #                (exit 2: continue the latest ledger instead); a later call finding the claim changed, removed
 #                or a link is refused (exit 3).
+#                An assess plan (stage_inputs.py assess-inputs, #259: stage "assess", call_plan mode "assess" with
+#                assess = max_model_calls >= 1 and none of the analysis stage keys) binds a new ledger the same
+#                way; it continues no parent (exit 2 with PARENT_LEDGER_DIR).
 #
 # Steps: refuse when LEDGER_DIR/ledger.jsonl already holds the limit of calls (started calls count,
 # failed ones too); stage PROMPT_FILE root-only in the guest (/var/lib/oss-research-staging/<NAME>/task.txt,
@@ -63,6 +66,16 @@ try:
     stage = json.loads(data)
     plan = stage["call_plan"]
     total = plan["max_model_calls"]
+    if stage.get("stage") == "assess":
+        # an assess-inputs plan: one candidate assessment call per discovery, no analysis stage key.
+        # A tuple, not a set literal: bash 3.2 brace-expands a comma list in braces inside this process substitution.
+        analysis_keys = ("shards", "lenses", "extract", "synthesis", "verify", "final", "continues")
+        ok = plan.get("mode") == "assess" and set(plan).isdisjoint(analysis_keys) and whole(plan["assess"]) \
+            and whole(total) and plan["assess"] >= 1 and total == plan["assess"] \
+            and whole(stage.get("max_model_calls")) and stage["max_model_calls"] == total
+        if ok:
+            print(total, hashlib.sha256(data).hexdigest(), "-", "-")
+        sys.exit(0)
     parts = [plan[k] for k in ("shards", "lenses", "extract", "synthesis", "verify", "final")]
     planned = plan["shards"] * plan["lenses"]
     continues, chain = "-", "-"

@@ -200,7 +200,7 @@ class GateTextTests(unittest.TestCase):
         for closed in ("staged runs (deep-research, Agent, search)", "a model run with a relay", "the whole macOS path",
                        "No isolated entry has made the candidate reads (discovery, locus-search) against real data",
                        "the curated collector has no isolated entry",
-                       "no path returns an assessment from an isolated model"):
+                       "no isolated model has returned an assessment yet"):
             self.assertGreater(skill.index(closed), skill.index("**Closed or unverified.**"), closed)
         self.assertIn("General Issue sources (`issues`) are `pending-unsupported`. An isolated Issue collection entry "
                       "exists, but its output is not connected to this workflow", skill)
@@ -214,7 +214,7 @@ class GateTextTests(unittest.TestCase):
         expected = {
             "`auto`": "closed", "staged runs (deep-research, Agent, search)": "closed", "model run with a relay": "closed",
             "macOS, every launch": "closed", "candidate reads (discover, locus-search)": "no isolated entry",
-            "curated tracker collection": "no isolated entry", "assessment from an isolated model": "no path",
+            "curated tracker collection": "no isolated entry", "assessment from an isolated model": "no run",
         }
         for path, state in expected.items():
             self.assertTrue(rows[path].startswith(state), (path, rows[path]))
@@ -485,11 +485,19 @@ class ReuseAndResumeTests(unittest.TestCase):
         self.assertIn("No isolated entry has run this step against real data yet", step["note"])
         discovery, manifest = flow.discover()
         flow.ok("adopt-discovery", "--discovery", str(discovery), "--manifest", str(manifest))
-        assessment, locus = flow.status()["next"]
-        self.assertEqual(("assessment", "awaiting-ai"), (assessment["stage"], assessment["kind"]))
-        self.assertIn("No isolated path returns an assessment yet", assessment["detail"])
+        # assess -> locus-search -> record (#259), all plan data.
+        assessment, locus, record = flow.status()["next"]
+        self.assertEqual(("assessment", "awaiting-ai", False),
+                         (assessment["stage"], assessment["kind"], assessment["executed"]))
+        self.assertEqual(["stage_inputs.py", "assess-inputs", "--analysis", "stages/analysis/gen-001/analysis.json",
+                          "--discovery", "stages/discovery/gen-001/discovery.json", "--out", "<HOST_INPUT>/assess"],
+                         assessment["argv"])
+        self.assertIn("No isolated model has returned an assessment yet", assessment["detail"])
+        self.assertIn("verify_e2e_result.py --answer-kind assess", assessment["then"])
         self.assertEqual(("locus-search", False), (locus["stage"], locus["executed"]))
         self.assertIn("No isolated entry has run this step against real data yet", locus["note"])
+        self.assertEqual(("record", "local", False, "record --assessment ... --origin ai"),
+                         (record["stage"], record["kind"], record["executed"], record["command"]))
 
     def test_changed_input_needs_replace_and_invalidates_downstream(self):
         flow = Flow(self)

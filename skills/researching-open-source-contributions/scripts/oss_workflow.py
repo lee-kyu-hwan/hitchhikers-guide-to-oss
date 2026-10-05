@@ -1751,16 +1751,28 @@ def next_steps(run: Run, request: dict, state: dict) -> List[dict]:
     if discovery["status"] == "no-candidates":
         return []
     if active(state, "locus-search") is None:
+        # assess -> locus-search -> record (#259): the assess input is the analysis bundle's (stage_inputs.py,
+        # docs/research/oss-e2e-2026-09-28), answered by one isolated model call and checked strictly before adoption.
         return [{"stage": "assessment", "kind": "awaiting-ai", "executed": False,
+                 "argv": ["stage_inputs.py", "assess-inputs",
+                          "--analysis", "stages/analysis/gen-%03d/analysis.json" % analysis["generation"],
+                          "--discovery", "stages/discovery/gen-%03d/discovery.json" % discovery["generation"],
+                          "--out", "<HOST_INPUT>/assess"],
                  "detail": "the assessment of stages/discovery/gen-%03d is AI research and never runs in this "
-                           "session. No isolated path returns an assessment yet; only an assessment that already "
-                           "exists can be recorded" % discovery["generation"]},
+                           "session: one isolated model call answers the assess input, through the research "
+                           "launcher's one measured read-only launch with the user's approval. No isolated model has "
+                           "returned an assessment yet; only an assessment that already exists can be recorded"
+                           % discovery["generation"],
+                 "then": "verify_e2e_result.py --answer-kind assess --discovery ... --input-scope ... --adopt-to "
+                         "... (a ready status passes only with --locus-search of its loci); only the adopted "
+                         "answer is the assessment"},
                 {"stage": "locus-search", "kind": "external-network-step", "executed": False, "note": unverified_note,
                  "argv": ["verify_candidates.py", "locus-search", "--discovery", "stages/discovery/gen-%03d/discovery.json" % discovery["generation"],
                           "--assessment", "<assessment.json>", "--output", "<ISOLATED_OUTPUT>/locus-search.json",
                           "--manifest", "<copy of stages/discovery/gen-%03d/manifest.json>" % discovery["generation"],
                           "--request-budget", str(target["locus_request_budget"])],
-                 "then": "adopt-locus-search --locus-search ... --manifest ..."}]
+                 "then": "adopt-locus-search --locus-search ... --manifest ..."},
+                {"stage": "record", "kind": "local", "executed": False, "command": "record --assessment ... --origin ai"}]
     if active(state, "record") is None:
         return [{"stage": "record", "kind": "local", "executed": False, "command": "record --assessment ... --origin ai"}]
     return []

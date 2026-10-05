@@ -46,8 +46,10 @@ reports. It never opens a network connection or starts a process.
   with a relay, and the whole macOS path (a setsid-escaped descendant
   survives cleanup, and Keychain isolation is unverified). No isolated entry
   has made the candidate reads (discovery, locus-search) against real data,
-  the curated collector has no isolated entry, and no path returns an
-  assessment from an isolated model. Never treat these as available. A fake
+  the curated collector has no isolated entry, and no isolated model has
+  returned an assessment yet (the analysis bundle's assess input and strict
+  check exist, but have not run against real data). Never treat these as
+  available. A fake
   success manifest from a probe is not a model result.
 - **No writes or side lookups.** Make no GitHub writes. Make no ad hoc HTTP
   lookups outside the stage scripts: such a lookup is not part of the recorded
@@ -88,7 +90,10 @@ reports. It never opens a network connection or starts a process.
    writes `PAT-*`. An analysis with no current pattern is a normal
    `insufficient` result.
 5. Adopt discovery and locus-search outputs from the isolated process with
-   `adopt-discovery` and `adopt-locus-search`. Adopt its assessment through
+   `adopt-discovery` and `adopt-locus-search`. The order is assessment,
+   locus-search, record: the assessment is one isolated model call on the
+   analysis bundle's assess input, adopted only after its strict check passes
+   (the verifier's record gate included). Adopt it through
    `record --assessment X --origin ai [--policy-evidence P]`. `record` runs
    the verifier's own gate offline. When the caller names no target, write
    `"target": null`: the run collects and analyzes only, the three candidate

@@ -4,6 +4,8 @@
   verify_e2e_result.py --run-dir RUN --corpus CORPUS --prompt TASK
       [--answer-kind extract|synthesis|verify|final] [--lens LENS] [--expect-id CANDIDATE]
       [--limits LIMITS] [--out VERDICT] [--adopt-to ANSWER.result.json] [--input-scope SCOPE.json]
+  verify_e2e_result.py --run-dir RUN --discovery DISCOVERY --prompt TASK --answer-kind assess
+      --input-scope assess.scope.json [--policy-evidence P] [--locus-search L] [--limits ...] [--out ...] [--adopt-to ...]
 
 Every model call of the E2E (5 extract, 1 synthesis, k verify, 1 final) goes
 through this same check. The worker contract (C, P, S, M, R0-R2) is identical
@@ -26,6 +28,15 @@ keys the input held], "quotes": [{"pr": key, "quote": text}] (final only)}. A
 synthesis answer may cite only those keys, a verify answer may only name those PRs,
 and every pattern quote of a final answer must be one of the listed pairs, exactly.
 This only adds a check (item R5); the corpus checks stay. Without it nothing changes.
+
+An assess answer (#259) is the candidate verifier's assessment document for the combinations of one discovery
+(stage_inputs.py assess-inputs). It has no corpus and no quote: C1 reads --discovery (its sha256 must be the scope's),
+R3 is the verifier's own assessment shape plus the scope's combinations, A1 binds discovery_sha256, R5 keeps every
+link inside the scope's links, A2 keeps every policy digest inside the policy bytes the input held (key, source,
+sha256), C2 binds --policy-evidence to the file the input was built with, A3 runs the verifier's own record gate
+in process (import, network refused) on the same discovery, the answer bytes, that policy evidence and, when given,
+--locus-search, and A4 refuses what the call cannot have done (execution evidence, an executed reproduction, a
+private reference outside private-report-ready). A URL in free text counts as a link for R5. A ready status passes A3 only with the locus search of its locus (see README 3.6).
 
 A final answer's search_clues (item R6, #82) must be strings the candidate verifier can put into GitHub search
 as they are: its discover quotes each clue into repo:<target> "<clue>" (issue, PR and code searches) and drops a
@@ -70,7 +81,10 @@ manifest as INFO; they are not the gate for which model ran.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
+import importlib.util
+import io
 import json
 import os
 from pathlib import Path
@@ -94,7 +108,9 @@ ROLES = {"supports", "counterexample"}
 PATTERN_KEYS = {"title", "description", "kind", "evidence", "applicability", "counterconditions",
                 "search_clues", "expected_tests", "maintainer_judgment_required", "confidence",
                 "confidence_reason"}
-KINDS = ("extract", "synthesis", "verify", "final")
+KINDS = ("extract", "synthesis", "verify", "final", "assess")
+VERIFIER = REPO / "dot_codex/skills/verifying-open-source-contribution-candidates/scripts/verify_candidates.py"
+DISCOVERY_MAX_BYTES = 4 << 20
 VERIFY_KEYS = {"id", "verdict", "evidence_checks", "counterexamples", "distinct_prs", "distinct_repos",
                "actionable", "actionable_reason", "confidence", "revised_statement"}
 FINAL_KEYS = {"records", "patterns", "extraction_ledger", "limitations"}
@@ -108,6 +124,8 @@ STAGE_OWNER = {
     "verify": "next: stage_inputs.py final-input (id binding, answer size, prompt budget)",
     "final": "next: stage_inputs.py assemble (judgment-field schema, deterministic-field refusal, "
              "record identity) and validate_corpus --analysis-output",
+    "assess": "next: verify_candidates.py locus-search on the adopted answer, workflow adopt-locus-search, then "
+              "record --assessment ... --origin ai (the workflow runs the record gate again)",
 }
 
 
@@ -378,25 +396,255 @@ def scope_problems(kind: str, answer: dict, quote_doc: dict, scope: dict) -> lis
     return problems
 
 
+def load_verifier():
+    """The candidate verifier, by its fixed repository path (never from input data); one copy per process."""
+    existing = sys.modules.get("verify_candidates")
+    if existing is not None and os.path.realpath(getattr(existing, "__file__", "")) == os.path.realpath(VERIFIER):
+        return existing
+    spec = importlib.util.spec_from_file_location("verify_candidates", VERIFIER)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["verify_candidates"] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def assess_problems(answer: object, scope: dict, vc) -> list:
+    """R3 of an assess answer: the verifier's assessment document shape, and the combinations of its input."""
+    if not isinstance(answer, dict) or set(answer) != {"schema_version", "discovery_sha256", "assessments"}:
+        return ["keys must be exactly schema_version, discovery_sha256, assessments"]
+    problems = []
+    if answer["schema_version"] != "1.0.0":
+        problems.append("schema_version must be 1.0.0")
+    if not isinstance(answer["discovery_sha256"], str):
+        problems.append("discovery_sha256 must be a string")
+    items = answer["assessments"]
+    if not isinstance(items, list) or not items or len(items) > scope["max_assessments"]:
+        return problems + ["assessments must be a list of 1 to %d" % scope["max_assessments"]]
+    combinations = {(item["pattern_id"], item["repository"]) for item in scope["combinations"]}
+    seen = set()
+    for index, item in enumerate(items):
+        problems.extend(vc._assessment_shape_violations(item, "assessments[%d]" % index))
+        if isinstance(item, dict):
+            combination = (item.get("pattern_id"), item.get("repository"))
+            if not all(isinstance(value, str) for value in combination):
+                continue        # the verifier's shape check above already names the field
+            if combination not in combinations:
+                problems.append("assessments[%d] assesses %s x %s, not a combination of its input"
+                                % ((index,) + combination))
+            seen.add(combination)
+    missing = sorted(combinations - seen)
+    if missing:
+        problems.append("no assessment for " + ", ".join("%s x %s" % item for item in missing))
+    return problems
+
+
+def assess_links(item: dict) -> list:
+    """Every link an assessment cites: all its evidence_links and the duplicate verdict's matched items."""
+    links = list(item.get("evidence_links") or [])
+    for group in ("readiness_checks", "policy_checks"):
+        values = item.get(group)
+        for value in (values.values() if isinstance(values, dict) else []):
+            if isinstance(value, dict) and isinstance(value.get("evidence_links"), list):
+                links += value["evidence_links"]
+    for name, key in (("reproduction", "evidence_links"), ("duplicate_verdict", "matched_items")):
+        value = item.get(name)
+        if isinstance(value, dict) and isinstance(value.get(key), list):
+            links += value[key]
+    return links
+
+
+URL_IN_TEXT = re.compile(r"https?://[^\s\"'<>()\[\]{}`]+")
+
+
+def text_values(value) -> list:
+    """Every string anywhere in a value (free text included)."""
+    if isinstance(value, dict):
+        return [text for item in value.values() for text in text_values(item)]
+    if isinstance(value, list):
+        return [text for item in value for text in text_values(item)]
+    return [value] if isinstance(value, str) else []
+
+
+def assess_scope_problems(answer: dict, scope: dict) -> tuple:
+    """(R5: links outside the input, A2: policy bytes outside the input). Exact match only, as R5 of final.
+
+    A link field must hold strings its input listed. A URL anywhere else in the assessment (summary, notes, public
+    steps, the private reference) is a link too, and must be one its input listed. A policy value names a source
+    only for ``found: true``, and then (key, source, sha256) must be bytes its input held."""
+    allowed_links = set(scope["links"])
+    allowed_policy = {(item["key"], item["source"], item["sha256"]) for item in scope["policy"]}
+    links, policy = [], []
+    for index, item in enumerate(answer["assessments"]):
+        cited = assess_links(item)
+        typed = [link for link in cited if not isinstance(link, str)]
+        if typed:
+            links.append("assessments[%d] has %d link value(s) that are not strings" % (index, len(typed)))
+        outside = [link for link in cited if isinstance(link, str) and link not in allowed_links]
+        for text in text_values(item):
+            if text in allowed_links:
+                continue
+            outside += [url.rstrip(".,;:!?") for url in URL_IN_TEXT.findall(text)
+                        if url.rstrip(".,;:!?") not in allowed_links]
+        outside = list(dict.fromkeys(outside))
+        if outside:
+            links.append("assessments[%d] cites %d link(s) its input did not hold: %s"
+                         % (index, len(outside), ", ".join(repr(link) for link in outside[:3])))
+        checks = item.get("policy_checks")
+        for key, value in sorted(checks.items() if isinstance(checks, dict) else []):
+            if not isinstance(value, dict):
+                continue
+            source, sha = value.get("source"), value.get("sha256")
+            if value.get("found") is not True and source is not None:
+                policy.append("assessments[%d].policy_checks.%s names a source (%r) but was not found; only found: "
+                              "true names one" % (index, key, source))
+            if sha is None:
+                continue
+            if key == "program_rules":
+                policy.append("assessments[%d].policy_checks.program_rules names a digest; the input held no "
+                              "program rules" % index)
+            elif not isinstance(source, str) or not isinstance(sha, str) or (key, source, sha) not in allowed_policy:
+                policy.append("assessments[%d].policy_checks.%s names policy bytes its input did not hold "
+                              "(source %r, sha256 %r)" % (index, key, source, sha))
+    return links, policy
+
+
+def assess_rule_problems(answer: dict) -> list:
+    """A4: what one assessment call cannot have done. It executed nothing (no execution evidence, no executed
+    reproduction) and held no private evidence (a private reference only for private-report-ready)."""
+    problems = []
+    for index, item in enumerate(answer["assessments"]):
+        if item.get("execution_evidence") is not None:
+            problems.append("assessments[%d].execution_evidence must be null: the assess call executed nothing" % index)
+        reproduction = item.get("reproduction")
+        if isinstance(reproduction, dict) and reproduction.get("method") == "executed":
+            problems.append("assessments[%d].reproduction.method executed: the assess call executed nothing" % index)
+        if item.get("private_evidence_reference") is not None and item.get("status") != "private-report-ready":
+            problems.append("assessments[%d].private_evidence_reference must be null outside private-report-ready"
+                            % index)
+    return problems
+
+
+def record_gate(vc, discovery: Path, answer: bytes, policy_evidence, locus_search) -> tuple:
+    """The verifier's own record gate on the same inputs, in process, writing only to a scratch directory.
+    Returns (ok, detail); the detail is the verifier's own message."""
+    def refuse(*args, **kwargs):
+        raise OSError("the record gate opens no network connection")
+
+    with tempfile.TemporaryDirectory(prefix="e2e-assess-gate-") as tmp:
+        document = Path(tmp) / "assessment.json"
+        document.write_bytes(answer)
+        argv = ["record", "--discovery", str(discovery), "--assessment", str(document),
+                "--output", str(Path(tmp) / "candidates.json"), "--manifest", str(Path(tmp) / "manifest.json")]
+        if policy_evidence is not None:
+            argv += ["--policy-evidence", str(policy_evidence)]
+        if locus_search is not None:
+            argv += ["--locus-search", str(locus_search)]
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            try:
+                code = vc.main(argv, opener=refuse)
+            except SystemExit as error:
+                code = error.code if isinstance(error.code, int) else 2
+            except Exception as error:  # a malformed answer must fail the gate, never crash the check
+                code = "raised"
+                print("%s: %s" % (type(error).__name__, error), file=sys.stderr)
+    detail = (stderr.getvalue().strip() or stdout.getvalue().strip())[:4000]
+    return code == 0, "verifier record exit %s: %s" % (code, detail)
+
+
+def assess_scope_valid(scope: object) -> bool:
+    """The shape of an assess.scope.json (stage_inputs assess-inputs)."""
+    sha = re.compile(r"[0-9a-f]{64}")
+    if not isinstance(scope, dict) or scope.get("kind") != "assess":
+        return False
+    combinations, policy, evidence = scope.get("combinations"), scope.get("policy"), scope.get("policy_evidence_sha256")
+    return (isinstance(scope.get("discovery_sha256"), str) and sha.fullmatch(scope["discovery_sha256"]) is not None
+            and isinstance(combinations, list) and combinations
+            and all(isinstance(item, dict) and set(item) == {"pattern_id", "repository"}
+                    and all(isinstance(value, str) for value in item.values()) for item in combinations)
+            and type(scope.get("max_assessments")) is int and scope["max_assessments"] >= len(combinations)
+            and isinstance(scope.get("links"), list) and all(isinstance(link, str) for link in scope["links"])
+            and isinstance(policy, list)
+            and all(isinstance(item, dict) and set(item) == {"key", "source", "sha256"}
+                    and all(isinstance(value, str) for value in item.values()) for item in policy)
+            and (evidence is None or isinstance(evidence, str) and sha.fullmatch(evidence) is not None))
+
+
+def verify_assess(v: "Verdict", answer: dict, report_bytes: bytes, scope: dict, assess: dict) -> tuple:
+    """A1, R5, A2, C2, A3 and Q1 of an assess answer whose R3 passed; each is judged on its own so a refusal names
+    every reason. Returns (result class, verified report bytes or None)."""
+    vc = load_verifier()
+    bound = answer["discovery_sha256"] == scope["discovery_sha256"]
+    v.add("A1-discovery-binding", "PASS" if bound else "FAIL",
+          "answer discovery_sha256 %r %s the input's %s" % (answer["discovery_sha256"], "is" if bound else "is not",
+                                                           scope["discovery_sha256"]))
+    links, policy = assess_scope_problems(answer, scope)
+    v.add("R5-input-scope", "FAIL" if links else "PASS", "; ".join(links) or "every link is one its input held")
+    v.add("A2-policy-bytes", "FAIL" if policy else "PASS",
+          "; ".join(policy) or "every policy digest names bytes its input held")
+    evidence, expected = assess.get("policy_evidence"), scope["policy_evidence_sha256"]
+    if evidence is None:
+        same = expected is None
+        detail = "none given" + ("" if same else "; the input was built with policy evidence %s" % expected)
+    else:
+        try:
+            digest = hashlib.sha256(read_bounded(evidence, MANIFEST_MAX_BYTES)).hexdigest()
+        except (OSError, Unsafe) as error:
+            digest = "unreadable (%s)" % error
+        same = digest == expected
+        detail = "--policy-evidence sha256 %s %s the input's %s" % (digest, "is" if same else "is not", expected)
+    v.add("C2-policy-evidence", "PASS" if same else "FAIL", detail)
+    ok, detail = record_gate(vc, assess["discovery"], report_bytes, evidence, assess.get("locus_search"))
+    v.add("A3-record-gate", "PASS" if ok else "FAIL", detail)
+    rules = assess_rule_problems(answer)
+    v.add("A4-assess-rules", "FAIL" if rules else "PASS",
+          "; ".join(rules) or "no execution evidence, no executed reproduction, no stray private reference")
+    v.add("Q1-quotes-verbatim", "INFO", "an assess answer holds no quote; its links and policy digests were "
+          "checked against its input in R5 and A2")
+    if not v.ok():
+        return "invalid", None
+    statuses = {item["status"] for item in answer["assessments"]}
+    return ("insufficient" if statuses == {"unverified"} else "evidence"), report_bytes
+
+
 def verify(run_dir: Path, corpus: Path, prompt: Path, limits: dict, kind: str = "extract",
-           lens: str | None = None, expect_id: str | None = None, scope: dict | None = None) -> tuple:
-    """Return (verdict, result class, verified report bytes or None)."""
+           lens: str | None = None, expect_id: str | None = None, scope: dict | None = None,
+           assess: dict | None = None) -> tuple:
+    """Return (verdict, result class, verified report bytes or None). ``assess`` (kind assess only) holds the
+    discovery path, and the policy evidence and locus search paths when given."""
     v = Verdict()
     worker = limits["worker"]
     lens = lens or limits["prompt_lens"]
     later = ["M1", "M2", "M3", "M4", "R1", "R0", "R2", "R3", "Q1"]
 
-    # C: the corpus the prompt was built from must be real and non-empty.
-    try:
-        corpus_doc = json.loads(read_bounded(corpus, CORPUS_MAX_BYTES))
-        records = corpus_doc.get("records") if isinstance(corpus_doc, dict) else None
-        if not isinstance(records, list) or not records:
-            raise Unsafe("corpus has no records")
-        v.add("C1-corpus-nonempty", "PASS", "%d record(s)" % len(records))
-    except (OSError, ValueError, Unsafe) as error:
-        v.add("C1-corpus-nonempty", "FAIL", str(error))
-        v.block(later, "no usable corpus")
-        return v, "invalid", None
+    # C: the corpus the prompt was built from must be real and non-empty (assess: the discovery it judged).
+    if kind == "assess":
+        corpus_doc = None
+        try:
+            data = read_bounded(assess["discovery"], DISCOVERY_MAX_BYTES)
+            document = json.loads(data)
+            records = document.get("records") if isinstance(document, dict) else None
+            if not isinstance(records, list) or not records:
+                raise Unsafe("discovery has no records")
+            digest = hashlib.sha256(data).hexdigest()
+            if digest != scope["discovery_sha256"]:
+                raise Unsafe("discovery sha256 %s is not the input's %s" % (digest, scope["discovery_sha256"]))
+            v.add("C1-discovery", "PASS", "%d record(s), sha256 %s" % (len(records), digest))
+        except (OSError, ValueError, Unsafe) as error:
+            v.add("C1-discovery", "FAIL", str(error))
+            v.block(later, "no usable discovery")
+            return v, "invalid", None
+    else:
+        try:
+            corpus_doc = json.loads(read_bounded(corpus, CORPUS_MAX_BYTES))
+            records = corpus_doc.get("records") if isinstance(corpus_doc, dict) else None
+            if not isinstance(records, list) or not records:
+                raise Unsafe("corpus has no records")
+            v.add("C1-corpus-nonempty", "PASS", "%d record(s)" % len(records))
+        except (OSError, ValueError, Unsafe) as error:
+            v.add("C1-corpus-nonempty", "FAIL", str(error))
+            v.block(later, "no usable corpus")
+            return v, "invalid", None
 
     # P: the prompt the worker was given.
     try:
@@ -501,6 +749,14 @@ def verify(run_dir: Path, corpus: Path, prompt: Path, limits: dict, kind: str = 
         return v, "invalid", None
     v.add("R2-report-json", "PASS" if isinstance(answer, dict) else "FAIL")
     v.add("R4-stage-contract", "INFO", "%s answer; %s" % (kind, STAGE_OWNER[kind]))
+    if kind == "assess":
+        problems = assess_problems(answer, scope, load_verifier())
+        if not v.add("R3-report-schema", "FAIL" if problems else "PASS", "; ".join(problems)):
+            v.block(["A1-discovery-binding", "R5-input-scope", "A2-policy-bytes", "C2-policy-evidence",
+                     "A3-record-gate", "A4-assess-rules", "Q1-quotes-verbatim"], "schema failed")
+            return v, "invalid", None
+        result_class, verified = verify_assess(v, answer, report_bytes, scope, assess)
+        return v, result_class, verified
     keys = corpus_keys(corpus_doc)
     quote_doc, quotes, empty = answer, 0, False
     if kind == "extract":
@@ -578,7 +834,12 @@ def adopt(report_bytes: bytes, target: Path) -> None:
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
     ap.add_argument("--run-dir", required=True, type=Path)
-    ap.add_argument("--corpus", required=True, type=Path)
+    ap.add_argument("--corpus", type=Path, help="every kind but assess (required there)")
+    ap.add_argument("--discovery", type=Path, help="assess only (required): the discovery.json the input was built from")
+    ap.add_argument("--policy-evidence", type=Path,
+                    help="assess only: the hand-reviewed policy evidence the input was built with (record takes it too)")
+    ap.add_argument("--locus-search", type=Path,
+                    help="assess only: the locus search of this answer's loci (a ready status needs it)")
     ap.add_argument("--prompt", required=True, type=Path)
     ap.add_argument("--answer-kind", choices=KINDS, default="extract")
     ap.add_argument("--lens", help="extract only: the lens this call answered (default: limits prompt_lens)")
@@ -587,8 +848,14 @@ def main(argv=None) -> int:
     ap.add_argument("--out", type=Path)
     ap.add_argument("--adopt-to", type=Path, help="new file that receives the verified report bytes when ok")
     ap.add_argument("--input-scope", type=Path,
-                    help="synthesis, verify or final only: the stage's input-scope.json (keys, and quotes for final)")
+                    help="synthesis, verify or final: the stage's input-scope.json (keys, and quotes for final); "
+                         "assess (required): assess.scope.json")
     a = ap.parse_args(argv)
+    assess = a.answer_kind == "assess"
+    if assess and (a.discovery is None or a.input_scope is None or a.corpus is not None):
+        ap.error("--answer-kind assess takes --discovery and --input-scope, and no --corpus")
+    if not assess and (a.corpus is None or a.discovery or a.policy_evidence or a.locus_search):
+        ap.error("--corpus is required, and --discovery, --policy-evidence and --locus-search are for assess only")
     if (a.lens is not None) != (a.answer_kind == "extract" and a.lens is not None):
         ap.error("--lens applies to --answer-kind extract only")
     if (a.expect_id is not None) != (a.answer_kind == "verify"):
@@ -614,13 +881,17 @@ def main(argv=None) -> int:
         except (OSError, ValueError) as error:
             ap.error("--input-scope is not readable JSON: %s" % error)
         quotes = scope.get("quotes", []) if isinstance(scope, dict) else None
-        if (not isinstance(scope, dict) or not isinstance(scope.get("keys"), list)
+        if assess:
+            if not assess_scope_valid(scope):
+                ap.error("--input-scope of assess must be the assess.scope.json of stage_inputs assess-inputs")
+        elif (not isinstance(scope, dict) or not isinstance(scope.get("keys"), list)
                 or not all(isinstance(key, str) for key in scope["keys"]) or not isinstance(quotes, list)
                 or not all(isinstance(item, dict) and isinstance(item.get("pr"), str) and isinstance(item.get("quote"), str)
                            for item in quotes)):
             ap.error("--input-scope must be {\"keys\": [strings], \"quotes\": [{pr, quote}]}")
-    verdict, result_class, report_bytes = verify(a.run_dir, a.corpus, a.prompt, limits, a.answer_kind,
-                                                 a.lens, a.expect_id, scope)
+    verdict, result_class, report_bytes = verify(
+        a.run_dir, a.corpus, a.prompt, limits, a.answer_kind, a.lens, a.expect_id, scope,
+        {"discovery": a.discovery, "policy_evidence": a.policy_evidence, "locus_search": a.locus_search} if assess else None)
     document = {"ok": result_class in ("evidence", "insufficient"), "result_class": result_class,
                 "answer_kind": a.answer_kind, "limits": "legacy-fixture" if legacy else "strict",
                 "complete": False, "items": verdict.items,

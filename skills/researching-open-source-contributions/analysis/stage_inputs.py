@@ -15,6 +15,8 @@ call, and assembles the final analysis envelope deterministically:
   verify-inputs    RUN + synthesis answer → OUT/verify-<id>/task.txt  (k calls, k may be 0)
   final-input      RUN + all answers → OUT/task.txt            (1 call: judgment fields)
   assemble         RUN + final answer → analysis.json          (no model; validated)
+  assess-inputs    analysis.json + discovery.json [+ policy evidence] → OUT/assess/task.txt
+                   (1 call: the candidate assessment of every combination of one discovery, #259; no RUN)
 
 Then the existing workflow commands finish the run:
 ``adopt-analysis --analysis analysis.json --origin ai --extraction-result ...`` and ``report``.
@@ -334,7 +336,10 @@ def read_bounded(path: Path, limit: int, label: str) -> bytes:
 
 
 def read_json(path: Path, limit: int, label: str):
-    data = read_bounded(Path(path), limit, label)
+    return parse_json(read_bounded(Path(path), limit, label), label)
+
+
+def parse_json(data: bytes, label: str):
     try:
         return json.loads(data.decode("utf-8"), object_pairs_hook=_unique_object, parse_constant=_refuse_constant)
     except (UnicodeDecodeError, ValueError) as error:
@@ -1361,6 +1366,215 @@ def cmd_assemble(context: Context, args) -> dict:
             "note": "an empty patterns array is a recorded insufficient outcome, not a failure"}
 
 
+# -- assess (#259): the candidate assessment of one discovery, by the verifier's own contract ----------------
+
+ASSESS_MAX_ASSESSMENTS = 10
+ASSESS_STEM = "assess"
+# The repository facts every discovery record of one repository repeats; the prompt carries them once.
+REPOSITORY_FACT_KEYS = ("repository", "repository_node_id", "head_sha", "observed_at", "repository_checks",
+                        "upstream_checks")
+# What a prompt needs of a pattern to judge it; pattern_history and generated_by stay in analysis.json.
+ASSESS_PATTERN_KEYS = ("pattern_id", "description", "applicability", "counterconditions", "search_clues",
+                       "expected_tests", "maintainer_judgment_required", "provenance_mode", "confidence",
+                       "source_licenses", "evidence_pr_ids")
+
+
+def assess_call_plan(calls: int = 1) -> dict:
+    """The model calls of an assess stage: one per discovery document (every combination it holds)."""
+    return {"mode": "assess", "assess": calls, "max_model_calls": calls,
+            "formula": "%d (assess: one call per discovery, all of its pattern x repository combinations) = %d"
+                       % (calls, calls)}
+
+
+def load_verifier(skills_root: str | None):
+    """The candidate verifier, resolved like the workflow resolves its siblings (never from input data)."""
+    wf = load_workflow()
+    return wf.Siblings(wf.resolve_siblings(skills_root)).verifier
+
+
+def https_values(value, found: list) -> list:
+    """Every https:// string in an observation, except the body of an untrusted remote text (its words are not
+    an observation the verifier made)."""
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if key == "text" and value.get("untrusted") is True:
+                continue
+            https_values(item, found)
+    elif isinstance(value, list):
+        for item in value:
+            https_values(item, found)
+    elif isinstance(value, str) and value.startswith("https://") and not any(c.isspace() for c in value):
+        found.append(value)
+    return found
+
+
+def policy_source(source_repository: str, path: str) -> str:
+    return "%s:%s" % (source_repository, path)
+
+
+def policy_table(vc, repository: str, policy_files: list, evidence: list) -> dict:
+    """Per policy key: what a ``found: true`` may name (source and digest of bytes the input holds), and how each
+    mapped path was observed, by the verifier's own key-to-path map."""
+    owner = repository.split("/", 1)[0]
+    sources = [repository] + ([owner + "/.github"] if owner + "/.github" != repository else [])
+    observed = {}
+    for item in policy_files:
+        if isinstance(item, dict):
+            observed.setdefault((item.get("source_repository"), item.get("path")), []).append(item)
+    table = {}
+    for key in vc.REVIEWABLE_POLICY_KEYS:
+        paths = vc.POLICY_CHECK_PATHS[key]
+        found, states = [], {"absent": [], "request-failed": [], "not-observed": []}
+        for source in sources:
+            for path in paths:
+                items = observed.get((source, path)) or []
+                if not items:
+                    states["not-observed"].append(policy_source(source, path))
+                for item in items:
+                    if item.get("status") == "found" and item.get("found") is True and isinstance(item.get("sha256"), str):
+                        found.append({"source": policy_source(source, path), "sha256": item["sha256"]})
+                    elif item.get("status") in ("absent", "request-failed"):
+                        states[item["status"]].append(policy_source(source, path))
+                    else:
+                        states["not-observed"].append(policy_source(source, path))
+        reviewed = [{"source": policy_source(entry["source_repository"], entry["path"]), "sha256": entry["sha256"]}
+                    for entry in evidence if entry["repository"] == repository and entry["policy_key"] == key]
+        table[key] = {"mapped_paths": list(paths), "found": found, "hand_reviewed": reviewed,
+                      "absent": states["absent"], "request_failed": states["request-failed"],
+                      "not_observed": states["not-observed"]}
+    table["program_rules"] = {"found": [], "hand_reviewed": [], "note": "no program rules input: found null, sha256 null"}
+    return table
+
+
+def assess_pattern(pattern: dict, urls: dict) -> dict:
+    view = {key: deepcopy(pattern[key]) for key in ASSESS_PATTERN_KEYS if key in pattern}
+    view["evidence_pr_urls"] = [urls[pr_id] for pr_id in pattern.get("evidence_pr_ids") or []
+                                if isinstance(urls.get(pr_id), str)]
+    return view
+
+
+def cmd_assess_inputs(args) -> dict:
+    """One assess call for one discovery document: its prompt, its scope and its call plan (#259).
+
+    The analysis must be the one discovery read (``inputs.analysis_sha256``). Every combination discovery recorded
+    is one unit of the call; skipped and failed scopes cannot be assessed (verifier contract) and are only named.
+    The prompt is measured whole and refused over PROMPT_MAX_BYTES before anything is written; it is never cut and
+    never split here (several answers would need one merged assessment for locus-search and record)."""
+    vc = load_verifier(args.skills_root)
+    analysis_bytes = read_bounded(Path(args.analysis), CORPUS_MAX_BYTES, "analysis")
+    discovery_bytes = read_bounded(Path(args.discovery), CORPUS_MAX_BYTES, "discovery")
+    analysis, discovery = parse_json(analysis_bytes, "analysis"), parse_json(discovery_bytes, "discovery")
+    if not isinstance(analysis, dict) or not isinstance(discovery, dict):
+        raise StageError("the analysis and the discovery must be JSON objects")
+    try:
+        vc._validate_discovery_document(discovery)
+    except vc.CliInputError as error:
+        raise StageError("discovery: %s" % error) from error
+    analysis_sha = hashlib.sha256(analysis_bytes).hexdigest()
+    discovery_sha = hashlib.sha256(discovery_bytes).hexdigest()
+    if discovery["inputs"].get("analysis_sha256") != analysis_sha:
+        raise StageError("the analysis is not the one this discovery read (inputs.analysis_sha256 %s, analysis %s)"
+                         % (discovery["inputs"].get("analysis_sha256"), analysis_sha))
+    records = discovery["records"]
+    if not records:
+        raise StageError("no discovery record to assess (skipped or failed scopes cannot be assessed)")
+    if len(records) > ASSESS_MAX_ASSESSMENTS:
+        raise StageError("%d combinations are more than one call may assess (%d)" % (len(records), ASSESS_MAX_ASSESSMENTS))
+    patterns = {pattern.get("pattern_id"): pattern for pattern in analysis.get("patterns") or [] if isinstance(pattern, dict)}
+    urls = {record.get("pr_id"): (record.get("pull_request") or {}).get("url") for record in analysis.get("records") or []
+            if isinstance(record, dict)}
+    evidence = []
+    evidence_sha = None
+    if args.policy_evidence:
+        try:
+            _, evidence = vc._policy_evidence_input(args.policy_evidence)
+        except vc.CliInputError as error:
+            raise StageError("policy evidence: %s" % error) from error
+        evidence_sha = hashlib.sha256(read_bounded(Path(args.policy_evidence), ANSWER_MAX_BYTES,
+                                                   "policy evidence")).hexdigest()
+
+    combinations, by_repository, links = [], {}, []
+    for record in records:
+        if record["pattern_id"] not in patterns:
+            raise StageError("discovery names %s, which the analysis does not hold" % record["pattern_id"])
+        combinations.append({"pattern_id": record["pattern_id"], "repository": record["repository"]})
+        by_repository.setdefault(record["repository"], []).append(record)
+        https_values(record, links)
+        links += assess_pattern(patterns[record["pattern_id"]], urls)["evidence_pr_urls"]
+        base = "https://github.com/" + record["repository"]
+        links.append(base)
+        if isinstance(record.get("head_sha"), str):
+            links.append(base + "/commit/" + record["head_sha"])
+            static = record.get("static_search") if isinstance(record.get("static_search"), dict) else {}
+            for hit in static.get("hits") or []:
+                if isinstance(hit, dict) and isinstance(hit.get("path"), str) and type(hit.get("line")) is int:
+                    links.append("%s/blob/%s/%s#L%d" % (base, record["head_sha"], hit["path"], hit["line"]))
+    for entry in evidence:
+        if isinstance(entry.get("source_url"), str) and entry["source_url"].startswith("https://"):
+            links.append(entry["source_url"])
+    links = sorted(set(links))
+
+    text = read_bounded(PROMPTS / "assess.md", PROMPT_MAX_BYTES, "assess template").decode("utf-8")
+    text += block("판정 단위", {"discovery_sha256": discovery_sha, "combinations": combinations,
+                              "max_assessments": ASSESS_MAX_ASSESSMENTS,
+                              "not_assessable": [{"section": section, "pattern_id": item.get("pattern_id"),
+                                                  "repository": item.get("repository"), "reason": item.get("reason")}
+                                                 for section in ("skipped_by_cap", "failed_scopes")
+                                                 for item in discovery[section]]})
+    for pattern_id in dict.fromkeys(item["pattern_id"] for item in combinations):
+        text += block("패턴 " + pattern_id, assess_pattern(patterns[pattern_id], urls))
+    allowed_policy = []
+    sizes = {}
+    for repository, group in by_repository.items():
+        first = group[0]
+        if any(record.get("policy_files") != first.get("policy_files") for record in group):
+            raise StageError("the discovery records of %s hold different policy observations" % repository)
+        text += block("저장소 사실 " + repository, {key: first.get(key) for key in REPOSITORY_FACT_KEYS})
+        text += block("정책 관찰 " + repository, first.get("policy_files") or [])
+        table = policy_table(vc, repository, first.get("policy_files") or [], evidence)
+        text += block("정책 키별 허용 값 " + repository, table)
+        for key in vc.REVIEWABLE_POLICY_KEYS:
+            for value in table[key]["found"] + table[key]["hand_reviewed"]:
+                allowed_policy.append({"key": key, "source": value["source"], "sha256": value["sha256"]})
+        for record in group:
+            view = {key: deepcopy(value) for key, value in record.items() if key != "policy_files"
+                    and not (key in REPOSITORY_FACT_KEYS[1:] and value == first.get(key))}
+            title = "discovery 관찰 %s × %s" % (record["pattern_id"], repository)
+            observation = block(title, view)
+            sizes[title] = len(observation.encode("utf-8"))
+            text += observation
+    if evidence:
+        text += block("손으로 확인한 정책 근거", [{key: entry[key] for key in ("repository", "policy_key", "path",
+                                                                     "source_repository", "source_url", "sha256",
+                                                                     "excerpt")} for entry in evidence])
+    text += block("허용 근거 링크", "\n".join(links))
+    size = len(text.encode("utf-8"))
+    if size > PROMPT_MAX_BYTES:
+        raise StageError("the assess prompt would be %d bytes, over %d (65536); refused before anything is written, "
+                         "nothing is cut (discovery observation blocks: %s)"
+                         % (size, PROMPT_MAX_BYTES, ", ".join("%s %d B" % item for item in sizes.items())))
+    unique_policy = []
+    for item in allowed_policy:
+        if item not in unique_policy:
+            unique_policy.append(item)
+
+    out = new_directory(args.out)
+    entry = write_prompt(out / ASSESS_STEM, text)
+    entry["result_name"] = ASSESS_STEM + ".result.json"
+    scope = {"kind": "assess", "discovery_sha256": discovery_sha, "analysis_sha256": analysis_sha,
+             "combinations": combinations, "max_assessments": ASSESS_MAX_ASSESSMENTS, "links": links,
+             "policy": unique_policy, "policy_evidence_sha256": evidence_sha}
+    write_json(out / (ASSESS_STEM + ".scope.json"), scope)
+    plan = assess_call_plan(1)
+    plan["inputs"] = {"combinations": len(combinations), "repositories": len(by_repository)}
+    summary = {"stage": "assess", "mode": "assess", "calls": [entry], "max_model_calls": plan["max_model_calls"],
+               "call_plan": plan, "discovery_sha256": discovery_sha, "analysis_sha256": analysis_sha,
+               "policy_evidence_sha256": evidence_sha, "combinations": combinations,
+               "prompt_budget": {"bytes": entry["bytes"], "cap": PROMPT_MAX_BYTES}}
+    write_json(out / "stage.json", summary)
+    return summary
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
     commands = parser.add_subparsers(dest="command", required=True)
@@ -1406,6 +1620,12 @@ def build_parser() -> argparse.ArgumentParser:
     final.add_argument("--extract-result", action="append", required=True)
     final.add_argument("--verify-result", action="append", default=[])
     final.add_argument("--out", required=True)
+    assess = commands.add_parser("assess-inputs", help="the assess call of one discovery (#259); no run directory")
+    assess.add_argument("--analysis", required=True, help="the analysis.json the discovery read")
+    assess.add_argument("--discovery", required=True, help="the verifier discover output (discovery.json)")
+    assess.add_argument("--policy-evidence", help="hand-reviewed policy evidence, as record --policy-evidence takes it")
+    assess.add_argument("--skills-root")
+    assess.add_argument("--out", required=True)
     assemble = command("assemble")
     assemble.add_argument("--final", required=True)
     assemble.add_argument("--generated-at", required=True)
@@ -1427,8 +1647,11 @@ HANDLERS = {
 def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
     try:
-        context = Context(args.run_dir, args.skills_root)
-        summary = HANDLERS[args.command](context, args)
+        if args.command == "assess-inputs":
+            summary = cmd_assess_inputs(args)
+        else:
+            context = Context(args.run_dir, args.skills_root)
+            summary = HANDLERS[args.command](context, args)
     except (StageError, OSError) as error:
         print("error: %s" % error, file=sys.stderr)
         return 2

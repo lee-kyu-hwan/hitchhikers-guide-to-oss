@@ -257,7 +257,8 @@ stays `insufficient`. Its completeness is `complete` or
 | collect (recent-closed) | network research | isolated research launcher only, through its non-AI collection entry; printed here as plan data |
 | collect (curated tracker), discover, locus-search | network research | isolated research launcher only, and it has no entry verified against real data for these yet; printed here as plan data |
 | pattern extraction, synthesis | AI research | isolated research launcher only, in its one measured read-only launch, following the sibling contracts |
-| assessment, and anything that needs Agent, agy, sub-agents, or deep-research | AI research | isolated research launcher only, and no such path is open or verified yet |
+| assessment | AI research | isolated research launcher only, in its one measured read-only launch, on the analysis bundle's assess input and its strict check (#259); not run against real data yet |
+| anything that needs Agent, agy, sub-agents, or deep-research | AI research | isolated research launcher only, and no such path is open or verified yet |
 | corpus validation, digest, prompts, output gate, record, validate, report | mechanical, offline | this workflow calling the sibling scripts in the development session |
 
 ## Isolation gate
@@ -283,7 +284,7 @@ instruction.
 | macOS, every launch | closed; a setsid-escaped descendant survives cleanup and Keychain isolation is unverified |
 | candidate reads (discover, locus-search) | no isolated entry verified against real data |
 | curated tracker collection | no isolated entry |
-| assessment from an isolated model | no path |
+| assessment from an isolated model | no run: the analysis bundle's assess input, prompt and strict check exist (#259), and no model has answered one |
 
 A row that is closed or unverified is never reported as available, and a
 fake success manifest from a probe is not a model result.
