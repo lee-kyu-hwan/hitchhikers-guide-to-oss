@@ -626,7 +626,7 @@ class ContractTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as temporary:
             completed = subprocess.run(
-                ["/opt/homebrew/bin/python3", os.fspath(SCRIPT), "--print-revision"],
+                [sys.executable, os.fspath(SCRIPT), "--print-revision"],
                 cwd=temporary,
                 capture_output=True,
                 text=True,
@@ -649,7 +649,7 @@ class ContractTests(unittest.TestCase):
             manifest_path = root / "synthetic-manifest.json"
             completed = subprocess.run(
                 [
-                    "/opt/homebrew/bin/python3", os.fspath(bootstrap), os.fspath(SCRIPT),
+                    sys.executable, os.fspath(bootstrap), os.fspath(SCRIPT),
                     "collect", "--tracker-repo", "synthetic-lab/tracker",
                     "--issue", "7", "--max-prs", "1", "--request-budget", "40",
                     "--output", os.fspath(corpus_path),
@@ -1549,7 +1549,7 @@ class CollectionTests(unittest.TestCase):
     def test_ac_15_post_review_print_revision_help(self):
         def invoke(*arguments):
             return subprocess.run(
-                ["/opt/homebrew/bin/python3", os.fspath(SCRIPT), *arguments],
+                [sys.executable, os.fspath(SCRIPT), *arguments],
                 capture_output=True,
                 text=True,
                 check=False,
@@ -2675,7 +2675,7 @@ class EndToEndTests(unittest.TestCase):
                 / "validate_corpus.py"
             )
             validated = subprocess.run(
-                ["/opt/homebrew/bin/python3", os.fspath(analyzer), os.fspath(failed.corpus_path)],
+                [sys.executable, os.fspath(analyzer), os.fspath(failed.corpus_path)],
                 capture_output=True,
                 text=True,
                 check=False,
