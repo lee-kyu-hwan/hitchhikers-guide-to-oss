@@ -14,7 +14,7 @@ C=$1; S=/opt/oss-research/src-$C; NODE=/opt/oss-research/node-v24.20.0-linux-arm
 E=/var/lib/oss-research-evidence/collect-issues-$C
 sudo install -d -m 0700 $E
 ENV=(env -i PATH=$NODE:/usr/bin:/bin LANG=C.UTF-8 OSS_RESEARCH_SRT_PREFIX=/opt/oss-research/srt-0.0.77 PYTHONDONTWRITEBYTECODE=1)
-WRAP="python3 -I -B $S/dot_local/bin/executable_oss-research-linux-run"
+WRAP="python3 -I -B $S/bin/oss-research-linux-run"
 state() { printf 'units=%s procs=%s pin_elements=%s' \
   "$(systemctl list-units --all 'oss-research-*' --no-legend | grep -v oss-research-nft | grep -c .)" \
   "$(ps -u ossresearch -o pid= | grep -c .)" \

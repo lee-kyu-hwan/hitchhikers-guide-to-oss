@@ -37,12 +37,12 @@ from unittest import mock
 
 
 REPO = Path(__file__).resolve().parents[1]
-SCRIPT = REPO / "dot_local/bin/executable_oss-research-worker"
+SCRIPT = REPO / "bin/oss-research-worker"
 LOADER = importlib.machinery.SourceFileLoader("oss_research_worker_linux", str(SCRIPT))
 SPEC = importlib.util.spec_from_loader(LOADER.name, LOADER)
 worker = importlib.util.module_from_spec(SPEC)
 LOADER.exec_module(worker)
-WRAPPER = REPO / "dot_local/bin/executable_oss-research-linux-run"
+WRAPPER = REPO / "bin/oss-research-linux-run"
 WRAPPER_LOADER = importlib.machinery.SourceFileLoader("oss_research_linux_run", str(WRAPPER))
 wrapper = importlib.util.module_from_spec(importlib.util.spec_from_loader(WRAPPER_LOADER.name,
                                                                           WRAPPER_LOADER))
@@ -887,9 +887,9 @@ class ProcScanTests(unittest.TestCase):
 
 
 class PickupVerifierTests(unittest.TestCase):
-    """dot_local/share/oss-research/linux/verify_pickup.py on crafted tars."""
+    """share/linux/verify_pickup.py on crafted tars."""
 
-    VERIFY = REPO / "dot_local/share/oss-research/linux/verify_pickup.py"
+    VERIFY = REPO / "share/linux/verify_pickup.py"
 
     def setUp(self):
         self.root = Path(tempfile.mkdtemp(prefix="osrl-pickup-")).resolve()
@@ -1556,7 +1556,7 @@ class EgressVerdictTests(unittest.TestCase):
         self.assertEqual(run(str(broken)).returncode, 1)
 
 
-MO_VERDICT = REPO / "dot_local/share/oss-research/linux/model_once_verdict.py"
+MO_VERDICT = REPO / "share/linux/model_once_verdict.py"
 MO_LOADER = importlib.machinery.SourceFileLoader("oss_research_model_once_verdict", str(MO_VERDICT))
 model_once_verdict = importlib.util.module_from_spec(importlib.util.spec_from_loader(
     MO_LOADER.name, MO_LOADER))
@@ -1567,7 +1567,7 @@ class AutoObservationPickupTests(unittest.TestCase):
     """verify_pickup.py --auto-observation: the same structure checks, and only
     the exact failure the stream format causes. The default contract is kept."""
 
-    VERIFY = REPO / "dot_local/share/oss-research/linux/verify_pickup.py"
+    VERIFY = REPO / "share/linux/verify_pickup.py"
 
     def setUp(self):
         self.root = Path(tempfile.mkdtemp(prefix="osrl-autopick-")).resolve()
@@ -1629,7 +1629,7 @@ class ChildProxyEnvironmentTests(unittest.TestCase):
                 self.assertFalse({name for name in environment if "proxy" in name.lower()}, environment)
 
 
-COLLECT_ENTRY = REPO / "dot_local/bin/executable_oss-research-collect"
+COLLECT_ENTRY = REPO / "bin/oss-research-collect"
 COLLECT_LOADER = importlib.machinery.SourceFileLoader("oss_research_collect_entry", str(COLLECT_ENTRY))
 collect_entry = importlib.util.module_from_spec(importlib.util.spec_from_loader(
     COLLECT_LOADER.name, COLLECT_LOADER))
@@ -1695,7 +1695,7 @@ class CollectEntryTests(unittest.TestCase):
                      "Selection(", "build_command", "run_research", "--model", "--effort",
                      "--permission-mode", "--credential-file", "--prompt-file"):
             self.assertNotIn(name, code, name)
-        self.assertEqual(wrapper.ENTRIES["collect"], "dot_local/bin/executable_oss-research-collect")
+        self.assertEqual(wrapper.ENTRIES["collect"], "bin/oss-research-collect")
         # The model gate stays where it was.
         self.assertIs(worker.SYSTEM_READ_MEASURED["linux"], False)
 
@@ -1849,7 +1849,7 @@ class CollectEntryTests(unittest.TestCase):
 class CollectPickupTests(unittest.TestCase):
     """verify_pickup.py --collect on crafted tars. Synthetic members, not a real run."""
 
-    VERIFY = REPO / "dot_local/share/oss-research/linux/verify_pickup.py"
+    VERIFY = REPO / "share/linux/verify_pickup.py"
     SIBLING = {"role": "sibling", "path": "/opt/x/collect_recent_closed_prs.py", "sha256": "c" * 64}
     SOURCES = [{"role": "issues", "path": "/opt/x/issues.py", "sha256": "d" * 64}, SIBLING]
 
@@ -2871,10 +2871,11 @@ class BootstrapFixture(unittest.TestCase):
         self.sentinel = self.root / "worker-imported"
         self.trusted = self.root / "opt"
         self.source = self.trusted / "oss-research/src"
-        bin_dir = self.source / "dot_local/bin"
+        bin_dir = self.source / "bin"
         bin_dir.mkdir(parents=True)
-        shutil.copyfile(WRAPPER, bin_dir / "executable_oss-research-linux-run")
-        self.worker_file = bin_dir / "executable_oss-research-worker"
+        (self.source / "skills").mkdir()      # a source tree has skills/ beside bin/
+        shutil.copyfile(WRAPPER, bin_dir / "oss-research-linux-run")
+        self.worker_file = bin_dir / "oss-research-worker"
         future = "from __future__ import annotations\n"
         self.worker_file.write_text(SCRIPT.read_text().replace(
             future, future + f"open({str(self.sentinel)!r}, 'w').close()\n", 1))
@@ -2889,7 +2890,7 @@ class BootstrapFixture(unittest.TestCase):
             os.chmod(current, 0o755)
             for name in files:
                 os.chmod(Path(current) / name, 0o755)
-        copied = bin_dir / "executable_oss-research-linux-run"
+        copied = bin_dir / "oss-research-linux-run"
         loader = importlib.machinery.SourceFileLoader("copied_linux_run", str(copied))
         self.copy = importlib.util.module_from_spec(importlib.util.spec_from_loader(
             loader.name, loader))
@@ -2938,6 +2939,7 @@ class WrapperBootstrapTests(BootstrapFixture):
             "tool writable": lambda: (self.tools / "systemd-run").chmod(0o777),
             "clock program writable": lambda: (self.tools / "date").chmod(0o777),
             "tool dir writable": lambda: self.tools.chmod(0o777),
+            "not a source tree (no skills/ beside bin/)": lambda: (self.source / "skills").rmdir(),
         }
         pristine = self.worker_file.read_text()
         for label, tamper in cases.items():
@@ -2950,6 +2952,7 @@ class WrapperBootstrapTests(BootstrapFixture):
                     for path in (self.source / "evil", self.source / "pipe"):
                         if path.is_symlink() or path.exists():
                             path.unlink()
+                    (self.source / "skills").mkdir(exist_ok=True)
                     if self.worker_file.is_symlink():
                         self.worker_file.unlink()
                         self.worker_file.write_text(pristine)
@@ -3009,7 +3012,7 @@ class ParentEofGuardTests(unittest.TestCase):
                      "print('grandchild', g.pid, flush=True)\n")
         code += "time.sleep(30)\n"
         # -I ignores PYTHONDONTWRITEBYTECODE; -B keeps the imported worker's
-        # bytecode out of dot_local/bin (CI fails on any __pycache__).
+        # bytecode out of bin (CI fails on any __pycache__).
         process = subprocess.Popen([sys.executable, "-I", "-B", "-c", code], stdin=stdin,
                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         for stream in (process.stdin, process.stdout, process.stderr):
@@ -3238,7 +3241,7 @@ class AnalysisCallLedgerTests(unittest.TestCase):
     model or token is used; the fake answers the staging sha and a clean SUMMARY log and writes no
     unit, so each accepted call appends one token line to the ledger and nothing is picked up."""
 
-    HARNESS = REPO / "dot_agents/skills/researching-open-source-contributions/analysis/harness/analysis_call.sh"
+    HARNESS = REPO / "skills/researching-open-source-contributions/analysis/harness/analysis_call.sh"
     VM_ROOT = "W=${OSS_RESEARCH_VM_ROOT:-/Users/lee-kyu-hwan/.oss-research-vm}\n"
     FAKE_LIMACTL = """#!/bin/bash
 echo "$*" >> "$(dirname "$0")/../../calls.log"
@@ -3260,7 +3263,7 @@ exit 0
         limactl.write_text(self.FAKE_LIMACTL)
         limactl.chmod(0o755)
         self.calls_log = vm / "calls.log"
-        self.harness = self.root / "repo/dot_agents/skills/researching-open-source-contributions/analysis/harness/analysis_call.sh"
+        self.harness = self.root / "repo/skills/researching-open-source-contributions/analysis/harness/analysis_call.sh"
         self.harness.parent.mkdir(parents=True)
         self.harness.write_text(text.replace(self.VM_ROOT, "W=%s\n" % vm))
         self.ledger_dir = self.root / "ledger"

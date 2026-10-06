@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Run the general Issue collector with the loopback relay as its transport.
 
-    executable_oss-research-relay-issues --relay-url http://127.0.0.1:PORT --skills-dir DIR \\
+    oss-research-relay-issues --relay-url http://127.0.0.1:PORT --skills-dir DIR \\
         --transport-record T.json --timeout-seconds S --max-response-bytes N [--require-proxy] \\
         --repo OWNER/NAME --date-field created|updated|closed --state open|closed|all \\
         --start-at YYYY-MM-DDTHH:MM:SSZ --end-at YYYY-MM-DDTHH:MM:SSZ \\
@@ -58,7 +58,7 @@ import urllib.request
 
 
 COLLECTOR_SCRIPT = Path("collecting-open-source-issues/scripts/collect_open_source_issues.py")
-ADAPTER = "executable_oss-research-relay-collect"
+ADAPTER = "oss-research-relay-collect"
 TOKEN_VARIABLES = ("GH_TOKEN", "GITHUB_TOKEN")
 GRAPHQL_URL = "https://api.github.com/graphql"
 GRAPHQL_TARGET = "/v1/graphql"

@@ -27,9 +27,9 @@ import urllib.request
 
 
 ROOT = Path(__file__).resolve().parents[1]
-RELAY_SCRIPT = ROOT / "dot_local/bin/executable_oss-research-relay"
-ADAPTER_SCRIPT = ROOT / "dot_local/bin/executable_oss-research-relay-collect"
-SKILLS = ROOT / "dot_codex/skills"
+RELAY_SCRIPT = ROOT / "bin/oss-research-relay"
+ADAPTER_SCRIPT = ROOT / "bin/oss-research-relay-collect"
+SKILLS = ROOT / "skills"
 API = "https://api.github.com"
 REPO = "octo/demo"
 INTERVAL = ("2026-09-01T00:00:00Z", "2026-09-08T00:00:00Z")

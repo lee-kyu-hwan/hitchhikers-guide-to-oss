@@ -19,7 +19,7 @@ sudo install -d -m 0700 $E
 state() { printf 'units=%s procs=%s' "$(systemctl list-units --all 'oss-research-*' --no-legend | grep -v oss-research-nft | grep -c .)" \
   "$(ps -u ossresearch -o pid= | grep -c .)"; }
 ENV=(env -i PATH=$NODE:/usr/bin:/bin LANG=C.UTF-8 OSS_RESEARCH_SRT_PREFIX=/opt/oss-research/srt-0.0.77 PYTHONDONTWRITEBYTECODE=1)
-WRAP="python3 -I -B $S/dot_local/bin/executable_oss-research-linux-run"
+WRAP="python3 -I -B $S/bin/oss-research-linux-run"
 KEYS='("succeeded","kept","status","manifest","upstream_requests","upstream_unmatched","upstream_authorization","corpus_records","collection_status","repository_status","outcome","docs_only","docs_filter","matched_count","request_count","search_queries","transport_rate_limits","transport_requests","transport_credential_scope","github_token")'
 fails=0
 echo "== before $(state)"

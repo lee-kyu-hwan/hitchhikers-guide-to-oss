@@ -4,7 +4,7 @@
     egress_verdict.py RECORD.json            # every check, one line each
     egress_verdict.py RECORD.json NAME       # one check
 
-The record is the JSON line executable_oss-research-linux-run printed for
+The record is the JSON line oss-research-linux-run printed for
 `--entry verify --egress pin -- egress OUT CA`. It is data only.
 
 Preconditions come first: both sandboxed runs ended normally with every

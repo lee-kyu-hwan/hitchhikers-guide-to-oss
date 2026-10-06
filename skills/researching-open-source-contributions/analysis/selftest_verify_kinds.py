@@ -31,7 +31,7 @@ RECORD = machine.RECORDS_ROOT / "oss-e2e-2026-09-28"
 CORPUS = next(p for p in (RECORD / "fixtures/corpus-min.json",
                           RECORD.parent / "oss-functional-validation-2026-09-28/raw/corpus.json") if p.exists())
 KEY, QUOTE = "npm-eslint-markdown#677", "Updates `editorconfig-checker` from 6.1.1 to 6.2.0"
-sys.path.insert(0, str(HERE.parents[3] / "dot_codex/skills/analyzing-open-source-pr-patterns/scripts"))
+sys.path.insert(0, str(HERE.parents[2] / "skills/analyzing-open-source-pr-patterns/scripts"))
 from build_digest import records_by_key  # noqa: E402
 
 KEYS = records_by_key(json.loads(CORPUS.read_text(encoding="utf-8")))

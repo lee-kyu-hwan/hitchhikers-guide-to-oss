@@ -1,4 +1,4 @@
-"""Tests for the candidate verifier's relay path (executable_oss-research-relay-verify).
+"""Tests for the candidate verifier's relay path (oss-research-relay-verify).
 
 Every run is local: a loopback mock stands in for api.github.com, the real
 relay serves it, and the adapter drives the real verifier's own main. A socket
@@ -32,9 +32,9 @@ import urllib.request
 
 
 ROOT = Path(__file__).resolve().parents[1]
-RELAY_SCRIPT = ROOT / "dot_local/bin/executable_oss-research-relay"
-ADAPTER_SCRIPT = ROOT / "dot_local/bin/executable_oss-research-relay-verify"
-SKILLS = ROOT / "dot_codex/skills"
+RELAY_SCRIPT = ROOT / "bin/oss-research-relay"
+ADAPTER_SCRIPT = ROOT / "bin/oss-research-relay-verify"
+SKILLS = ROOT / "skills"
 ANALYSIS = SKILLS / "verifying-open-source-contribution-candidates/tests/fixtures/common/analysis.json"
 API = "https://api.github.com"
 TARGET = "octo/demo"

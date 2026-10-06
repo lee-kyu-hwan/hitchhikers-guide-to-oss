@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """Run the candidate verifier's read steps with the loopback relay as its transport.
 
-    executable_oss-research-relay-verify discover --relay-url http://127.0.0.1:PORT \\
+    oss-research-relay-verify discover --relay-url http://127.0.0.1:PORT \\
         --skills-dir DIR --transport-record T.json --timeout-seconds S --max-response-bytes N \\
         --deadline-seconds D [--require-proxy] --analysis A.json --repo OWNER/NAME \\
         --output D.json --manifest M.json [--pattern PAT-001] [--max-candidates-per-repo N] \\
         [--max-candidates-total N] [--request-budget N] [--max-clues-per-pattern N] \\
         [--static-reads none|rest] [--static-dir DIR ...]
-    executable_oss-research-relay-verify locus-search ... --discovery D.json \\
+    oss-research-relay-verify locus-search ... --discovery D.json \\
         --assessment A.json --output L.json --manifest M.json [--clue C] [--request-budget N] \\
         [--max-clues-per-locus N]
 
@@ -66,13 +66,13 @@ from typing import Any, Optional
 
 
 VERIFIER_SCRIPT = Path("verifying-open-source-contribution-candidates/scripts/verify_candidates.py")
-ADAPTER = "executable_oss-research-relay-collect"
+ADAPTER = "oss-research-relay-collect"
 TOKEN_VARIABLES = ("GH_TOKEN", "GITHUB_TOKEN")
 MAX_DEADLINE_SECONDS = 1800.0
 STATIC_READS_MODES = ("none", "rest")
 STATIC_MAX_DIRS = 3
 STATIC_MAX_DEPTH = 3
-# The relay's content path segment (executable_oss-research-relay _CONTENT_SEGMENT, the
+# The relay's content path segment (oss-research-relay _CONTENT_SEGMENT, the
 # verifier's CONTENT_SEGMENT). tests/test_oss_research_relay_verify.py keeps the three equal.
 CONTENT_SEGMENT = r"[A-Za-z0-9_-][A-Za-z0-9_.-]{0,254}|\.[A-Za-z0-9_-][A-Za-z0-9_.-]{0,253}"
 _STATIC_SEGMENT = re.compile(r"\A(?:" + CONTENT_SEGMENT + r")\Z")

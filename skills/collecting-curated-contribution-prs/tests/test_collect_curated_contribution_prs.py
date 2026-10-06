@@ -25,14 +25,14 @@ SKILL_DIR = Path(__file__).resolve().parents[1]
 SCRIPT = SKILL_DIR / "scripts" / "collect_curated_contribution_prs.py"
 FIXTURES = SKILL_DIR / "tests" / "fixtures"
 SPEC = (
-    Path(__file__).resolve().parents[4]
+    Path(__file__).resolve().parents[3]
     / "docs"
     / "development"
     / "2026-09-10-80-collecting-curated-contribution-prs"
     / "spec.md"
 )
 HARDENING_SPEC = (
-    Path(__file__).resolve().parents[4]
+    Path(__file__).resolve().parents[3]
     / "docs"
     / "development"
     / "2026-09-15-80-post-review-hardening"
@@ -1619,7 +1619,7 @@ class CollectionTests(unittest.TestCase):
         assert_portable_eval(self)
 
     def test_ac_22_contract_stdlib_synthetic_packaging(self):
-        root = Path(__file__).resolve().parents[4]
+        root = Path(__file__).resolve().parents[3]
         test_source = Path(__file__).read_text(encoding="utf-8")
         syntax = ast.parse(test_source)
         import_roots = set()

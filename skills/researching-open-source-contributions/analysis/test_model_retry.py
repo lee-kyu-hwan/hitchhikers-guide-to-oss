@@ -11,7 +11,7 @@ tests/test_oss_research_worker_linux.py AnalysisCallLedgerTests does), with a fa
 judge and a fake strict checker beside them: each fake model answer names the verdict it gets. No VM, model,
 network or token is used; the 2026-10-06 split gate run's verdicts are read when this machine has them.
 
-  /opt/homebrew/bin/python3 -B -m unittest dot_agents/skills/researching-open-source-contributions/analysis/test_model_retry.py
+  /opt/homebrew/bin/python3 -B -m unittest skills/researching-open-source-contributions/analysis/test_model_retry.py
 """
 
 from __future__ import annotations
@@ -34,7 +34,7 @@ import retry_policy  # noqa: E402
 import machine_settings as machine  # noqa: E402
 
 SPLIT_GATE = machine.VM_LOGS / "a78-split-gate-20261006T055754Z"
-BUNDLE = "dot_agents/skills/researching-open-source-contributions/analysis"
+BUNDLE = "skills/researching-open-source-contributions/analysis"
 MODEL = json.loads((HERE / "run_limits.json").read_text(encoding="utf-8"))["worker"]["model"]
 
 
@@ -153,7 +153,7 @@ class RetryFixture(unittest.TestCase):
         for name in ("harness/call_with_retry.py", "retry_policy.py", "run_limits.json"):
             shutil.copy(HERE / name, bundle / name)
         (bundle / "verify_e2e_result.py").write_text(FAKE_VERIFIER)
-        linux = self.root / "repo/dot_local/share/oss-research/linux"
+        linux = self.root / "repo/share/linux"
         linux.mkdir(parents=True)
         (linux / "verify_pickup.py").write_text(FAKE_PICKUP)
         (linux / "model_once_verdict.py").write_text(FAKE_JUDGE)

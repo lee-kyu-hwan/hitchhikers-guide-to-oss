@@ -1,0 +1,24 @@
+{
+  "schema_version": "1.0.0",
+  "mode": "offline-reuse",
+  "source": {
+    "kind": "recent-closed-prs",
+    "repositories": ["eslint/eslint", "eslint/markdown", "eslint/css"],
+    "interval": {"start_at": "2026-07-06T00:00:00Z", "end_at": "2026-10-04T00:00:00Z"},
+    "outcome": ["merged", "closed-unmerged"],
+    "max_per_repository": 5,
+    "request_budget": 60,
+    "reference_repositories": []
+  },
+  "target": {
+    "repositories": ["eslint/eslint", "eslint/markdown", "eslint/css", "eslint-markdown/eslint-markdown", "typescript-eslint/typescript-eslint", "eslint/json", "eslint/code-explorer", "eslint-community/eslint-plugin-eslint-plugin"],
+    "max_candidates_per_repo": 5,
+    "max_candidates_total": 5,
+    "discover_request_budget": 100,
+    "locus_request_budget": 40,
+    "allow_clone": false
+  },
+  "budget": {"total_api_requests": 410, "max_elapsed_seconds": null},
+  "static_only": true,
+  "provenance": {"model": "claude-opus-5-5", "effort": "medium"}
+}

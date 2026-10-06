@@ -99,8 +99,8 @@ import tempfile
 
 sys.dont_write_bytecode = True
 HERE = Path(__file__).resolve().parent
-REPO = HERE.parents[3]
-ANALYZER = REPO / "dot_codex/skills/analyzing-open-source-pr-patterns/scripts"
+REPO = HERE.parents[2]
+ANALYZER = REPO / "skills/analyzing-open-source-pr-patterns/scripts"
 CHECK = ANALYZER / "check_extraction.py"
 CREDENTIAL_VARIABLE = "CLAUDE_CODE_OAUTH_TOKEN"
 # Strings that must never reach the model prompt or come back in the report.
@@ -112,13 +112,13 @@ PATTERN_KEYS = {"title", "description", "kind", "evidence", "applicability", "co
                 "search_clues", "expected_tests", "maintainer_judgment_required", "confidence",
                 "confidence_reason"}
 KINDS = ("extract", "synthesis", "verify", "final", "assess")
-VERIFIER = REPO / "dot_codex/skills/verifying-open-source-contribution-candidates/scripts/verify_candidates.py"
+VERIFIER = REPO / "skills/verifying-open-source-contribution-candidates/scripts/verify_candidates.py"
 DISCOVERY_MAX_BYTES = 4 << 20
 VERIFY_KEYS = {"id", "verdict", "evidence_checks", "counterexamples", "distinct_prs", "distinct_repos",
                "actionable", "actionable_reason", "confidence", "revised_statement"}
 FINAL_KEYS = {"records", "patterns", "extraction_ledger", "limitations"}
 QUOTE_ENTRY = re.compile(r'(PR-[0-9]+) "(.*)"', re.S)
-# The candidate-reads entry's clue limit (dot_local/bin/executable_oss-research-candidate-reads MAX_CLUE_CHARS).
+# The candidate-reads entry's clue limit (bin/oss-research-candidate-reads MAX_CLUE_CHARS).
 SEARCH_CLUE_MAX_CHARS = 200
 HANGUL = re.compile("[\u1100-\u11ff\u3130-\u318f\ua960-\ua97f\uac00-\ud7a3\ud7b0-\ud7ff]")
 STAGE_OWNER = {

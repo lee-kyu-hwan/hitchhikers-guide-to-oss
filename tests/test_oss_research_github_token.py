@@ -33,8 +33,8 @@ import tests.test_oss_research_worker_linux as linux_tests
 
 relay_module = relay_tests.relay_module
 REPO = relay_tests.ROOT
-BIN = REPO / "dot_local/bin"
-VERIFY = REPO / "dot_local/share/oss-research/linux/verify_pickup.py"
+BIN = REPO / "bin"
+VERIFY = REPO / "share/linux/verify_pickup.py"
 SENTINEL = "ghp_SENTINEL0123456789ABCDEFGHIJKLMNOP"  # only ever in a test's temporary directory
 OTHER = "ghp_PARENTSECRETZYXWVUTSRQPONMLKJIHGFE"
 
@@ -390,7 +390,7 @@ class RelayCommandLineTests(TempCase):
 def load_entry(name):
     from importlib.machinery import SourceFileLoader
     import importlib.util
-    loader = SourceFileLoader("osr_token_" + name.replace("-", "_"), str(BIN / ("executable_oss-research-" + name)))
+    loader = SourceFileLoader("osr_token_" + name.replace("-", "_"), str(BIN / ("oss-research-" + name)))
     module = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
     loader.exec_module(module)
     return module
@@ -660,7 +660,7 @@ class EntryTokenTests(EntryCase):
 
     def test_no_entry_reads_a_token_from_the_environment_or_adds_a_second_way_in(self):
         for entry in self.ENTRIES:
-            code = (BIN / ("executable_oss-research-" + entry)).read_text().split('"""', 2)[2]
+            code = (BIN / ("oss-research-" + entry)).read_text().split('"""', 2)[2]
             for name in ("GH_TOKEN", "GITHUB_TOKEN", "gh auth token"):
                 self.assertNotIn('environ.get("%s' % name, code, (entry, name))
                 self.assertNotIn('environ["%s' % name, code, (entry, name))

@@ -29,7 +29,7 @@ Anthropic sandbox runtime(`srt`)으로 감싸고, 결과와 종료 상태를 검
 ## 실행
 
 ```bash
-python3 dot_local/bin/executable_oss-research-worker \
+python3 bin/oss-research-worker \
   --profile claude-profile1 \
   --input-dir /absolute/research-input \
   --prompt-file /absolute/research-input/task.txt \
@@ -87,7 +87,7 @@ python3 dot_local/bin/executable_oss-research-worker \
 |---|---|---|---|---|---|
 | `read-only`(기본) | `Read,Glob,Grep` | 같음 | 기존 목록 | 없음 | 없음 |
 | `corpus-extract` | `Read,Glob,Grep,Agent,Write` | `Read Glob Grep Agent(corpus-extractor) Write` | `Bash,PowerShell,WebFetch,WebSearch,Edit,NotebookEdit,Skill,Workflow` | `--safe-mode`(custom agent를 끄므로) | 부모가 쓴 `--agents` 파일(`corpus-extractor`, 도구 `Read`만, model 지정 없음), `--add-dir <run>/output` |
-| `deep-research` | `Read,Skill,Workflow,WebSearch,WebFetch` | `Read Skill(deep-research) Workflow(deep-research) WebSearch` + 도메인마다 `WebFetch(domain:<host>)` | `Bash,PowerShell,Edit,Write,NotebookEdit` | `--safe-mode`, `--disable-slash-commands` | `dot_agents/skills/deep-research/SKILL.md`(`a330b11e…`), `dot_claude/workflows/deep-research.js`(`4d7392eb…`) |
+| `deep-research` | `Read,Skill,Workflow,WebSearch,WebFetch` | `Read Skill(deep-research) Workflow(deep-research) WebSearch` + 도메인마다 `WebFetch(domain:<host>)` | `Bash,PowerShell,Edit,Write,NotebookEdit` | `--safe-mode`, `--disable-slash-commands` | `share/staged/skills/deep-research/SKILL.md`(`a330b11e…`), `share/staged/workflows/deep-research.js`(`4d7392eb…`) |
 
 - 두 staged 프로필 모두 `--restricted`, `--strict-mcp-config`, `--no-chrome`,
   `--setting-sources ""`, `--permission-prompts none`, `--max-turns 20`을 유지하고
@@ -102,7 +102,7 @@ python3 dot_local/bin/executable_oss-research-worker \
 
 staging(`stage_research_config`)은 `prepare_run` 뒤, 자식 시작 전에 부모가 한다.
 
-1. 원본 위치는 이 스크립트의 chezmoi source checkout(`reviewed_source_root`)이다.
+1. 원본 위치는 이 스크립트의 source checkout(`reviewed_source_root`: `<root>/bin/oss-research-worker`이고 `bin/` 옆에 `skills/`가 있는 트리)이다.
    설치본(`~/.local/bin/oss-research-worker`)이나 `~/.claude`·프로필 디렉터리·동기화
    스킬은 쓰지 않는다. 설치본에서 staged 프로필을 고르면 Blocked다.
 2. 원본마다 source root·중간 디렉터리·파일이 symlink가 아닌지 보고 `O_NOFOLLOW`로
@@ -186,7 +186,7 @@ WebSearch 실행 위치. 인자 생성 성공은 스킬 실행 성공이 아니�
   프로세스는 `start_new_session`으로 자기 그룹을 가진다. deadline이 지나면 새
   프로세스를 시작하지 않는다(`timeout` 기록).
 - **신뢰 relay 경로**: 실행기 옆의 고정 이름만 쓴다. source tree에서는
-  `executable_oss-research-relay`와 같은 checkout의 `dot_codex/skills`, 설치본에서는
+  `oss-research-relay`와 같은 checkout의 `skills`, 설치본에서는
   `oss-research-relay`와 `~/.codex/skills`다. 인터프리터는 실행기 자신의
   `sys.executable`이다. relay가 없으면 `Blocked`다. relay 환경은 허용 목록
   (`PATH`·`LANG`·`LC_*`·`TERM`)과 `PYTHONDONTWRITEBYTECODE`뿐이다. GitHub 토큰은
@@ -712,7 +712,7 @@ Linux 게스트 안의 별도 로그인(`.credentials.json`), API key·`apiKeyHe
 - **cgroup 층**: `tests/fixtures/oss_research_worker/linux/cgroup_escape.py`가 먼저 유닛
   없이 setsid 자손이 살아남는지 확인한다(대조군). 그다음 `systemd-run`
   (`KillMode=control-group`) 유닛에서는 같은 자손이 남지 않음을 확인한다(3회 통과).
-- **unit wrapper(실행 경로 연결)**: `dot_local/bin/executable_oss-research-linux-run`. 게스트
+- **unit wrapper(실행 경로 연결)**: `bin/oss-research-linux-run`. 게스트
   관리자(root)가 실행하고, 고정 inner(제품 실행기 또는 비AI 검증 entry
   `linux/unit_inner.py`)를 `systemd-run --wait --pipe --collect --uid=ossresearch
   -p KillMode=control-group` 고정 argv로 한 unit에 넣는다. 실행기의 `parent_eof_guard`는
@@ -725,7 +725,7 @@ Linux 게스트 안의 별도 로그인(`.credentials.json`), API key·`apiKeyHe
   근거는 `docs/research/2026-09-28-189-cgroup-integration.md`에 있다. 실제 조사 실행은 아직
   unit으로 돌리지 않았다(게이트 닫힘).
 - **결과 회수**: `linux/supervised_run.py`(실 srt + relay + 비AI probe)의 run/result를
-  호스트가 `limactl shell … tar` 스트림(상한 64 MiB)으로 받는다. `dot_local/share/oss-research/linux/verify_pickup.py`가
+  호스트가 `limactl shell … tar` 스트림(상한 64 MiB)으로 받는다. `share/linux/verify_pickup.py`가
   `data` filter로 풀고 파일 집합·manifest `succeeded`·`report.md` 해시를 확인한다.
 - **Linux setsid 시험**: 자손이 보고한 pid는 namespace pid라 `os.kill`로 판정하지
   않는다. 자손 argv에 있는 고유 marker 경로를 호스트 `/proc/*/cmdline`에서 찾는다
@@ -743,9 +743,9 @@ Linux 게스트 안의 별도 로그인(`.credentials.json`), API key·`apiKeyHe
 - 기록: manifest의 `requested_model`·`requested_effort`는 요청값일 뿐이다. 실제 모델 성공을 뜻하지 않는다. 결과 JSON에 `modelUsage`가 있을 때만 `observed_models`를 따로 남긴다.
 - 값은 사용자가 나중에 준다. 전용 oauth-token 미확인 blocker는 그대로다.
 
-## 비AI 수집 entry (`executable_oss-research-collect`)
+## 비AI 수집 entry (`oss-research-collect`)
 
-조사 worker(`executable_oss-research-worker`의 `main`)와 수집 entry는 역할이 다른 별개 프로그램이다. unit wrapper에서는 `--entry worker|collect|verify`로 고른다.
+조사 worker(`oss-research-worker`의 `main`)와 수집 entry는 역할이 다른 별개 프로그램이다. unit wrapper에서는 `--entry worker|collect|verify`로 고른다.
 
 | | worker `main` | 수집 entry `collect` |
 |---|---|---|
@@ -779,28 +779,28 @@ Linux 게스트 안의 별도 로그인(`.credentials.json`), API key·`apiKeyHe
 
 시험과 실측은 아래 「검증 상태」 표의 해당 행과 `docs/research/2026-10-03-eslint-docs-research/README.md` 결함 절의 해소 표시에 있다. 게스트 사례는 `tests/fixtures/oss_research_worker/linux/collect_docs_cases.sh`(`--egress none`, loopback mock)와 `github_token_cases.sh` T4~T7(sentinel)이다.
 
-## 후보 verifier 읽기 entry (`executable_oss-research-candidate-reads`)
+## 후보 verifier 읽기 entry (`oss-research-candidate-reads`)
 
 후보 verifier(`verifying-open-source-contribution-candidates`)의 GitHub 읽기 두 단계, `discover`와 `locus-search`를 비AI로 격리 안에서 실행하는 entry다. 수집 entry(`collect`, `collect-issues`)와 같은 구조이고 모델 gate와 무관하다. unit wrapper에서는 `--entry candidate-reads`로 고른다(시험 fixture entry `verify`와 다르다). mock(loopback)으로만 검증했다. 실제 GitHub 조회와 익명 `/search/code` 응답은 측정하지 않았다.
 
 ```text
-executable_oss-research-candidate-reads --out-dir OUT --input-dir IN --stage discover \
+oss-research-candidate-reads --out-dir OUT --input-dir IN --stage discover \
     --repo OWNER/NAME --pattern PAT-001 [--pattern ...] [--max-candidates-per-repo 5] \
     [--max-candidates-total 5] [--max-clues-per-pattern 5] [--request-budget 60] [--timeout 300] \
     [--static-reads none|rest] [--static-dir DIR ...]
-executable_oss-research-candidate-reads --out-dir OUT --input-dir IN --stage locus-search \
+oss-research-candidate-reads --out-dir OUT --input-dir IN --stage locus-search \
     --repo OWNER/NAME [--clue TEXT ...] [--max-clues-per-locus 5] [--request-budget 60] [--timeout 300]
 ```
 
 | | 계약 |
 |---|---|
-| 하는 일 | relay(`relay_launch`, 인증 없는 GET 허용목록)를 부모가 띄우고, srt 안에서 `executable_oss-research-relay-verify --require-proxy`가 검토된 verifier를 skills 디렉터리에서 경로로 불러 `discover` 또는 `locus-search`를 실행한다. srt의 loopback proxy로만 relay에 닿는다(직접 접속은 srt netns가 거부) |
+| 하는 일 | relay(`relay_launch`, 인증 없는 GET 허용목록)를 부모가 띄우고, srt 안에서 `oss-research-relay-verify --require-proxy`가 검토된 verifier를 skills 디렉터리에서 경로로 불러 `discover` 또는 `locus-search`를 실행한다. srt의 loopback proxy로만 relay에 닿는다(직접 접속은 srt netns가 거부) |
 | 없는 것 | 모델·credential·profile·prompt·permission 경로, upstream·base URL·proxy 옵션, clone(`--allow-clone`·`--clone-root`·`--keep-clone`·`--fixture-dir`·`--api-version`을 넘기지 않는다), markdown 출력. 대상 저장소 코드는 실행하지 않는다(static 읽기만). 시험이 이것들을 고정한다 |
 | 정책 | `build_policy(model=False)`: relay loopback port 하나만 `allowedDomains`. 부모의 proxy·토큰 변수는 넘기지 않는다 |
 | 입력 | `--input-dir`는 단계가 정한 파일만 정확히 담는다: `discover`는 `analysis.json`, `locus-search`는 `discovery.json`과 `assessment.json`. 각 파일은 O_NOFOLLOW·비차단으로 여는 regular 파일, 4 MiB 이하, group·other 쓰기 불가, 중복 키·NaN 없는 JSON 객체다. 디렉터리도 group·other 쓰기 불가다. discover는 요청한 패턴이 분석에 있고 superseded가 아니어야 하고, locus-search는 discovery가 정확히 이 저장소 하나의 것이고 assessment가 그 discovery의 sha256에 묶여 있어야 한다 |
 | 고정 상한 | 대상 저장소 1개(relay는 소유자의 `.github` 저장소도 허용: verifier의 정책 읽기가 필요로 한다), 패턴 1~5개(`PAT-<n>`), 후보 `per repo`·`total` 각 1~5, 패턴당 단서 1~5, locus당 단서 1~5, `--clue` 5개 이하·각 200자 이하(따옴표·역슬래시·제어문자·가장자리 공백 없음), 요청 예산 1~60(relay도 같은 예산), timeout 1800 s 이하. 범위 밖 인자·입력은 **relay를 띄우기 전에** exit 2다 |
 | REST 정적 대조(#256) | `--static-reads rest`(discover만, 기본 `none`이면 요청·child argv가 전과 바이트 단위로 같다)와 `--static-dir DIR`(0~3개, 생략하면 `docs/rules`). adapter `relay-verify`가 같은 두 옵션만 verifier에 넘긴다. verifier가 head commit에서 `README.md`, 디렉터리 목록, 그 바로 아래 `.md`(저장소당 30개, 256 KiB, UTF-8만)를 기존 contents route로 읽고 헤딩 유무(`## Options`)·문구 유무(README 설치 명령의 `eslint`)·저장소 내 상대 링크·앵커(GitHub slug, 중복 `-1`)를 결정적으로 대조해 `static_search`에 낸다(파일 경로·줄·발췌 1줄·sha, 본문 사본 없음). 외부 링크는 열지 않고 `external_links`로만 남긴다. 디렉터리는 relay `_CONTENT_PATH` segment 규칙·깊이 3, 예산은 26+1+디렉터리 수+30 이상(디렉터리 1개면 58). 범위 밖이면 relay 전 exit 2. request에는 rest일 때만 `static_reads`·`static_dirs`가 붙는다. 하한 58은 정적 읽기 몫만이고, 검색까지 끝내려면 조합마다 쓰는 단서 1개당 5건(이슈·PR 검색 4 + 코드 검색 1)이 더 든다(패턴 2개·단서 5개면 58 + 50 = 108, entry 상한 60을 넘는다). 그래서 검색 중 예산이 끝나도 discovery 최상위 `static_reads`(저장소마다 항목 1개, `{repository, head_sha, static_search}`, 레코드와 별개)에 끝난 정적 읽기가 남고 조합은 `failed_scopes`(`budget-exhausted`)로 간다(#266). 설계: `2026-10-05-candidate-discovery/README.md` 「후속 설계: REST 정적 대조」·「#266 결함 2」 |
-| srt 읽기 집합 | Linux 시스템 집합 + 이 entry의 집합: pinned python, 어댑터가 옆에서 불러오는 `executable_oss-research-relay-collect`, verifier의 `REVISION_PATHS` 7개 파일(`SKILL.md`, `agents/openai.yaml`, `references/verification-contract.md`, `references/github-verification-contract.md`, `scripts/verify_candidates.py`, `tests/test_verify_candidates.py`, `tests/test_skill_contract.py`). **tz 파일은 필요 없다**(게스트에서 tz 없이 통과, 수집 entry와 다르다). 실행 때 verifier의 `REVISION_PATHS`를 **소스 텍스트(`ast`)에서** 읽어(verifier 코드는 부모에서 실행하지 않는다) 상수와 다르면 relay 전에 Blocked다. 상수가 verifier와 같은지는 시험이 고정한다. 목록에서 한 파일을 빼면 verifier가 출력 revision을 쓸 때 실패한다(게스트 사례 `drop-verifier-file`: exit 1, 출력 없음) |
+| srt 읽기 집합 | Linux 시스템 집합 + 이 entry의 집합: pinned python, 어댑터가 옆에서 불러오는 `oss-research-relay-collect`, verifier의 `REVISION_PATHS` 7개 파일(`SKILL.md`, `agents/openai.yaml`, `references/verification-contract.md`, `references/github-verification-contract.md`, `scripts/verify_candidates.py`, `tests/test_verify_candidates.py`, `tests/test_skill_contract.py`). **tz 파일은 필요 없다**(게스트에서 tz 없이 통과, 수집 entry와 다르다). 실행 때 verifier의 `REVISION_PATHS`를 **소스 텍스트(`ast`)에서** 읽어(verifier 코드는 부모에서 실행하지 않는다) 상수와 다르면 relay 전에 Blocked다. 상수가 verifier와 같은지는 시험이 고정한다. 목록에서 한 파일을 빼면 verifier가 출력 revision을 쓸 때 실패한다(게스트 사례 `drop-verifier-file`: exit 1, 출력 없음) |
 | 출력 | `OUT/run/output/`의 `discovery.json`(discover) 또는 `locus-search.json`(locus-search), `verification-manifest.json`, `transport.json`과 `OUT/run/result/`의 `manifest.json`(이 run), `relay.log`, `stderr.log`, `read-envelope.json`. envelope는 모든 파일과 **입력 파일**의 크기·sha256을 요청, child의 exit, relay의 ready sources에 묶는다. 출력은 regular·16 MiB 이하만 O_NOFOLLOW·비차단·fstat로 읽는다(링크·FIFO·디렉터리·거대 sparse 파일은 fail closed) |
 | 상태 | verifier의 exit 그대로다. 0은 `succeeded`(entry exit 0), 3은 `partial`(exit 5: 예산 소진, 익명 코드 검색 불가, 읽지 못한 원본), 그 밖은 `failed`(exit 4). 부모의 supervisor 실패가 있으면 항상 `failed`다. 모든 결과를 남기고 올리지 않는다 |
 | 회수 | `verify_pickup.py --candidate-reads --stage S --verifier-sha256 H --relay-issues-sha256 H --relay-sibling-sha256 H --wrapper-record R.json --upstream U`(S는 `discover` 또는 `locus-search`, U는 `github-rest-via-relay` 또는 `loopback-mock`). 호스트가 커밋 트리에서 계산한 sha256과 대조하고(verifier, relay가 읽는 issues·sibling), 요청 범위·예산·대상 저장소, 모든 요청의 delivery(`relayed` 또는 4xx·5xx를 받은 `upstream-error`), verifier가 소비한 요청 수, envelope 크기·sha, 출력 revision(호스트 verifier의 `compute_revision()`), 입력 sha, 후보·단서 상한, upstream 구분을 본다. rest 요청이면 그 형식·예산 하한, 출력 `inputs`의 `static_reads`·`static_dirs`, 레코드마다 `static_search`가 `rest-contents`이고 `ref`가 head sha인지, 읽은 파일·hit 경로가 `README.md`나 요청 디렉터리 바로 아래 `.md`인지, 발췌가 200자 한 줄이고 본문(`content`)이 없는지, transport의 모든 contents 요청이 정책 파일·`README.md`·요청 디렉터리·그 바로 아래 `.md`뿐인지, 출력 `static_reads`가 그 저장소의 항목 정확히 1개이고 같은 규칙을 지키며(읽지 못했으면 `ref` null·`error` `repository-unavailable`/`budget-exhausted`·파일과 hit 없음) 레코드마다 `static_search`가 그 항목과 같은지도 본다(#266). 기본 요청은 이 검사를 하지 않고 출력에 정적 필드나 `static_reads` 섹션이 있으면 FAIL이다. mock 결과를 live로 요구하면 FAIL이다 |
@@ -827,11 +827,11 @@ executable_oss-research-candidate-reads --out-dir OUT --input-dir IN --stage loc
 - 게스트 사례: `tests/fixtures/oss_research_worker/linux/github_token_cases.sh`(`--egress none`, loopback mock, sentinel만). 세 entry의 normal(mock upstream이 모든 요청에서 `Bearer <sentinel>`을 보는지 mock 쪽에서만 대조), 인자 없는 익명, srt child의 읽기 시도(`token-probe`), wrapper SIGKILL, 설치 직후 harness SIGKILL(reaper가 사본을 지움), 인자 거부를 본다.
 - 실제 토큰과 실제 `api.github.com`은 사용하지 않았다. 실제 토큰 측정은 별도 작업이다.
 - 비밀값 파일(토큰 등)은 `secret-file-store <경로>`로 만들고, 에이전트는 값을 대화에 받지 않고 `receiving-secrets-from-user` 스킬 절차를 따른다.
-- 조사 대상 저장소와 조사 이력은 `docs/research/oss-research-targets.md` 등록부에 적고, 조직 단위 선별은 호스트의 읽기 전용 `oss-research-scope`로 한다(격리 entry가 아니다).
+- 조사 대상 저장소와 조사 이력은 `docs/oss-research-targets.md` 등록부에 적고, 조직 단위 선별은 호스트의 읽기 전용 `oss-research-scope`로 한다(격리 entry가 아니다).
 
 ## 시계 검사 (unit wrapper의 실행 전 조건)
 
-Linux 게스트(Lima/VZ)는 호스트 Mac이 잠자는 동안 **시스템 시계가 멈추고** RTC(`rtc-efi`, 호스트의 시각)는 계속 간다. 게스트에서 NTP에는 닿지 못하므로(조사·resolver uid의 송신이 막혀 있다) `systemd-timesyncd`는 동기화하지 못한다. 2026-10-02에 시스템 시계가 RTC보다 7시간 1분, 19분 46초 늦은 일이 두 번 있었다(`2026-10-02-189-isolation-acceptance-matrix.md` 9절 3, 11절). 시계가 틀리면 실제 모델 호출·TLS 인증서 검증·pin lease 판단이 어긋나므로 `executable_oss-research-linux-run`이 **모든 entry(`worker`·`collect`·`collect-issues`·`candidate-reads`·`verify`)와 모든 egress 모드**에서 실행 전에 시계를 대조한다. 새 네트워크 허용(NTP), nft·timesyncd 설정 변경은 쓰지 않는다.
+Linux 게스트(Lima/VZ)는 호스트 Mac이 잠자는 동안 **시스템 시계가 멈추고** RTC(`rtc-efi`, 호스트의 시각)는 계속 간다. 게스트에서 NTP에는 닿지 못하므로(조사·resolver uid의 송신이 막혀 있다) `systemd-timesyncd`는 동기화하지 못한다. 2026-10-02에 시스템 시계가 RTC보다 7시간 1분, 19분 46초 늦은 일이 두 번 있었다(`2026-10-02-189-isolation-acceptance-matrix.md` 9절 3, 11절). 시계가 틀리면 실제 모델 호출·TLS 인증서 검증·pin lease 판단이 어긋나므로 `oss-research-linux-run`이 **모든 entry(`worker`·`collect`·`collect-issues`·`candidate-reads`·`verify`)와 모든 egress 모드**에서 실행 전에 시계를 대조한다. 새 네트워크 허용(NTP), nft·timesyncd 설정 변경은 쓰지 않는다.
 
 | | 계약 |
 |---|---|

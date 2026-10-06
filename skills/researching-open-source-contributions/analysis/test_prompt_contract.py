@@ -16,7 +16,7 @@ Here, without a model:
 The answers are hand-written over the 2026-09-28 fixture corpus (two PRs). The strict check runs as a process (it
 starts check_extraction), so this file does not install the offline guard; nothing here opens the network.
 
-  /opt/homebrew/bin/python3 -B -m unittest dot_agents/skills/researching-open-source-contributions/analysis/test_prompt_contract.py
+  /opt/homebrew/bin/python3 -B -m unittest skills/researching-open-source-contributions/analysis/test_prompt_contract.py
 """
 
 from __future__ import annotations
@@ -35,8 +35,8 @@ import tempfile
 import unittest
 
 HERE = Path(__file__).resolve().parent
-REPO = HERE.parents[3]
-ANALYZER = REPO / "dot_codex/skills/analyzing-open-source-pr-patterns/scripts"
+REPO = HERE.parents[2]
+ANALYZER = REPO / "skills/analyzing-open-source-pr-patterns/scripts"
 sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(ANALYZER))
 sys.dont_write_bytecode = True

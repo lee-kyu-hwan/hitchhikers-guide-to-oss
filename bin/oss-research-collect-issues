@@ -2,14 +2,14 @@
 """The non-AI Issue collection entry: general Issues through the relay, inside srt.
 
 Linux guest only, as the research user inside the unit wrapper
-(executable_oss-research-linux-run --entry collect-issues):
+(oss-research-linux-run --entry collect-issues):
 
-    executable_oss-research-collect-issues --out-dir OUT --repo OWNER/NAME \\
+    oss-research-collect-issues --out-dir OUT --repo OWNER/NAME \\
         --date-field created|updated|closed --state open|closed|all \\
         --start-at 2026-03-28T00:00:00Z --end-at 2026-09-28T00:00:00Z \\
         [--max-per-repo 14] [--request-budget 60] [--timeout 300]
 
-It is the PR collection entry (executable_oss-research-collect) with the Issue
+It is the PR collection entry (oss-research-collect) with the Issue
 collector behind it, and nothing else changes: the same worker pieces (relay,
 build_policy(model=False), Supervisor, area checks), the same bounded reads of
 the child's files and the same envelope shape. The PR entry and its limits are
@@ -24,7 +24,7 @@ IssueEvidence GraphQL query, and it holds no credential. An anonymous GraphQL
 query can fail upstream; the collector then keeps those facts unknown and the
 collection partial.
 
-The child is executable_oss-research-relay-issues --require-proxy (the adapter
+The child is oss-research-relay-issues --require-proxy (the adapter
 that runs collect_open_source_issues.py with the relay as its transport). It
 reads only the worker's Linux system set plus this collection's own set: the
 pinned python, the relay-collect adapter it loads beside itself, the Issue
@@ -45,7 +45,7 @@ the cap, the budget or an unknown GraphQL category left it incomplete; anything
 else is "failed" (exit 4). Every outcome is kept.
 
 An optional --github-token-file PATH hands a read-only GitHub token file to the RELAY only
-(anonymous without it), checked and recorded exactly as in executable_oss-research-collect
+(anonymous without it), checked and recorded exactly as in oss-research-collect
 (collect_entry.checked_github_token): the child never gets the token or the path.
 
 Output, in OUT/run: output/{corpus.json, collection-manifest.json,
@@ -53,7 +53,7 @@ transport.json} from the child, and in result/ manifest.json (this run),
 relay.log, stderr.log and collection-envelope.json, which binds every file's
 size and sha256 to the request, the child's exit code and the relay's ready
 sources. The host checks it with
-dot_local/share/oss-research/linux/verify_pickup.py --issues.
+share/linux/verify_pickup.py --issues.
 """
 
 from __future__ import annotations
@@ -85,12 +85,12 @@ RELAY_MAX_RESPONSE_BYTES = 4 * 1024 * 1024
 RELAY_RESPONSE_BYTE_BUDGET = 64 * 1024 * 1024
 RELAY_TIMEOUT_SECONDS = 30.0
 ADAPTER_TIMEOUT_SECONDS = "30"
-ADAPTER = "executable_oss-research-relay-issues"
+ADAPTER = "oss-research-relay-issues"
 # The files beside the adapter that it loads by path (its ADAPTER: the
 # relay-collect adapter, whose RelayOpener it reuses). Measured on the guest:
 # without it the adapter stops with FileNotFoundError inside srt. A test keeps
 # this equal to the adapter's own constant.
-ADAPTER_DEPENDENCIES = ("executable_oss-research-relay-collect",)
+ADAPTER_DEPENDENCIES = ("oss-research-relay-collect",)
 DATE_FIELDS = ("created", "updated", "closed")
 STATES = ("open", "closed", "all")
 INSTANT = re.compile(r"\A\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ\Z")
@@ -104,7 +104,7 @@ COLLECTOR_REVISION_FILES = ("SKILL.md", "agents/openai.yaml", "references/collec
 OUTPUTS = ("corpus.json", "collection-manifest.json", "transport.json")
 ENVELOPE_SCHEMA = "oss-research-issue-collection-envelope/1"
 UPSTREAM = "github-rest-via-relay"
-ENTRY = "dot_local/bin/executable_oss-research-collect-issues"
+ENTRY = "bin/oss-research-collect-issues"
 MODE = "collect-issues"
 
 EXIT_OK = 0
@@ -134,7 +134,7 @@ class IssueCollection(NamedTuple):
 
 def load_collect_entry(here: Path = Path(__file__)):
     """The PR collection entry beside this file, for load_worker and file_entry."""
-    path = Path(os.path.realpath(here)).with_name("executable_oss-research-collect")
+    path = Path(os.path.realpath(here)).with_name("oss-research-collect")
     loader = importlib.machinery.SourceFileLoader("oss_research_collect_entry", str(path))
     module = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
     loader.exec_module(module)

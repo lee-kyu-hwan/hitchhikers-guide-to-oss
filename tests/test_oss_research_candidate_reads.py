@@ -28,9 +28,9 @@ import unittest
 from unittest import mock
 
 REPO = Path(__file__).resolve().parents[1]
-BIN = REPO / "dot_local/bin"
-SKILLS = REPO / "dot_codex/skills"
-VERIFY = REPO / "dot_local/share/oss-research/linux/verify_pickup.py"
+BIN = REPO / "bin"
+SKILLS = REPO / "skills"
+VERIFY = REPO / "share/linux/verify_pickup.py"
 VERIFIER_SOURCE = SKILLS / "verifying-open-source-contribution-candidates/scripts/verify_candidates.py"
 
 
@@ -41,11 +41,11 @@ def load(name, path):
     return module
 
 
-ENTRY = BIN / "executable_oss-research-candidate-reads"
+ENTRY = BIN / "oss-research-candidate-reads"
 entry = load("oss_research_candidate_reads", ENTRY)
 collect_entry = entry.load_collect_entry()
 worker = collect_entry.load_worker()
-wrapper = load("oss_research_linux_run_for_candidate_reads", BIN / "executable_oss-research-linux-run")
+wrapper = load("oss_research_linux_run_for_candidate_reads", BIN / "oss-research-linux-run")
 
 
 def sha256(path):
@@ -169,10 +169,10 @@ class CandidateReadsEntryTests(EntryCase):
 
     def test_the_entry_is_registered_beside_the_others_and_is_not_the_fixture_entry(self):
         self.assertEqual(wrapper.ENTRIES["candidate-reads"], entry.ENTRY)
-        self.assertEqual(entry.ENTRY, "dot_local/bin/executable_oss-research-candidate-reads")
+        self.assertEqual(entry.ENTRY, "bin/oss-research-candidate-reads")
         self.assertEqual(set(wrapper.ENTRIES), {"worker", "collect", "collect-issues", "candidate-reads", "verify"})
-        self.assertEqual(wrapper.ENTRIES["collect"], "dot_local/bin/executable_oss-research-collect")
-        self.assertEqual(wrapper.ENTRIES["collect-issues"], "dot_local/bin/executable_oss-research-collect-issues")
+        self.assertEqual(wrapper.ENTRIES["collect"], "bin/oss-research-collect")
+        self.assertEqual(wrapper.ENTRIES["collect-issues"], "bin/oss-research-collect-issues")
         self.assertEqual(wrapper.ENTRIES["verify"], "tests/fixtures/oss_research_worker/linux/unit_inner.py")
         self.assertNotEqual(entry.MODE, "verify")
         self.assertTrue(os.access(ENTRY, os.X_OK))
@@ -259,7 +259,7 @@ class CandidateReadsEntryTests(EntryCase):
         self.assertFalse(any("claude" in p.lower() or "credential" in p.lower() for p in read), read)
         command = seen["command"]
         self.assertEqual(command[:4], [*runtime, "--settings", "/p.json"])
-        self.assertEqual(Path(command[command.index("-B") + 1]).name, "executable_oss-research-relay-verify")
+        self.assertEqual(Path(command[command.index("-B") + 1]).name, "oss-research-relay-verify")
         tail = command[command.index("discover"):]
         self.assertEqual(tail[0], "discover")
         self.assertIn("--require-proxy", tail)

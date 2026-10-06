@@ -23,7 +23,7 @@ import unittest
 from unittest import mock
 
 
-SCRIPT = Path(__file__).resolve().parents[1] / "dot_local/bin/executable_oss-research-worker"
+SCRIPT = Path(__file__).resolve().parents[1] / "bin/oss-research-worker"
 # srt's socket paths stay short; Linux has no /private.
 SHORT_TMP = "/tmp" if sys.platform == "linux" else "/private/tmp"
 LOADER = importlib.machinery.SourceFileLoader("oss_research_worker_auth", str(SCRIPT))

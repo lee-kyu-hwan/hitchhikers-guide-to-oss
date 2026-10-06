@@ -102,8 +102,8 @@ import tempfile
 sys.dont_write_bytecode = True
 
 HERE = Path(__file__).resolve().parent
-REPO = HERE.parents[3]
-WORKFLOW = REPO / "dot_agents/skills/researching-open-source-contributions/scripts/oss_workflow.py"
+REPO = HERE.parents[2]
+WORKFLOW = REPO / "skills/researching-open-source-contributions/scripts/oss_workflow.py"
 PROMPTS = HERE / "prompts"
 LIMITS = json.loads((HERE / "run_limits.json").read_text(encoding="utf-8"))
 sys.path.insert(0, str(HERE))

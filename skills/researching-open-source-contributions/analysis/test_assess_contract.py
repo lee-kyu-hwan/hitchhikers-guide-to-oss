@@ -8,7 +8,7 @@ requires the same verdict. assess-inputs also reads the discovery's top-level ``
 static reads of a repository without a discovery record are not assessable (the record gate refuses such a
 combination) and stay in the report only. No model, VM, token or network is used.
 
-  /opt/homebrew/bin/python3 -B -m unittest dot_agents/skills/researching-open-source-contributions/analysis/test_assess_contract.py
+  /opt/homebrew/bin/python3 -B -m unittest skills/researching-open-source-contributions/analysis/test_assess_contract.py
 """
 
 from __future__ import annotations

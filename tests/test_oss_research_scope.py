@@ -1,4 +1,4 @@
-"""Tests for the org scope survey (executable_oss-research-scope).
+"""Tests for the org scope survey (oss-research-scope).
 
 The script runs as a subprocess with a fake ``gh`` first on PATH. The fake serves
 fixed JSON and logs every argv, so nothing here reaches a network and no test
@@ -20,7 +20,7 @@ from urllib.parse import parse_qs, urlsplit
 
 
 ROOT = Path(__file__).resolve().parents[1]
-SCRIPT = ROOT / "dot_local/bin/executable_oss-research-scope"
+SCRIPT = ROOT / "bin/oss-research-scope"
 FAKE_TOKEN = "ghp_FAKETOKENFORLEAKCHECK0123456789"
 
 FAKE_GH = textwrap.dedent(

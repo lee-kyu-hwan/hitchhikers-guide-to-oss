@@ -1,4 +1,4 @@
-"""Offline tests for dot_local/bin/executable_oss-research-egress-pin.
+"""Offline tests for bin/oss-research-egress-pin.
 
 Run: PYTHONDONTWRITEBYTECODE=1 python3 -B -m unittest tests.test_oss_research_egress_pin -v
 
@@ -28,7 +28,7 @@ import unittest
 sys.dont_write_bytecode = True
 
 ROOT = Path(__file__).resolve().parents[1]
-TOOL = ROOT / "dot_local" / "bin" / "executable_oss-research-egress-pin"
+TOOL = ROOT / "bin" / "oss-research-egress-pin"
 
 
 def load_tool():

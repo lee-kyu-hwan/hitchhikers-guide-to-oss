@@ -10,7 +10,7 @@ Three kinds of process take part, all on 127.0.0.1:
 - a fixture upstream (the #192 relay tests' ``FixtureUpstream``) in this test
   process, standing in for api.github.com and counting every request it gets;
 - the product relay, ``oss-research-relay``, as its own process group with
-  ``--skills-dir`` fixed to this checkout's dot_codex/skills. A test-only
+  ``--skills-dir`` fixed to this checkout's skills. A test-only
   sitecustomize sends its api.github.com calls to the fixture upstream and
   refuses and logs every other connection;
 - a non-AI probe (tests/fixtures/oss_research_offline_integration/relay_probe.py)
@@ -50,9 +50,9 @@ import uuid
 
 
 REPO = Path(__file__).resolve().parents[1]
-RELAY = REPO / "dot_local/bin/executable_oss-research-relay"
-WORKER = REPO / "dot_local/bin/executable_oss-research-worker"
-SKILLS = REPO / "dot_codex/skills"
+RELAY = REPO / "bin/oss-research-relay"
+WORKER = REPO / "bin/oss-research-worker"
+SKILLS = REPO / "skills"
 FIXTURES = REPO / "tests/fixtures/oss_research_offline_integration"
 PROBE = FIXTURES / "relay_probe.py"
 PREFIX = os.environ.get("OSS_RESEARCH_SRT_PREFIX")

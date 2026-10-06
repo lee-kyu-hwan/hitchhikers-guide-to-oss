@@ -5,7 +5,7 @@ the whole digest: every prompt stays at or under 65,536 bytes, and a synthesis t
 call is split in groups and merged. Every answer below is a hand-written stand-in for a model call;
 nothing here starts a model, opens the network or reads a credential.
 
-  /opt/homebrew/bin/python3 -B -m unittest dot_agents/skills/researching-open-source-contributions/analysis/test_reduce_inputs.py
+  /opt/homebrew/bin/python3 -B -m unittest skills/researching-open-source-contributions/analysis/test_reduce_inputs.py
 """
 
 from __future__ import annotations

@@ -21,7 +21,7 @@ set -u
 if [ "${1:-}" = kill-after-install ]; then MODE_KILL=yes; shift; else MODE_KILL=no; fi
 C="${1:?commit}"; S=/opt/oss-research/src-$C; NODE=/opt/oss-research/node-v24.20.0-linux-arm64/bin
 PY=/usr/bin/python3
-WRAP="$PY -I -B $S/dot_local/bin/executable_oss-research-linux-run"
+WRAP="$PY -I -B $S/bin/oss-research-linux-run"
 ENV=(env -i PATH=$NODE:/usr/bin:/bin LANG=C.UTF-8 OSS_RESEARCH_SRT_PREFIX=/opt/oss-research/srt-0.0.77 PYTHONDONTWRITEBYTECODE=1)
 CTOP=/run/oss-research-credentials
 GT=/run/osr-gt
@@ -191,7 +191,7 @@ install_token 300 && {
   sudo "${ENV[@]}" $WRAP --entry verify --egress none --timeout 300 -- collect-case $OUT upstream-hang $TOKEN > /tmp/osr-gt-rec.R 2>&1 &
   sleep 12
   echo "   before kill: $(state)"
-  sudo pkill -KILL -f "executable_oss-research-linux-run --entry verify"; sleep 5
+  sudo pkill -KILL -f "oss-research-linux-run --entry verify"; sleep 5
   echo "   after SIGKILL+5s: $(state | sed 's/creds=[0-9]*/creds=held-by-harness/')"
   if sudo test -f "$TOKEN"; then pass "R: the token copy is still the harness's own to remove (control)"; else fail "R: token copy vanished"; fi
   no_sentinel R $OUT /tmp/osr-gt-rec.R

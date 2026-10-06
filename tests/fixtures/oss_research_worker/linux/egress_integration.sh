@@ -14,8 +14,8 @@ set -u
 SRC="${1:?source tree}"
 PREFIX="${2:?srt prefix}"
 NODE_BIN="${3:?node bin dir}"
-WRAPPER="$SRC/dot_local/bin/executable_oss-research-linux-run"
-TOOL="$SRC/dot_local/bin/executable_oss-research-egress-pin"
+WRAPPER="$SRC/bin/oss-research-linux-run"
+TOOL="$SRC/bin/oss-research-egress-pin"
 FIX="$SRC/tests/fixtures/oss_research_linux_vm/egress"
 ANTH_IP=140.82.112.7
 GH_IP=140.82.112.5

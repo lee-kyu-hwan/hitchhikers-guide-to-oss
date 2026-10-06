@@ -7,7 +7,7 @@
 - **범위가 정해지는 곳은 따로 있다.** run 하나의 범위는 요청 파일 `request.json`(`source.repositories`, `target.repositories`, `reference_repositories`)이 정하고, 격리 entry는 `--repo` 인자로 받은 저장소로만 relay를 띄운다(`oss-research-collect`, `-collect-issues`, `-candidate-reads`). 요청 파일을 쓸 때 저장소는 이 표에서 가져오고, 새 저장소를 넣으면 이 표에도 행을 더한다.
 - **조회 시점의 기록이다.** 수치는 적힌 날짜의 값이다. 다시 조사하기 전에 `oss-research-scope`로 새로 센다.
 - 행을 더하거나 고칠 때는 날짜와 근거(어느 조회·문서)를 같이 적는다. 증거 문서 경로는 저장소 루트 기준이다.
-- 이 표를 만든 선별 조회 `dot_local/bin/executable_oss-research-scope`는 격리 entry가 아니다. 호스트의 `gh` 로그인으로 `gh api --method GET`만 하는 읽기 전용 조회이고 범위를 정하는 데만 쓴다. 격리 경계(#189)와 섞어 읽지 않는다.
+- 이 표를 만든 선별 조회 `bin/oss-research-scope`는 격리 entry가 아니다. 호스트의 `gh` 로그인으로 `gh api --method GET`만 하는 읽기 전용 조회이고 범위를 정하는 데만 쓴다. 격리 경계(#189)와 섞어 읽지 않는다.
 
 ```bash
 oss-research-scope --org eslint --since 2026-07-05 --out-dir <새 디렉터리>

@@ -6,7 +6,7 @@ is a hand-written stand-in. The strict check (verify_e2e_result.py --answer-kind
 runs the verifier's own ``record`` gate in process too, so the offline guards stay in place. No model, VM, token or
 network is used.
 
-  /opt/homebrew/bin/python3 -B -m unittest dot_agents/skills/researching-open-source-contributions/analysis/test_assess.py
+  /opt/homebrew/bin/python3 -B -m unittest skills/researching-open-source-contributions/analysis/test_assess.py
 """
 
 from __future__ import annotations
@@ -22,8 +22,8 @@ import tempfile
 import unittest
 
 HERE = Path(__file__).resolve().parent
-REPO = HERE.parents[3]
-sys.path.insert(0, str(REPO / "dot_agents/skills/researching-open-source-contributions/tests"))
+REPO = HERE.parents[2]
+sys.path.insert(0, str(REPO / "skills/researching-open-source-contributions/tests"))
 sys.path.insert(0, str(HERE))
 sys.dont_write_bytecode = True
 

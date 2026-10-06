@@ -4,7 +4,7 @@
 #   bash candidate_reads_live.sh COMMIT STAGE IN_DIR -- <entry 인자: --stage … --repo … 등>
 #
 # 정식 경로만 쓴다: linux-run --entry candidate-reads --egress pin(resolver 192.168.5.2) →
-# executable_oss-research-candidate-reads(상한은 entry의 것) → relay(token 없음, GET 허용목록) →
+# oss-research-candidate-reads(상한은 entry의 것) → relay(token 없음, GET 허용목록) →
 # srt child relay-verify --require-proxy. mock·sitecustomize 없음. 모델·credential 없음. GitHub 쓰기 없음.
 # IN_DIR은 호스트가 미리 만든 입력 디렉터리(ossresearch 소유, group·other 쓰기 불가)다.
 # 결과는 cp -P(링크를 따라가지 않음)로 root 전용 증거 경로에 보존하고 tar로 묶는다. 회수 판정은 호스트
@@ -26,7 +26,7 @@ echo "INFO start $(date -u +%FT%TZ)"
 sudo bash -c 'env -i "$@" > /run/osr-live-record.json 2> /run/osr-live-wrapper.err' _ \
   PATH=$NODE:/usr/bin:/bin LANG=C.UTF-8 OSS_RESEARCH_SRT_PREFIX=/opt/oss-research/srt-0.0.77 \
   OSS_RESEARCH_EGRESS_RESOLVER=192.168.5.2 PYTHONDONTWRITEBYTECODE=1 \
-  python3 -I -B $S/dot_local/bin/executable_oss-research-linux-run --entry candidate-reads --egress pin --timeout 660 -- \
+  python3 -I -B $S/bin/oss-research-linux-run --entry candidate-reads --egress pin --timeout 660 -- \
   --out-dir "$OUT" --input-dir "$IN" "$@" --timeout 600
 rc=$?
 echo "INFO end $(date -u +%FT%TZ) wrapper rc=$rc"

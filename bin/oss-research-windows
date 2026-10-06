@@ -3,14 +3,14 @@
 
 Host only, offline:
 
-    executable_oss-research-windows --start-at YYYY-MM-DDTHH:MM:SSZ --end-at YYYY-MM-DDTHH:MM:SSZ \\
+    oss-research-windows --start-at YYYY-MM-DDTHH:MM:SSZ --end-at YYYY-MM-DDTHH:MM:SSZ \\
         --repo OWNER/NAME [--repo ...] --outcome merged|closed-unmerged|all [--outcome ...] \\
         [--window-days 31] [--max-per-repo 5] [--request-budget 60] [--docs-only title|label] \\
         [--max-runs 60]
 
 This is not an isolated entry and it runs nothing. It opens no network connection,
 reads no credential and starts no process: it only computes and prints JSON. One
-isolated collection entry (executable_oss-research-collect) covers one repository,
+isolated collection entry (oss-research-collect) covers one repository,
 one outcome and an interval of at most 31 days, so a longer period, several
 repositories or both outcomes are several runs. The planner lists them:
 
@@ -18,7 +18,7 @@ repositories or both outcomes are several runs. The planner lists them:
     31, the entry's limit); the end is exclusive, so windows touch without overlapping,
     and the last window is cut short at the period's end;
   - one run per repository, outcome and window, in that order, each with the argument
-    list for `executable_oss-research-linux-run` (everything from `--entry` on; the
+    list for `oss-research-linux-run` (everything from `--entry` on; the
     run's own output directory replaces <OUT_DIR>);
   - the request budget summed and the most requests the runs can make. The estimate
     is 4 requests plus 7 per pull request, measured on real runs of the entry
@@ -56,7 +56,7 @@ OUTCOMES = ("all",) + OUTCOME_KINDS
 DOCS_ONLY_MODES = ("title", "label")
 INSTANT = re.compile(r"\A\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ\Z")
 REPOSITORY = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9_.-]+\Z")
-LINUX_RUN = "/opt/oss-research/src-<COMMIT>/dot_local/bin/executable_oss-research-linux-run"
+LINUX_RUN = "/opt/oss-research/src-<COMMIT>/bin/oss-research-linux-run"
 FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 
 
@@ -156,7 +156,7 @@ def plan(args) -> dict:
     return {
         "schema_version": SCHEMA_VERSION,
         "executed": False,
-        "note": "plan data only: nothing was run. Each run is `executable_oss-research-linux-run` with its "
+        "note": "plan data only: nothing was run. Each run is `oss-research-linux-run` with its "
                 "linux_run_args inside the research VM, with the user's approval and the coordinator's instruction.",
         "linux_run": LINUX_RUN,
         "request": {

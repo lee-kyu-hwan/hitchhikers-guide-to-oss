@@ -13,7 +13,7 @@ staged under a hash pin, writes to them denied), another profile, model or
 effort. SYSTEM_READ_MEASURED["linux"] is False: the Linux read set counts as
 measured for that one launch only, not in general. The code that hands the
 credential to the child and checks it was not exposed runs in tests with fake
-sentinels and in that measured launch. See docs/research/oss-research-worker.md.
+sentinels and in that measured launch. See docs/oss-research-worker.md.
 """
 
 from __future__ import annotations
@@ -250,10 +250,10 @@ STAGED_PROFILES = {
         denied="Bash,PowerShell,Edit,Write,NotebookEdit",
         dropped=("--safe-mode", "--disable-slash-commands"),
         sources=(
-            StagedSource("dot_agents/skills/deep-research/SKILL.md",
+            StagedSource("share/staged/skills/deep-research/SKILL.md",
                          "skills/deep-research/SKILL.md",
                          "a330b11edcbaf34942595d4f947a9f201a52895a064b4a5e5f2bb57d2398cedc"),
-            StagedSource("dot_claude/workflows/deep-research.js",
+            StagedSource("share/staged/workflows/deep-research.js",
                          "workflows/deep-research.js",
                          "4d7392eb5495115e8e1b29b5450774cf18d1f0318d619a5ec774c91ddd4c8fd4"),
         ),
@@ -685,7 +685,7 @@ def platform_problems(prefix: Path, platform: str) -> list[str]:
     return []
 
 
-# Set by the Linux unit wrapper (executable_oss-research-linux-run) on the unit
+# Set by the Linux unit wrapper (oss-research-linux-run) on the unit
 # it starts; its stdin is then the wrapper's pipe.
 UNIT_ENV_MARKER = "OSS_RESEARCH_UNIT"
 PARENT_GONE_EXIT = 75
@@ -1139,16 +1139,25 @@ def checked_relay_request(repositories: list[str], request_budget: int,
                         response_byte_budget, timeout_seconds)
 
 
+def source_checkout(script: Path) -> Path | None:
+    """The checkout root when script is <root>/bin/<name> of this repository
+    (skills/ beside bin/), else None: an installed copy such as ~/.local/bin."""
+    if script.parent.name == "bin" and (script.parent.parent / "skills").is_dir():
+        return script.parent.parent
+    return None
+
+
 def trusted_relay(script: Path) -> tuple[Path, Path]:
     """The relay beside this script and the skills directory it must load.
 
-    In the chezmoi source tree both come from the same checkout; installed,
+    In a source checkout both come from the same checkout; installed,
     the relay is ~/.local/bin/oss-research-relay and the skills ~/.codex/skills.
     """
     script = script.resolve()
-    if script.name.startswith("executable_"):
-        relay = script.with_name("executable_oss-research-relay")
-        skills = script.parents[2] / "dot_codex/skills"
+    root = source_checkout(script)
+    if root is not None:
+        relay = script.with_name("oss-research-relay")
+        skills = root / "skills"
     else:
         relay = script.with_name("oss-research-relay")
         skills = Path.home() / ".codex/skills"
@@ -1307,12 +1316,12 @@ def prepare_run(run_dir: Path, policy: dict) -> Path:
 
 
 def reviewed_source_root(script: Path) -> Path:
-    """The chezmoi source checkout this worker runs from. An installed copy
+    """The source checkout this worker runs from. An installed copy
     (~/.local/bin) has no reviewed source beside it, so nothing is staged."""
-    if not script.name.startswith("executable_"):
+    if source_checkout(script) is None:
         raise Blocked("staged profiles run only from the reviewed source checkout; "
                       "installed skills are never staged")
-    return script.resolve().parents[2]
+    return script.resolve().parents[1]
 
 
 def read_reviewed(root: Path, source: StagedSource) -> bytes:

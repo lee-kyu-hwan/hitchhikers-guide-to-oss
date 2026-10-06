@@ -25,7 +25,7 @@ import sys
 import time
 
 tree, fake = Path(sys.argv[1]), Path(sys.argv[2])
-script = tree / "dot_local/bin/executable_oss-research-linux-run"
+script = tree / "bin/oss-research-linux-run"
 loader = importlib.machinery.SourceFileLoader("probe_linux_run", str(script))
 wrapper = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
 loader.exec_module(wrapper)

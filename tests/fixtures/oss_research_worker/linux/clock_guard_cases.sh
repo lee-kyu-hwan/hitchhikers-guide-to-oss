@@ -12,7 +12,7 @@
 set -u
 C=$1; S=/opt/oss-research/src-$C; NODE=/opt/oss-research/node-v24.20.0-linux-arm64/bin
 ENV=(env -i PATH=$NODE:/usr/bin:/bin LANG=C.UTF-8 OSS_RESEARCH_SRT_PREFIX=/opt/oss-research/srt-0.0.77 PYTHONDONTWRITEBYTECODE=1)
-WRAP="python3 -I -B $S/dot_local/bin/executable_oss-research-linux-run"
+WRAP="python3 -I -B $S/bin/oss-research-linux-run"
 rtc() { sudo cat /sys/class/rtc/rtc0/since_epoch; }
 offset() { sudo python3 -c "import time; print(round(time.time() - $(rtc), 3))"; }
 restore() { sudo /usr/bin/date -u -s "@$(rtc)" > /dev/null; echo "   restored from RTC: offset now $(offset)"; }

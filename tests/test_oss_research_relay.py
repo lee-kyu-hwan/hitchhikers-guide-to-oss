@@ -27,8 +27,8 @@ import urllib.request
 
 
 ROOT = Path(__file__).resolve().parents[1]
-SCRIPT = ROOT / "dot_local/bin/executable_oss-research-relay"
-SKILLS = ROOT / "dot_codex/skills"
+SCRIPT = ROOT / "bin/oss-research-relay"
+SKILLS = ROOT / "skills"
 FIXTURES = ROOT / "tests/fixtures/oss_research_relay"
 SHA = "0123456789abcdef0123456789abcdef01234567"
 API = "https://api.github.com"
@@ -887,7 +887,7 @@ class CommandLineTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 2)
         for bad in (["--repo", "octo"], ["--repo", "https://github.com/octo/demo"],
                     ["--request-budget", "0"], ["--timeout-seconds", "301"], ["--upstream", "http://x"],
-                    ["--skills-dir", "dot_codex/skills"], ["--skills-dir", self.temporary.name],
+                    ["--skills-dir", "skills"], ["--skills-dir", self.temporary.name],
                     ["--repo", "octo/demo"]):
             with self.subTest(bad=bad):
                 self.assertEqual(self.run_relay(*(full + bad)).returncode, 2)

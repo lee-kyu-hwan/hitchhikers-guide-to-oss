@@ -1,4 +1,4 @@
-"""Tests for the Issue collector's relay path (executable_oss-research-relay-issues).
+"""Tests for the Issue collector's relay path (oss-research-relay-issues).
 
 Every run is local: a loopback mock stands in for api.github.com (REST and the
 GraphQL POST), the real relay serves it, and the adapter drives the real
@@ -30,9 +30,9 @@ import urllib.request
 
 
 ROOT = Path(__file__).resolve().parents[1]
-RELAY_SCRIPT = ROOT / "dot_local/bin/executable_oss-research-relay"
-ADAPTER_SCRIPT = ROOT / "dot_local/bin/executable_oss-research-relay-issues"
-SKILLS = ROOT / "dot_codex/skills"
+RELAY_SCRIPT = ROOT / "bin/oss-research-relay"
+ADAPTER_SCRIPT = ROOT / "bin/oss-research-relay-issues"
+SKILLS = ROOT / "skills"
 API = "https://api.github.com"
 TARGET = "octo/demo"
 INTERVAL = ("2030-01-01T00:00:00Z", "2030-02-01T00:00:00Z")

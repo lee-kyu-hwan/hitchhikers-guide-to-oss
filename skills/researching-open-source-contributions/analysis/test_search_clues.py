@@ -13,7 +13,7 @@ character, or Hangul. Nothing is relaxed; an answer without search_clues is left
 The verifier runs as a process (selftest_verify_kinds), so this file does not install the offline guard of
 test_stage_inputs. No model, network or credential is used.
 
-  /opt/homebrew/bin/python3 -B -m unittest dot_agents/skills/researching-open-source-contributions/analysis/test_search_clues.py
+  /opt/homebrew/bin/python3 -B -m unittest skills/researching-open-source-contributions/analysis/test_search_clues.py
 """
 
 from __future__ import annotations

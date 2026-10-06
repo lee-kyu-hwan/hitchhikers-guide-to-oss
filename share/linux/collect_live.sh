@@ -4,7 +4,7 @@
 #   bash collect_live.sh COMMIT START_AT END_AT REPO [REPO...]
 #
 # 정식 경로만 쓴다: linux-run --entry collect --egress pin(resolver 192.168.5.2) →
-# executable_oss-research-collect(상한 PR 3/repo, 예산 60, 명시 UTC 구간) → relay(token 없음) →
+# oss-research-collect(상한 PR 3/repo, 예산 60, 명시 UTC 구간) → relay(token 없음) →
 # srt child adapter --require-proxy. mock·sitecustomize 없음. 모델·credential 없음. GitHub 쓰기 없음.
 # 결과는 cp -P(링크를 따라가지 않음)로 root 전용 증거 경로에 보존하고 tar로 묶는다. 회수 판정은 호스트
 # verify_pickup.py --collect --upstream github-rest-via-relay가 한다. 실패·부분도 그대로 보존한다.
@@ -25,7 +25,7 @@ echo "INFO start $(date -u +%FT%TZ)"
 sudo bash -c 'env -i "$@" > /run/osr-live-record.json 2> /run/osr-live-wrapper.err' _ \
   PATH=$NODE:/usr/bin:/bin LANG=C.UTF-8 OSS_RESEARCH_SRT_PREFIX=/opt/oss-research/srt-0.0.77 \
   OSS_RESEARCH_EGRESS_RESOLVER=192.168.5.2 PYTHONDONTWRITEBYTECODE=1 \
-  python3 -I -B $S/dot_local/bin/executable_oss-research-linux-run --entry collect --egress pin --timeout 900 -- \
+  python3 -I -B $S/bin/oss-research-linux-run --entry collect --egress pin --timeout 900 -- \
   --out-dir "$OUT" "${REPOS[@]}" --start-at "$START" --end-at "$END" --max-per-repo 3 --request-budget 60 \
   --timeout 840
 rc=$?

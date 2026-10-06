@@ -97,7 +97,7 @@ PERMISSION_WORDING = re.compile(r"requested permissions|haven't granted|[Pp]ermi
 
 
 def load_worker():
-    script = Path(__file__).resolve().parents[4] / "dot_local/bin/executable_oss-research-worker"
+    script = Path(__file__).resolve().parents[2] / "bin/oss-research-worker"
     loader = importlib.machinery.SourceFileLoader("oss_research_worker_verdict", str(script))
     module = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
     loader.exec_module(module)
@@ -503,7 +503,7 @@ def judge_auto(record_text: str, stream_text: str, kind: str, canaries: dict,
     return rows
 
 
-# The bundle's report_max_bytes (dot_agents/skills/researching-open-source-contributions/analysis/run_limits.json).
+# The bundle's report_max_bytes (skills/researching-open-source-contributions/analysis/run_limits.json).
 MAX_ANALYSIS_REPORT_BYTES = 262144
 
 

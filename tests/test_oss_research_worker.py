@@ -19,7 +19,7 @@ import unittest
 from unittest import mock
 
 
-SCRIPT = Path(__file__).resolve().parents[1] / "dot_local/bin/executable_oss-research-worker"
+SCRIPT = Path(__file__).resolve().parents[1] / "bin/oss-research-worker"
 LOADER = importlib.machinery.SourceFileLoader("oss_research_worker", str(SCRIPT))
 SPEC = importlib.util.spec_from_loader(LOADER.name, LOADER)
 worker = importlib.util.module_from_spec(SPEC)

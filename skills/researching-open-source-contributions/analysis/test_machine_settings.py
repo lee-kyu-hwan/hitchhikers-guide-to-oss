@@ -4,7 +4,7 @@ machine_settings.py (VM root, VM logs, dated run records) and harness/analysis_c
 unset or empty gives exactly the value used before the split, a set variable gives that value. The harness case
 runs as an unchanged copy against a fake limactl under a temporary VM root, so no VM, model or token is used.
 
-  /opt/homebrew/bin/python3 -B -m unittest dot_agents/skills/researching-open-source-contributions/analysis/test_machine_settings.py
+  /opt/homebrew/bin/python3 -B -m unittest skills/researching-open-source-contributions/analysis/test_machine_settings.py
 """
 
 from __future__ import annotations
@@ -19,13 +19,14 @@ import tempfile
 import unittest
 
 HERE = Path(__file__).resolve().parent
-REPO = HERE.parents[3]
+REPO = HERE.parents[2]
 HARNESS = HERE / "harness/analysis_call.sh"
 VARIABLES = ("OSS_RESEARCH_VM_ROOT", "OSS_RESEARCH_VM_NAME", "OSS_RESEARCH_RECORDS_ROOT")
-# The values the bundle used before #290, written out here on purpose.
+# The defaults, written out here on purpose: the values used before #290, except the records root, which is this
+# repository's copy of the dotfiles records (tests/fixtures/dotfiles_records).
 OLD_VM_ROOT = "/Users/lee-kyu-hwan/.oss-research-vm"
 OLD_VM_NAME = "oss-research-debian"
-OLD_RECORDS_ROOT = str(REPO / "docs/research")
+OLD_RECORDS_ROOT = str(REPO / "tests/fixtures/dotfiles_records")
 FAKE_LIMACTL = """#!/bin/bash
 echo "$*" >> "$(dirname "$0")/../../calls.log"
 case "$*" in

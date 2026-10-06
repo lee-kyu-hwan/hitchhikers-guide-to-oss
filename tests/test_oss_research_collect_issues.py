@@ -26,7 +26,7 @@ import unittest
 from unittest import mock
 
 REPO = Path(__file__).resolve().parents[1]
-BIN = REPO / "dot_local/bin"
+BIN = REPO / "bin"
 
 
 def load(name, path):
@@ -36,13 +36,13 @@ def load(name, path):
     return module
 
 
-ISSUES_ENTRY = BIN / "executable_oss-research-collect-issues"
+ISSUES_ENTRY = BIN / "oss-research-collect-issues"
 entry = load("oss_research_collect_issues", ISSUES_ENTRY)
 collect_entry = entry.load_collect_entry()
 worker = collect_entry.load_worker()
-wrapper = load("oss_research_linux_run_for_issues", BIN / "executable_oss-research-linux-run")
-VERIFY = REPO / "dot_local/share/oss-research/linux/verify_pickup.py"
-SKILLS = REPO / "dot_codex/skills"
+wrapper = load("oss_research_linux_run_for_issues", BIN / "oss-research-linux-run")
+VERIFY = REPO / "share/linux/verify_pickup.py"
+SKILLS = REPO / "skills"
 
 
 def sha256(path):
@@ -121,7 +121,7 @@ class IssueEntryTests(unittest.TestCase):
     def test_the_pr_entry_and_its_limits_are_unchanged(self):
         self.assertEqual((collect_entry.MAX_PER_REPO, collect_entry.MAX_REQUEST_BUDGET,
                           collect_entry.MAX_INTERVAL_DAYS), (5, 60, 31))
-        self.assertEqual(wrapper.ENTRIES["collect"], "dot_local/bin/executable_oss-research-collect")
+        self.assertEqual(wrapper.ENTRIES["collect"], "bin/oss-research-collect")
         self.assertEqual(wrapper.ENTRIES["collect-issues"], entry.ENTRY)
         self.assertEqual(set(wrapper.ENTRIES), {"worker", "collect", "collect-issues", "candidate-reads", "verify"})
 
@@ -184,7 +184,7 @@ class IssueEntryTests(unittest.TestCase):
         command = seen["command"]
         self.assertEqual(command[:4], [*runtime, "--settings", "/p.json"])
         self.assertEqual(command[-1], "--require-proxy")
-        self.assertEqual(Path(command[command.index("-B") + 1]).name, "executable_oss-research-relay-issues")
+        self.assertEqual(Path(command[command.index("-B") + 1]).name, "oss-research-relay-issues")
         for option, value in (("--relay-url", "http://127.0.0.1:4242"), ("--date-field", "created"),
                               ("--state", "open"), ("--max-per-repo", "20"), ("--request-budget", "60"),
                               ("--start-at", "2026-03-28T00:00:00Z"), ("--end-at", "2026-09-28T00:00:00Z"),
@@ -341,7 +341,7 @@ class IssuePickupTests(unittest.TestCase):
                                   "github_token": {"authenticated": False, "token_file_sha256": None},
                                   "relay": {"sources": sources, "relay_sha256": "e" * 64, "port": 4242}},
             "envelope": {"schema": "oss-research-issue-collection-envelope/1",
-                         "entry": "dot_local/bin/executable_oss-research-collect-issues",
+                         "entry": "bin/oss-research-collect-issues",
                          "unit": "oss-research-0123456789abcdef", "upstream": "loopback-mock",
                          "github_token": {"authenticated": False, "token_file_sha256": None},
                          "request": dict(self.REQUEST), "adapter_exit": adapter,
@@ -429,7 +429,7 @@ class IssuePickupTests(unittest.TestCase):
             "adapter exit false": c(("envelope", "adapter_exit"), False),
             "run exit 0.0": c(("run-manifest.json", "exit_code"), 0.0),
             "PR envelope": c(("envelope", "schema"), "oss-research-collection-envelope/1"),
-            "other entry": c(("envelope", "entry"), "dot_local/bin/executable_oss-research-collect"),
+            "other entry": c(("envelope", "entry"), "bin/oss-research-collect"),
             "direct transport": c(("transport.json", "transport"), "direct"),
             "transport exit": c(("transport.json", "exit_code"), 3),
             "unrelayed request": c(("transport.json", "requests"), [{"outcome": "relay-refused"}] * 9),

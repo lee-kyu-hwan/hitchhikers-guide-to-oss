@@ -39,7 +39,7 @@ stream causes, permission mode auto and a clean credential check. Anything
 else fails. The default contract is unchanged.
 
 --collect is the non-AI collection step's contract (produced by the
-collection entry dot_local/bin/executable_oss-research-collect). Fixed names, all required: corpus.json, collection-manifest.json,
+collection entry bin/oss-research-collect). Fixed names, all required: corpus.json, collection-manifest.json,
 inventory.md, transport.json, relay.log, run-manifest.json and
 collection-envelope.json. The same structure checks apply first. Then every
 JSON file must be one object (no duplicate keys, no NaN/Infinity) and all of:
@@ -77,8 +77,8 @@ pickup checks held; it is not evidence that every matching PR was collected
 (the cap, the budget and search limits stay).
 
 --issues is the non-AI Issue collection step's contract (produced by
-dot_local/bin/executable_oss-research-collect-issues and its adapter
-executable_oss-research-relay-issues). Fixed names, all required:
+bin/oss-research-collect-issues and its adapter
+oss-research-relay-issues). Fixed names, all required:
 corpus.json, collection-manifest.json, transport.json, relay.log,
 run-manifest.json and collection-envelope.json. The same structure checks
 apply first, then every JSON file must be one object, and all of:
@@ -118,8 +118,8 @@ else. Exit 0 or 3 says the pickup checks held; it is not evidence that every
 matching Issue was collected (the cap, the budget and search limits stay).
 
 --candidate-reads is the non-AI candidate-verifier read step's contract (produced
-by dot_local/bin/executable_oss-research-candidate-reads and its adapter
-executable_oss-research-relay-verify). The host names the stage. Fixed names, all
+by bin/oss-research-candidate-reads and its adapter
+oss-research-relay-verify). The host names the stage. Fixed names, all
 required: discovery.json (discover) or locus-search.json (locus-search),
 verification-manifest.json, transport.json, relay.log, run-manifest.json and
 read-envelope.json. The same structure checks apply first, then every JSON file
@@ -444,15 +444,15 @@ def _empty_collection_is_explained(record: dict, repositories, docs_only) -> boo
 ISSUE_FILES = {"corpus.json", "collection-manifest.json", "transport.json", "relay.log",
                "run-manifest.json", "collection-envelope.json"}
 ISSUE_ENVELOPE = "oss-research-issue-collection-envelope/1"
-ISSUE_ENTRY = "dot_local/bin/executable_oss-research-collect-issues"
+ISSUE_ENTRY = "bin/oss-research-collect-issues"
 ISSUE_SKILL = "collecting-open-source-issues"
 ISSUE_LIMITS = {"issues": 20, "request_budget": 90, "interval_days": 184}
 ISSUE_DATE_FIELDS = ("created", "updated", "closed")
 ISSUE_STATES = ("open", "closed", "all")
 ISSUE_REQUEST_FIELDS = {"repositories", "date_field", "state", "start_at", "end_at", "max_per_repo",
                         "request_budget"}
-# The host's own reviewed tree: this file is dot_local/share/oss-research/linux/ (four levels below it).
-HOST_SKILLS = Path(__file__).resolve().parents[4] / "dot_codex/skills"
+# The host's own reviewed tree: this file is share/linux/ (two levels below it).
+HOST_SKILLS = Path(__file__).resolve().parents[2] / "skills"
 HOST_ISSUE_COLLECTOR = HOST_SKILLS / "collecting-open-source-issues/scripts/collect_open_source_issues.py"
 HOST_SIBLING = HOST_SKILLS / "collecting-recent-closed-prs/scripts/collect_recent_closed_prs.py"
 # run status -> (adapter exit, collection_status, wrapper exit)
@@ -711,7 +711,7 @@ def issue_bindings(dest: Path, docs: dict, result: dict, host: dict) -> list:
 
 
 CR_ENVELOPE = "oss-research-candidate-reads-envelope/1"
-CR_ENTRY = "dot_local/bin/executable_oss-research-candidate-reads"
+CR_ENTRY = "bin/oss-research-candidate-reads"
 CR_STAGES = ("discover", "locus-search")
 CR_INPUTS = {"discover": ("analysis.json",), "locus-search": ("discovery.json", "assessment.json")}
 CR_DOCUMENT = {"discover": "discovery.json", "locus-search": "locus-search.json"}

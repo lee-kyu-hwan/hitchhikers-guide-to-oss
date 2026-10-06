@@ -2,17 +2,17 @@
 """The non-AI candidate-verifier read entry: discover and locus-search through the relay, inside srt.
 
 Linux guest only, as the research user inside the unit wrapper
-(executable_oss-research-linux-run --entry candidate-reads):
+(oss-research-linux-run --entry candidate-reads):
 
-    executable_oss-research-candidate-reads --out-dir OUT --input-dir IN --stage discover \\
+    oss-research-candidate-reads --out-dir OUT --input-dir IN --stage discover \\
         --repo OWNER/NAME --pattern PAT-001 [--pattern PAT-002 ...] \\
         [--max-candidates-per-repo 5] [--max-candidates-total 5] [--max-clues-per-pattern 5] \\
         [--request-budget 60] [--timeout 300] [--static-reads none|rest] [--static-dir DIR ...]
-    executable_oss-research-candidate-reads --out-dir OUT --input-dir IN --stage locus-search \\
+    oss-research-candidate-reads --out-dir OUT --input-dir IN --stage locus-search \\
         --repo OWNER/NAME [--clue TEXT ...] [--max-clues-per-locus 5] [--request-budget 60] \\
         [--timeout 300]
 
-It is the PR and Issue collection entries' structure (executable_oss-research-collect,
+It is the PR and Issue collection entries' structure (oss-research-collect,
 -collect-issues) with the candidate verifier's two read steps behind it:
 verifying-open-source-contribution-candidates' discover and locus-search, which
 read GitHub and nothing else. The same worker pieces are reused, not copied:
@@ -26,7 +26,7 @@ is no upstream, base URL or proxy option: the relay talks to api.github.com only
 and holds no credential. There is no clone (the verifier's --allow-clone is never
 passed) and nothing is run from the target repository: static reads only.
 
-The child is executable_oss-research-relay-verify --require-proxy, which loads
+The child is oss-research-relay-verify --require-proxy, which loads
 the reviewed verifier from the worker's skills directory and reaches the relay
 only through srt's own loopback proxy. It reads only the worker's Linux system
 set plus this entry's own set: the pinned python, the relay-collect adapter it
@@ -66,7 +66,7 @@ code search or an unreadable source), anything else is "failed" (exit 4). Every
 outcome is kept.
 
 An optional --github-token-file PATH hands a read-only GitHub token file to the RELAY only
-(anonymous without it), checked and recorded exactly as in executable_oss-research-collect
+(anonymous without it), checked and recorded exactly as in oss-research-collect
 (collect_entry.checked_github_token). The file must also lie outside --input-dir, which the
 child reads. The child never gets the token or the path.
 
@@ -75,7 +75,7 @@ verification-manifest.json, transport.json} from the child, and in result/
 manifest.json (this run), relay.log, stderr.log and read-envelope.json, which
 binds every file's and every input's size and sha256 to the request, the child's
 exit code and the relay's ready sources. The host checks it with
-dot_local/share/oss-research/linux/verify_pickup.py --candidate-reads.
+share/linux/verify_pickup.py --candidate-reads.
 """
 
 from __future__ import annotations
@@ -110,10 +110,10 @@ RELAY_RESPONSE_BYTE_BUDGET = 64 * 1024 * 1024
 RELAY_TIMEOUT_SECONDS = 30.0
 ADAPTER_TIMEOUT_SECONDS = "30"
 ADAPTER_DEADLINE_MARGIN = 30.0
-ADAPTER = "executable_oss-research-relay-verify"
+ADAPTER = "oss-research-relay-verify"
 # The files beside the adapter that it loads by path (its ADAPTER constant: the
 # relay-collect adapter, whose RelayOpener it reuses). A test keeps this equal.
-ADAPTER_DEPENDENCIES = ("executable_oss-research-relay-collect",)
+ADAPTER_DEPENDENCIES = ("oss-research-relay-collect",)
 VERIFIER_SKILL = "verifying-open-source-contribution-candidates"
 VERIFIER_SCRIPT = "scripts/verify_candidates.py"
 # The verifier's own REVISION_PATHS (verify_candidates.py): the files it reads when it
@@ -128,7 +128,7 @@ OUTPUT_FILES = {"discover": ("discovery.json", "verification-manifest.json", "tr
                 "locus-search": ("locus-search.json", "verification-manifest.json", "transport.json")}
 ENVELOPE_SCHEMA = "oss-research-candidate-reads-envelope/1"
 UPSTREAM = "github-rest-via-relay"
-ENTRY = "dot_local/bin/executable_oss-research-candidate-reads"
+ENTRY = "bin/oss-research-candidate-reads"
 MODE = "candidate-reads"
 # REST static reads (the verifier's constants of the same names; a test keeps them equal).
 STATIC_READS_MODES = ("none", "rest")
@@ -185,7 +185,7 @@ class Reads(NamedTuple):
 
 def load_collect_entry(here: Path = Path(__file__)):
     """The PR collection entry beside this file, for load_worker and file_entry."""
-    path = Path(os.path.realpath(here)).with_name("executable_oss-research-collect")
+    path = Path(os.path.realpath(here)).with_name("oss-research-collect")
     loader = importlib.machinery.SourceFileLoader("oss_research_collect_entry", str(path))
     module = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
     loader.exec_module(module)

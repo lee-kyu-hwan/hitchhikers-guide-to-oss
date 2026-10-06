@@ -12,7 +12,7 @@ copied the backslashes. These tests pin the three parts of the fix:
 
 Every answer is a hand-written stand-in; nothing starts a model, opens the network or reads a credential.
 
-  /opt/homebrew/bin/python3 -B -m unittest dot_agents/skills/researching-open-source-contributions/analysis/test_quote_escape.py
+  /opt/homebrew/bin/python3 -B -m unittest skills/researching-open-source-contributions/analysis/test_quote_escape.py
 """
 
 from __future__ import annotations

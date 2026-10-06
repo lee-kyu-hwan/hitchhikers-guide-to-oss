@@ -27,7 +27,7 @@ from unittest import mock
 
 
 REPO = Path(__file__).resolve().parents[1]
-SCRIPT = REPO / "dot_local/bin/executable_oss-research-worker"
+SCRIPT = REPO / "bin/oss-research-worker"
 LOADER = importlib.machinery.SourceFileLoader("oss_research_worker_skills", str(SCRIPT))
 SPEC = importlib.util.spec_from_loader(LOADER.name, LOADER)
 worker = importlib.util.module_from_spec(SPEC)
@@ -254,9 +254,9 @@ class StagingTests(Fixture):
         record = worker.stage_research_config(self.run_dir, self.staged())
         home = self.run_dir / "home/.claude"
         self.assertEqual(sha256(home / "skills/deep-research/SKILL.md"),
-                         sha256(REPO / "dot_agents/skills/deep-research/SKILL.md"))
+                         sha256(REPO / "share/staged/skills/deep-research/SKILL.md"))
         self.assertEqual(sha256(home / "workflows/deep-research.js"),
-                         sha256(REPO / "dot_claude/workflows/deep-research.js"))
+                         sha256(REPO / "share/staged/workflows/deep-research.js"))
         self.assertEqual(record["profile"], "deep-research")
         self.assertEqual([entry["staged"] for entry in record["files"]],
                          ["skills/deep-research/SKILL.md", "workflows/deep-research.js",
@@ -300,23 +300,23 @@ class StagingTests(Fixture):
             worker.stage_research_config(self.run_dir, self.staged(source_root=source_root))
 
     def test_hash_mismatch_is_blocked(self):
-        with (self.sources / "dot_claude/workflows/deep-research.js").open("a") as handle:
+        with (self.sources / "share/staged/workflows/deep-research.js").open("a") as handle:
             handle.write("// changed\n")
         self.blocked("differs from the reviewed pin")
 
     def test_missing_source_is_blocked(self):
-        (self.sources / "dot_agents/skills/deep-research/SKILL.md").unlink()
+        (self.sources / "share/staged/skills/deep-research/SKILL.md").unlink()
         self.blocked("unusable")
 
     def test_symlinked_source_is_blocked(self):
-        skill = self.sources / "dot_agents/skills/deep-research/SKILL.md"
+        skill = self.sources / "share/staged/skills/deep-research/SKILL.md"
         real = self.root / "elsewhere.md"
         shutil.move(skill, real)
         skill.symlink_to(real)
         self.blocked("symlink")
 
     def test_symlinked_source_directory_is_blocked(self):
-        directory = self.sources / "dot_claude/workflows"
+        directory = self.sources / "share/staged/workflows"
         shutil.move(directory, self.root / "moved-workflows")
         directory.symlink_to(self.root / "moved-workflows")
         self.blocked("symlink")
@@ -351,6 +351,9 @@ class StagingTests(Fixture):
         with self.assertRaisesRegex(worker.Blocked, "source checkout"):
             worker.reviewed_source_root(installed)
         self.assertEqual(worker.reviewed_source_root(SCRIPT), REPO)
+        # A checkout is <root>/bin/<name> with skills/ beside bin/; ~/.local/bin has no ~/.local/skills.
+        self.assertIsNone(worker.source_checkout(installed))
+        self.assertEqual(worker.source_checkout(SCRIPT), REPO)
 
     def test_changed_or_added_staged_files_fail_the_check(self):
         self.prepare()
@@ -465,7 +468,7 @@ class RunTests(Fixture):
         self.assertNotIn("report_sha256", manifest)
 
     def test_staging_failure_is_recorded_and_nothing_starts(self):
-        (self.sources / "dot_agents/skills/deep-research/SKILL.md").write_text("changed")
+        (self.sources / "share/staged/skills/deep-research/SKILL.md").write_text("changed")
         succeeded, manifest = self.research()
         self.assertFalse(succeeded)
         self.assertTrue(any(item.startswith("staging-blocked:")

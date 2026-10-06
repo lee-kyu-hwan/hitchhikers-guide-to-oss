@@ -9,7 +9,7 @@ T=$(sudo mktemp -d /tmp/osr-g-XXXX); sudo chown ossresearch:ossresearch $T
 sudo -u ossresearch bash -c "umask 077; mkdir -p $T/cred/claude-profile2 $T/input && chmod 700 $T/cred/claude-profile2 && printf 'sentinel-gate-token-%040d\n' 0 > $T/cred/claude-profile2/oauth-token && chmod 600 $T/cred/claude-profile2/oauth-token && echo summarize > $T/input/task.txt && chmod 755 $T $T/input && chmod 644 $T/input/task.txt"
 BASE="--profile claude-profile2 --input-dir $T/input --prompt-file $T/input/task.txt --credential-file $T/cred/claude-profile2/oauth-token --runtime-prefix /opt/oss-research/srt-0.0.77"
 ARGS="$BASE --model claude-opus-5-5 --effort medium"
-WRAP=(sudo env -i PATH=$NODE:/usr/bin:/bin LANG=C.UTF-8 OSS_RESEARCH_SRT_PREFIX=/opt/oss-research/srt-0.0.77 PYTHONDONTWRITEBYTECODE=1 python3 -I -B $S/dot_local/bin/executable_oss-research-linux-run)
+WRAP=(sudo env -i PATH=$NODE:/usr/bin:/bin LANG=C.UTF-8 OSS_RESEARCH_SRT_PREFIX=/opt/oss-research/srt-0.0.77 PYTHONDONTWRITEBYTECODE=1 python3 -I -B $S/bin/oss-research-linux-run)
 state() { printf 'units=%s procs=%s' \
   "$(systemctl list-units --all 'oss-research-*' --no-legend | grep -v oss-research-nft | grep -c .)" \
   "$(ps -u ossresearch -o pid= | grep -c .)"; }
@@ -23,11 +23,11 @@ O=$(sudo mktemp -d /tmp/osr-g-out-XXXX); sudo chown ossresearch:ossresearch $O
 "${WRAP[@]}" --entry verify --egress none --timeout 30 -- unit-check $O | python3 -c 'import json,sys; r=json.loads(sys.stdin.read().strip().splitlines()[-1]); print(r["unit"], r["exit_code"], r["stdout"].strip())'
 sudo rm -rf $O
 echo "== G2 direct run outside the wrapper (range otherwise matches, no marker)"
-sudo -u ossresearch env -i HOME=/home/ossresearch PATH=$NODE:/usr/bin:/bin LANG=C.UTF-8 python3 -I -B $S/dot_local/bin/executable_oss-research-worker $ARGS --run-dir $T/run-g2 < /dev/null; echo "rc=$? run_dir_exists=$(test -e $T/run-g2 && echo yes || echo no)"
+sudo -u ossresearch env -i HOME=/home/ossresearch PATH=$NODE:/usr/bin:/bin LANG=C.UTF-8 python3 -I -B $S/bin/oss-research-worker $ARGS --run-dir $T/run-g2 < /dev/null; echo "rc=$? run_dir_exists=$(test -e $T/run-g2 && echo yes || echo no)"
 echo "== G3 forged marker, stdin pipe closes at once (parent EOF guard)"
-echo | sudo -u ossresearch env -i HOME=/home/ossresearch PATH=$NODE:/usr/bin:/bin LANG=C.UTF-8 OSS_RESEARCH_UNIT=oss-research-0123456789abcdef python3 -I -B $S/dot_local/bin/executable_oss-research-worker $ARGS --run-dir $T/run-g3; echo "rc=$? run_dir_exists=$(test -e $T/run-g3 && echo yes || echo no)"
+echo | sudo -u ossresearch env -i HOME=/home/ossresearch PATH=$NODE:/usr/bin:/bin LANG=C.UTF-8 OSS_RESEARCH_UNIT=oss-research-0123456789abcdef python3 -I -B $S/bin/oss-research-worker $ARGS --run-dir $T/run-g3; echo "rc=$? run_dir_exists=$(test -e $T/run-g3 && echo yes || echo no)"
 echo "== G3b forged marker, an open pipe on stdin, outside any unit"
-sleep 20 | sudo -u ossresearch env -i HOME=/home/ossresearch PATH=$NODE:/usr/bin:/bin LANG=C.UTF-8 OSS_RESEARCH_UNIT=oss-research-0123456789abcdef python3 -I -B $S/dot_local/bin/executable_oss-research-worker $ARGS --run-dir $T/run-g3b; echo "rc=${PIPESTATUS[1]} run_dir_exists=$(test -e $T/run-g3b && echo yes || echo no)"
+sleep 20 | sudo -u ossresearch env -i HOME=/home/ossresearch PATH=$NODE:/usr/bin:/bin LANG=C.UTF-8 OSS_RESEARCH_UNIT=oss-research-0123456789abcdef python3 -I -B $S/bin/oss-research-worker $ARGS --run-dir $T/run-g3b; echo "rc=${PIPESTATUS[1]} run_dir_exists=$(test -e $T/run-g3b && echo yes || echo no)"
 echo "== G4 wrapper --entry worker, permission mode auto"
 "${WRAP[@]}" --entry worker --egress none --timeout 60 -- $ARGS --permission-mode auto --run-dir $T/run-g4 | show G4 $T/run-g4
 echo "== G5 wrapper --entry worker, relay requested"

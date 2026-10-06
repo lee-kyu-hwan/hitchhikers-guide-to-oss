@@ -22,13 +22,13 @@
 
 ## 실행
 
-- 저장소 체크아웃에서 쓴다. 형제 스킬(workflow `scripts/oss_workflow.py`, analyzer·verifier)과 격리 스택(`tests/fixtures/oss_research_worker/linux/`), 실행 기록(`docs/research/oss-e2e-2026-09-28/`)을 저장소 상대 경로로 읽기 때문이다. 그래서 `.chezmoiignore`가 이 `analysis/` 하위 트리를 $HOME 배포에서 뺀다(스킬 본체 `SKILL.md`·`scripts/`·`references/`·`tests/`는 그대로 배포된다).
-- 머신 설정값(#290): `OSS_RESEARCH_VM_ROOT`(VM 작업 루트, 기본 `/Users/lee-kyu-hwan/.oss-research-vm`), `OSS_RESEARCH_VM_NAME`(Lima 인스턴스, 기본 `oss-research-debian`, 하네스만 읽음), `OSS_RESEARCH_RECORDS_ROOT`(날짜별 실행 기록, 기본 이 체크아웃의 `docs/research`). 비었거나 지정하지 않으면 기본값이고, 기본값은 분리 전과 같다. 기본값 고정 시험은 `test_machine_settings.py`다.
+- 저장소 체크아웃에서 쓴다. 형제 스킬(workflow `scripts/oss_workflow.py`, analyzer·verifier)과 격리 스택(`tests/fixtures/oss_research_worker/linux/`, `share/linux/`), 시험이 읽는 실행 기록 사본(`tests/fixtures/dotfiles_records/`)을 저장소 상대 경로로 읽기 때문이다. 그래서 이 `analysis/` 하위 트리는 $HOME에 설치하지 않는다(dotfiles 당시 `.chezmoiignore`로 뺐다. 스킬 본체 `SKILL.md`·`scripts/`·`references/`·`tests/`는 설치된다). 실행 기록 원본은 dotfiles `docs/research/`에 있다.
+- 머신 설정값(#290): `OSS_RESEARCH_VM_ROOT`(VM 작업 루트, 기본 `/Users/lee-kyu-hwan/.oss-research-vm`), `OSS_RESEARCH_VM_NAME`(Lima 인스턴스, 기본 `oss-research-debian`, 하네스만 읽음), `OSS_RESEARCH_RECORDS_ROOT`(날짜별 실행 기록, 기본 이 저장소의 사본 `tests/fixtures/dotfiles_records`; dotfiles 체크아웃의 `docs/research`를 주면 원본을 읽는다). 비었거나 지정하지 않으면 기본값이다(VM 두 값은 분리 전과 같다). 기본값 고정 시험은 `test_machine_settings.py`다.
 - 시험은 모듈마다 따로 돌린다(같은 프로세스에서 여러 모듈을 discover하면 offline guard가 하네스 시험의 하위 프로세스를 막는다). CI의 스킬 시험은 `<스킬>/tests`만 찾으므로 이 시험들은 CI 밖이다(옮기기 전과 같다).
 
 ```sh
-for f in dot_agents/skills/researching-open-source-contributions/analysis/test_*.py; do /opt/homebrew/bin/python3 -B -m unittest "$f"; done
-for f in dot_agents/skills/researching-open-source-contributions/analysis/selftest_*.py; do /opt/homebrew/bin/python3 -B "$f"; done
+for f in skills/researching-open-source-contributions/analysis/test_*.py; do /opt/homebrew/bin/python3 -B -m unittest "$f"; done
+for f in skills/researching-open-source-contributions/analysis/selftest_*.py; do /opt/homebrew/bin/python3 -B "$f"; done
 ```
 
 ## 한정 재시도와 답 크기 목표 (#280)
@@ -86,25 +86,25 @@ strict가 답을 거부하는 이유는 모두 그 답의 지시문이 말한 �
 
 | 옛 경로 | 새 경로 |
 |---|---|
-| `docs/research/oss-e2e-2026-09-28/stage_inputs.py` | `dot_agents/skills/researching-open-source-contributions/analysis/stage_inputs.py` |
-| `docs/research/oss-e2e-2026-09-28/verify_e2e_result.py` | `dot_agents/skills/researching-open-source-contributions/analysis/verify_e2e_result.py` |
-| `docs/research/oss-e2e-2026-09-28/assess_contract.py` | `dot_agents/skills/researching-open-source-contributions/analysis/assess_contract.py` |
-| `docs/research/oss-e2e-2026-09-28/prepare_input.sh` | `dot_agents/skills/researching-open-source-contributions/analysis/prepare_input.sh` |
-| `docs/research/oss-e2e-2026-09-28/prompts/*.md`(6개) | `dot_agents/skills/researching-open-source-contributions/analysis/prompts/*.md` |
-| `docs/research/oss-e2e-2026-09-28/run_limits.json` | `dot_agents/skills/researching-open-source-contributions/analysis/run_limits.json` |
-| `docs/research/oss-e2e-2026-09-28/request.template.json` | `dot_agents/skills/researching-open-source-contributions/analysis/request.template.json` |
-| `docs/research/oss-e2e-2026-09-28/test_*.py`(9개)·`selftest_*.py`(3개) | `dot_agents/skills/researching-open-source-contributions/analysis/test_*.py`·`selftest_*.py` |
-| `tests/fixtures/oss_research_worker/linux/analysis_call.sh` | `dot_agents/skills/researching-open-source-contributions/analysis/harness/analysis_call.sh` |
+| `docs/research/oss-e2e-2026-09-28/stage_inputs.py` | `skills/researching-open-source-contributions/analysis/stage_inputs.py` |
+| `docs/research/oss-e2e-2026-09-28/verify_e2e_result.py` | `skills/researching-open-source-contributions/analysis/verify_e2e_result.py` |
+| `docs/research/oss-e2e-2026-09-28/assess_contract.py` | `skills/researching-open-source-contributions/analysis/assess_contract.py` |
+| `docs/research/oss-e2e-2026-09-28/prepare_input.sh` | `skills/researching-open-source-contributions/analysis/prepare_input.sh` |
+| `docs/research/oss-e2e-2026-09-28/prompts/*.md`(6개) | `skills/researching-open-source-contributions/analysis/prompts/*.md` |
+| `docs/research/oss-e2e-2026-09-28/run_limits.json` | `skills/researching-open-source-contributions/analysis/run_limits.json` |
+| `docs/research/oss-e2e-2026-09-28/request.template.json` | `skills/researching-open-source-contributions/analysis/request.template.json` |
+| `docs/research/oss-e2e-2026-09-28/test_*.py`(9개)·`selftest_*.py`(3개) | `skills/researching-open-source-contributions/analysis/test_*.py`·`selftest_*.py` |
+| `tests/fixtures/oss_research_worker/linux/analysis_call.sh` | `skills/researching-open-source-contributions/analysis/harness/analysis_call.sh` |
 | `docs/research/oss-e2e-2026-09-28/README.md`, `fixtures/`, `request.json`, `run_limits.legacy-fixture.json` | 그대로(실행 기록·증거) |
 
 ## 격리 스택 (#274에서 옮김)
 
-#261 때 `tests/fixtures/oss_research_worker/linux/`에 남겼던 격리 스택의 실행 파일은 #274에서 `dot_local/share/oss-research/linux/`로 옮겼다. 하네스(`harness/analysis_call.sh`)는 그 경로(호스트 `$REPO/dot_local/share/oss-research/linux/…`, 게스트 `$S/dot_local/share/oss-research/linux/model_once.sh`)를 부른다. 게스트 수락 시험(`unit_inner.py`·탐침·사례 스크립트)과 시험 데이터는 시험이라 `tests/fixtures/`에 남는다. 구분표와 결정은 `dot_local/share/oss-research/README.md`.
+#261 때 `tests/fixtures/oss_research_worker/linux/`에 남겼던 격리 스택의 실행 파일은 #274에서 `share/linux/`로 옮겼다. 하네스(`harness/analysis_call.sh`)는 그 경로(호스트 `$REPO/share/linux/…`, 게스트 `$S/share/linux/model_once.sh`)를 부른다. 게스트 수락 시험(`unit_inner.py`·탐침·사례 스크립트)과 시험 데이터는 시험이라 `tests/fixtures/`에 남는다. 구분표와 결정은 `share/README.md`.
 
 | 옛 경로 | 새 경로 |
 |---|---|
-| `tests/fixtures/oss_research_worker/linux/verify_pickup.py` | `dot_local/share/oss-research/linux/verify_pickup.py` |
-| `tests/fixtures/oss_research_worker/linux/model_once.sh` | `dot_local/share/oss-research/linux/model_once.sh` |
-| `tests/fixtures/oss_research_worker/linux/model_once_verdict.py` | `dot_local/share/oss-research/linux/model_once_verdict.py` |
-| `tests/fixtures/oss_research_worker/linux/collect_live.sh` | `dot_local/share/oss-research/linux/collect_live.sh` |
-| `tests/fixtures/oss_research_worker/linux/candidate_reads_live.sh` | `dot_local/share/oss-research/linux/candidate_reads_live.sh` |
+| `tests/fixtures/oss_research_worker/linux/verify_pickup.py` | `share/linux/verify_pickup.py` |
+| `tests/fixtures/oss_research_worker/linux/model_once.sh` | `share/linux/model_once.sh` |
+| `tests/fixtures/oss_research_worker/linux/model_once_verdict.py` | `share/linux/model_once_verdict.py` |
+| `tests/fixtures/oss_research_worker/linux/collect_live.sh` | `share/linux/collect_live.sh` |
+| `tests/fixtures/oss_research_worker/linux/candidate_reads_live.sh` | `share/linux/candidate_reads_live.sh` |

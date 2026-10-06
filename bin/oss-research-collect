@@ -2,9 +2,9 @@
 """The non-AI collection entry: recent closed PRs through the relay, inside srt.
 
 Linux guest only, as the research user inside the unit wrapper
-(executable_oss-research-linux-run --entry collect):
+(oss-research-linux-run --entry collect):
 
-    executable_oss-research-collect --out-dir OUT --repo OWNER/NAME \\
+    oss-research-collect --out-dir OUT --repo OWNER/NAME \\
         --start-at 2026-09-01T00:00:00Z --end-at 2026-09-08T00:00:00Z \\
         [--outcome all] [--docs-only title|label] [--max-per-repo 5] [--request-budget 60] [--timeout 300]
 
@@ -20,7 +20,7 @@ What runs (the worker's own pieces, reused, not copied):
   repositories only, request budget, response caps), started by the worker's
   Supervisor under one deadline with both groups ended on every exit;
 - the child, inside srt: the pinned python running
-  executable_oss-research-relay-collect --require-proxy, which loads the
+  oss-research-relay-collect --require-proxy, which loads the
   reviewed collector from the worker's skills directory and reaches the relay
   only through srt's own loopback proxy (a direct connect is refused there).
 
@@ -55,7 +55,7 @@ inventory.md, transport.json} from the child, and in result/ (not writable
 inside srt) manifest.json (this run), relay.log, stderr.log and
 collection-envelope.json, which binds every file's size and sha256 to the
 request, the child's exit code and the relay's ready sources. The host checks
-it with dot_local/share/oss-research/linux/verify_pickup.py --collect.
+it with share/linux/verify_pickup.py --collect.
 """
 
 from __future__ import annotations
@@ -82,7 +82,7 @@ RELAY_MAX_RESPONSE_BYTES = 4 * 1024 * 1024
 RELAY_RESPONSE_BYTE_BUDGET = 64 * 1024 * 1024
 RELAY_TIMEOUT_SECONDS = 30.0
 ADAPTER_TIMEOUT_SECONDS = "30"
-ADAPTER = "executable_oss-research-relay-collect"
+ADAPTER = "oss-research-relay-collect"
 OUTCOMES = ("all", "merged", "closed-unmerged")
 # The documentation filter's fixed choices (the collector's DOCS_ONLY_MODES). No other value reaches it.
 DOCS_ONLY_MODES = ("title", "label")
@@ -102,7 +102,7 @@ ENVELOPE_SCHEMA = "oss-research-collection-envelope/1"
 # What this entry states about where the relay went. The relay has no other
 # upstream; this is a statement, never evidence of a request.
 UPSTREAM = "github-rest-via-relay"
-ENTRY = "dot_local/bin/executable_oss-research-collect"
+ENTRY = "bin/oss-research-collect"
 
 EXIT_OK = 0
 EXIT_BAD_INPUT = 2
@@ -188,7 +188,7 @@ def token_path_is_readable_by_child(token_file: Path, allow_read: list[str]) -> 
 
 
 def load_worker(here: Path = Path(__file__)):
-    path = Path(os.path.realpath(here)).with_name("executable_oss-research-worker")
+    path = Path(os.path.realpath(here)).with_name("oss-research-worker")
     loader = importlib.machinery.SourceFileLoader("oss_research_worker", str(path))
     module = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
     loader.exec_module(module)

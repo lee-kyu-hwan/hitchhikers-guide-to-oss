@@ -19,9 +19,9 @@ set -u
 C=$1; S=/opt/oss-research/src-$C; NODE=/opt/oss-research/node-v24.20.0-linux-arm64/bin
 E=/var/lib/oss-research-evidence/candidate-reads-$C
 sudo install -d -m 0700 $E
-ANALYSIS=$S/dot_codex/skills/verifying-open-source-contribution-candidates/tests/fixtures/common/analysis.json
+ANALYSIS=$S/skills/verifying-open-source-contribution-candidates/tests/fixtures/common/analysis.json
 ENV=(env -i PATH=$NODE:/usr/bin:/bin LANG=C.UTF-8 OSS_RESEARCH_SRT_PREFIX=/opt/oss-research/srt-0.0.77 PYTHONDONTWRITEBYTECODE=1)
-WRAP="python3 -I -B $S/dot_local/bin/executable_oss-research-linux-run"
+WRAP="python3 -I -B $S/bin/oss-research-linux-run"
 state() { printf 'units=%s procs=%s pin_elements=%s' \
   "$(systemctl list-units --all 'oss-research-*' --no-legend | grep -v oss-research-nft | grep -c .)" \
   "$(ps -u ossresearch -o pid= | grep -c .)" \
@@ -65,7 +65,7 @@ OUT=$(sudo mktemp -d /tmp/osr-v-out-XXXX); sudo chown ossresearch:ossresearch $O
 sudo "${ENV[@]}" $WRAP --entry verify --egress none --timeout 300 -- candidate-reads-case $OUT upstream-hang > /tmp/osr-vrec.eof 2>&1 &
 sleep 12
 echo "== parent-eof before kill: $(state) srt_procs=$(pgrep -u ossresearch -fc srt || true)"
-sudo pkill -KILL -f "executable_oss-research-linux-run --entry verify" ; sleep 5
+sudo pkill -KILL -f "oss-research-linux-run --entry verify" ; sleep 5
 echo "== parent-eof after SIGKILL+5s: $(state)"
 sudo rm -rf $OUT /tmp/osr-vrec.eof
 # production entry through the wrapper: out-of-range arguments and inputs are refused before any relay (no network)
@@ -100,7 +100,7 @@ sudo chmod 755 $IN
 # outside the unit: a valid request, run directly as the research user (no wrapper, no unit marker)
 OUT=$(sudo mktemp -d /tmp/osr-v-out-XXXX); sudo chown ossresearch:ossresearch $OUT
 sudo -u ossresearch env -i HOME=/home/ossresearch PATH=$NODE:/usr/bin:/bin LANG=C.UTF-8 OSS_RESEARCH_SRT_PREFIX=/opt/oss-research/srt-0.0.77 \
-  python3 -I -B $S/dot_local/bin/executable_oss-research-candidate-reads --out-dir $OUT --input-dir $IN --stage discover --repo octo/demo --pattern PAT-001 \
+  python3 -I -B $S/bin/oss-research-candidate-reads --out-dir $OUT --input-dir $IN --stage discover --repo octo/demo --pattern PAT-001 \
   < /dev/null > /tmp/osr-vrec.out 2>&1
 echo "== entry outside the unit rc=$? $(state) out_entries=$(sudo ls -A $OUT | wc -l) stderr=$(tr -s '\n ' ' ' < /tmp/osr-vrec.out | cut -c1-200)"
 sudo cp /tmp/osr-vrec.out $E/outside-unit.txt

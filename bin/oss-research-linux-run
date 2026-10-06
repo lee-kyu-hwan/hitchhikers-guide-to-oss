@@ -4,7 +4,7 @@
 Linux guest only, as root, started by the trusted guest administrator:
 
     sudo env -i PATH=/usr/bin:/bin /usr/bin/python3 -I -B \\
-      /opt/oss-research/src-<commit>/dot_local/bin/executable_oss-research-linux-run \\
+      /opt/oss-research/src-<commit>/bin/oss-research-linux-run \\
       --entry worker|verify --timeout SECONDS [--egress none|pin] -- ARGS...
 
 With --egress pin (and OSS_RESEARCH_EGRESS_RESOLVER set by the administrator),
@@ -33,10 +33,10 @@ directory removed.
 
 Only five programs can run, all from the checked tree: the worker itself
 (whose main stays behind its closed gate), the non-AI collection entry
-dot_local/bin/executable_oss-research-collect (no model path), the non-AI
-Issue collection entry dot_local/bin/executable_oss-research-collect-issues
+bin/oss-research-collect (no model path), the non-AI
+Issue collection entry bin/oss-research-collect-issues
 (no model path), the non-AI candidate-verifier read entry
-dot_local/bin/executable_oss-research-candidate-reads (no model path, no clone)
+bin/oss-research-candidate-reads (no model path, no clone)
 and the non-AI verification entry
 tests/fixtures/oss_research_worker/linux/unit_inner.py. Nothing here adds a
 sudoers rule or runs anything else as root.
@@ -88,7 +88,7 @@ CLOCK_TOLERANCE_SECONDS = 5.0
 # 1970 would otherwise be copied into the system clock): block instead of resetting.
 CLOCK_MAX_RESYNC_SECONDS = 7 * 24 * 3600
 CLOCK_SET_SECONDS = 10
-WORKER = "executable_oss-research-worker"
+WORKER = "oss-research-worker"
 # worker: the research worker (its main stays behind its model gates).
 # collect: the non-AI collection entry (relay + collector in srt, model=False;
 # no model, credential or prompt, so it opens no model path).
@@ -97,10 +97,10 @@ WORKER = "executable_oss-research-worker"
 # candidate-reads: the non-AI candidate-verifier read entry (the same relay and srt
 # child shape, with the verifier's discover and locus-search; model=False; no clone).
 # verify: the non-AI verification entry of the tests.
-ENTRIES = {"worker": "dot_local/bin/executable_oss-research-worker",
-           "collect": "dot_local/bin/executable_oss-research-collect",
-           "collect-issues": "dot_local/bin/executable_oss-research-collect-issues",
-           "candidate-reads": "dot_local/bin/executable_oss-research-candidate-reads",
+ENTRIES = {"worker": "bin/oss-research-worker",
+           "collect": "bin/oss-research-collect",
+           "collect-issues": "bin/oss-research-collect-issues",
+           "candidate-reads": "bin/oss-research-candidate-reads",
            "verify": "tests/fixtures/oss_research_worker/linux/unit_inner.py"}
 # The unit's properties are fixed; RuntimeMaxSec follows --timeout. MemoryMax
 # leaves the 2 GiB guest room for its own services.
@@ -119,7 +119,7 @@ MANIFEST_SHA256 = re.compile(r"\Asha256:[0-9a-f]{64}\Z")  # egress-pin's manifes
 # pinned names on 443 for the run and is always cleared afterwards. The
 # resolver is decided by the administrator (no default yet); none means the
 # research user keeps no egress at all (the guest's nft default).
-EGRESS_PIN = "dot_local/bin/executable_oss-research-egress-pin"
+EGRESS_PIN = "bin/oss-research-egress-pin"
 EGRESS_MODES = ("none", "pin")
 EGRESS_RESOLVER_VARIABLE = "OSS_RESEARCH_EGRESS_RESOLVER"
 EGRESS_SECONDS = 60
@@ -231,10 +231,11 @@ def trusted_tree(source: Path) -> list[str]:
 def bootstrap(script: Path, entry: str, python: Path,
               egress: str = "none") -> tuple[Path, list[str]]:
     """(source tree, problems): everything the import and the unit rely on."""
-    if script.is_symlink() or not script.name.startswith("executable_"):
+    # A reviewed source tree: this file is <tree>/bin/<name> with skills/ beside bin/.
+    if script.is_symlink() or script.parent.name != "bin" or not (script.parent.parent / "skills").is_dir():
         return Path(), ["the unit wrapper runs only as the file of a reviewed source tree"]
     script = Path(os.path.realpath(script))
-    source = script.parents[2]
+    source = script.parents[1]
     problems = trusted_tree(source)
     for label, path in (("unit wrapper", script), ("worker", script.with_name(WORKER)),
                         ("entry", source / ENTRIES[entry]), ("python", python),

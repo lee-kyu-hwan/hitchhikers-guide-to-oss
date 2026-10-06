@@ -34,7 +34,7 @@ from unittest import mock
 
 
 REPO = Path(__file__).resolve().parents[1]
-SCRIPT = REPO / "dot_local/bin/executable_oss-research-worker"
+SCRIPT = REPO / "bin/oss-research-worker"
 FIXTURES = REPO / "tests/fixtures/oss_research_worker_supervisor"
 
 
@@ -356,8 +356,8 @@ class RelayReadyTests(unittest.TestCase):
 
     def test_trusted_relay_is_the_sibling_and_its_ready_line_checks_out(self):
         relay, skills = worker.trusted_relay(SCRIPT)
-        self.assertEqual(relay, REPO / "dot_local/bin/executable_oss-research-relay")
-        self.assertEqual(skills, REPO / "dot_codex/skills")
+        self.assertEqual(relay, REPO / "bin/oss-research-relay")
+        self.assertEqual(skills, REPO / "skills")
         request = worker.checked_relay_request(["octo/demo"], 5, 4096, 65536, 5.0)
         launch = worker.relay_launch(request, {"PATH": "/usr/bin:/bin", "GH_TOKEN": "sentinel"})
         self.assertEqual(launch.argv[:3], [PYTHON, "-B", str(relay)])

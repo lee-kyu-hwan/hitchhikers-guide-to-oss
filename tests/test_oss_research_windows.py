@@ -1,4 +1,4 @@
-"""Tests for the collection window planner (executable_oss-research-windows).
+"""Tests for the collection window planner (oss-research-windows).
 
 The planner turns a period, repositories and outcomes into one collection run per
 repository, outcome and window of at most 31 days, and prints the isolated
@@ -18,7 +18,7 @@ import unittest
 
 
 ROOT = Path(__file__).resolve().parents[1]
-SCRIPT = ROOT / "dot_local/bin/executable_oss-research-windows"
+SCRIPT = ROOT / "bin/oss-research-windows"
 FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 
 
@@ -107,7 +107,7 @@ class RunListTests(unittest.TestCase):
                           "--end-at", run["end_at"], "--outcome", run["outcome"], "--docs-only", "title",
                           "--max-per-repo", "5", "--request-budget", "60", "--timeout", "840"], run["linux_run_args"])
         self.assertIs(document["executed"], False)
-        self.assertIn("executable_oss-research-linux-run", document["linux_run"])
+        self.assertIn("oss-research-linux-run", document["linux_run"])
         without, _ = plan(*self.ARGS)
         self.assertNotIn("--docs-only", without["runs"][0]["linux_run_args"])
 

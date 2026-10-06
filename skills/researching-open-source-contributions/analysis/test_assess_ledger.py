@@ -9,7 +9,7 @@ The harness runs as a copy whose VM root is a fake limactl (the fixture of tests
 AnalysisCallLedgerTests, borrowed, not changed), so no VM, model or token is used. This file does not import the
 offline fixture: the harness is a bash process.
 
-  /opt/homebrew/bin/python3 -B -m unittest dot_agents/skills/researching-open-source-contributions/analysis/test_assess_ledger.py
+  /opt/homebrew/bin/python3 -B -m unittest skills/researching-open-source-contributions/analysis/test_assess_ledger.py
 """
 
 from __future__ import annotations
@@ -21,7 +21,7 @@ import sys
 import unittest
 
 HERE = Path(__file__).resolve().parent
-REPO = HERE.parents[3]
+REPO = HERE.parents[2]
 sys.path.insert(0, str(REPO))
 sys.path.insert(0, str(HERE))
 sys.dont_write_bytecode = True

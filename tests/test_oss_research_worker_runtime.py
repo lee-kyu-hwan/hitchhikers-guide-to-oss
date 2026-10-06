@@ -42,7 +42,7 @@ import uuid
 
 
 REPO = Path(__file__).resolve().parents[1]
-SCRIPT = REPO / "dot_local/bin/executable_oss-research-worker"
+SCRIPT = REPO / "bin/oss-research-worker"
 PROBE = REPO / "tests/fixtures/oss_research_worker/probe.py"
 LOADER = importlib.machinery.SourceFileLoader("oss_research_worker", str(SCRIPT))
 SPEC = importlib.util.spec_from_loader(LOADER.name, LOADER)

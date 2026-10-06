@@ -284,7 +284,7 @@ COLLECT_CASES = ("normal", "drop-tz", "drop-collector", "upstream-missing", "ups
 
 
 def load_collect_entry():
-    path = Path.cwd().resolve() / "dot_local/bin/executable_oss-research-collect"
+    path = Path.cwd().resolve() / "bin/oss-research-collect"
     loader = importlib.machinery.SourceFileLoader("oss_research_collect_entry", str(path))
     module = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
     loader.exec_module(module)
@@ -306,7 +306,7 @@ def token_counts(upstream, token_file) -> dict:
 def collect(out: Path, case: str = "normal", token_file: Path | None = None) -> int:
     """The production collection entry's run_collection, with local fixtures.
 
-    What runs is executable_oss-research-collect's own code: its limits, its
+    What runs is oss-research-collect's own code: its limits, its
     policy (build_policy(model=False) + the collection read set), its adapter
     argv (--require-proxy), its record function and envelope. Only the
     infrastructure beside it is a fixture: a loopback mock api.github.com (the
@@ -457,7 +457,7 @@ RATE_LIMIT_RETRY_AFTER = "31"
 
 
 def load_issue_entry():
-    path = Path.cwd().resolve() / "dot_local/bin/executable_oss-research-collect-issues"
+    path = Path.cwd().resolve() / "bin/oss-research-collect-issues"
     loader = importlib.machinery.SourceFileLoader("oss_research_collect_issues_entry", str(path))
     module = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
     loader.exec_module(module)
@@ -467,7 +467,7 @@ def load_issue_entry():
 def collect_issues(out: Path, case: str = "normal", token_file: Path | None = None) -> int:
     """The Issue collection entry's run_collection, with local fixtures.
 
-    As collect(): what runs is executable_oss-research-collect-issues's own
+    As collect(): what runs is oss-research-collect-issues's own
     code (limits, policy, read set, the relay-issues adapter argv with
     --require-proxy, record and envelope). Beside it: the loopback mock
     api.github.com of tests/test_oss_research_relay_issues (two open Issues of
@@ -650,7 +650,7 @@ CANDIDATE_CASES = ("normal", "anonymous-code-search", "locus-search", "drop-veri
 
 
 def load_candidate_entry():
-    path = Path.cwd().resolve() / "dot_local/bin/executable_oss-research-candidate-reads"
+    path = Path.cwd().resolve() / "bin/oss-research-candidate-reads"
     loader = importlib.machinery.SourceFileLoader("oss_research_candidate_reads_entry", str(path))
     module = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
     loader.exec_module(module)
@@ -669,7 +669,7 @@ def candidate_inputs(directory: Path, files: dict) -> Path:
 def candidate_reads(out: Path, case: str = "normal", token_file: Path | None = None) -> int:
     """The candidate-reads entry's run_reads, with local fixtures.
 
-    As collect_issues(): what runs is executable_oss-research-candidate-reads's own code
+    As collect_issues(): what runs is oss-research-candidate-reads's own code
     (limits, input checks, policy, read set, the relay-verify adapter argv with
     --require-proxy, record and envelope). Beside it: the loopback mock api.github.com of
     tests/test_oss_research_relay_verify (a target repository of octo/demo and the synthetic

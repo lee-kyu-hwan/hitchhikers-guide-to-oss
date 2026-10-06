@@ -8,7 +8,7 @@ cap 40, with repository bundles that would pass. The merge itself is split into 
 answers do not fit one prompt; there is no fixed group limit. Every answer below is a hand-written stand-in;
 nothing here starts a model, opens the network or reads a credential.
 
-  /opt/homebrew/bin/python3 -B -m unittest dot_agents/skills/researching-open-source-contributions/analysis/test_dry_plan.py
+  /opt/homebrew/bin/python3 -B -m unittest skills/researching-open-source-contributions/analysis/test_dry_plan.py
 """
 
 from __future__ import annotations
