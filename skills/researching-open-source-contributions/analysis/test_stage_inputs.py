@@ -31,6 +31,7 @@ sys.path.insert(0, str(HERE))
 
 import offline_fixture as fx  # noqa: E402  (installs the offline guards first)
 import stage_inputs  # noqa: E402
+import machine_settings as machine  # noqa: E402
 
 LENSES = ("blind", "correctness", "maintenance", "review", "structure")
 GENERATED_AT = "2026-09-28T00:00:00Z"
@@ -825,7 +826,7 @@ class ShardedRunTests(unittest.TestCase):
                         stage_inputs.PROMPT_MAX_BYTES)
 
 
-EVIDENCE_928 = Path("/Users/lee-kyu-hwan/.oss-research-vm/logs/a78-two-repo-20260928T075531Z")
+EVIDENCE_928 = machine.VM_LOGS / "a78-two-repo-20260928T075531Z"
 
 
 @unittest.skipUnless((EVIDENCE_928 / "analysis/in-final/final/task.txt").is_file(),

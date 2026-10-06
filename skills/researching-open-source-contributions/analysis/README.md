@@ -14,6 +14,7 @@
 | `run_limits.json` | strict 상한, worker 선택값, 추출·검증 답 크기 목표치, 한정 재시도 정책(`model_retry`) |
 | `retry_policy.py` | 한정 재시도 정책 하나(#280): call_plan의 재시도 몫, 재시도할 strict 판정 분류, 하네스의 재시도 허용(`admit`) |
 | `request.template.json` | workflow 요청 틀 |
+| `machine_settings.py` | 이 머신의 설정값(#290): VM 작업 루트(`OSS_RESEARCH_VM_ROOT`)와 날짜별 실행 기록 위치(`OSS_RESEARCH_RECORDS_ROOT`). 지정하지 않으면 분리 전과 같은 값 |
 | `prepare_input.sh` | 수집 산출물 → blind 추출 입력 1개 |
 | `harness/analysis_call.sh` | 호스트에서 격리 모델 호출 1회와 원장(호출 상한·call_plan 결속·이어받기 체인·재시도 몫, `--retry-of`) |
 | `harness/call_with_retry.py` | 계획된 호출 1개: 하네스 호출 → 원장 줄 확인 → strict 검사·채택, 답 내용 위반이면 같은 prompt로 한정 재시도(#280) |
@@ -22,6 +23,7 @@
 ## 실행
 
 - 저장소 체크아웃에서 쓴다. 형제 스킬(workflow `scripts/oss_workflow.py`, analyzer·verifier)과 격리 스택(`tests/fixtures/oss_research_worker/linux/`), 실행 기록(`docs/research/oss-e2e-2026-09-28/`)을 저장소 상대 경로로 읽기 때문이다. 그래서 `.chezmoiignore`가 이 `analysis/` 하위 트리를 $HOME 배포에서 뺀다(스킬 본체 `SKILL.md`·`scripts/`·`references/`·`tests/`는 그대로 배포된다).
+- 머신 설정값(#290): `OSS_RESEARCH_VM_ROOT`(VM 작업 루트, 기본 `/Users/lee-kyu-hwan/.oss-research-vm`), `OSS_RESEARCH_VM_NAME`(Lima 인스턴스, 기본 `oss-research-debian`, 하네스만 읽음), `OSS_RESEARCH_RECORDS_ROOT`(날짜별 실행 기록, 기본 이 체크아웃의 `docs/research`). 비었거나 지정하지 않으면 기본값이고, 기본값은 분리 전과 같다. 기본값 고정 시험은 `test_machine_settings.py`다.
 - 시험은 모듈마다 따로 돌린다(같은 프로세스에서 여러 모듈을 discover하면 offline guard가 하네스 시험의 하위 프로세스를 막는다). CI의 스킬 시험은 `<스킬>/tests`만 찾으므로 이 시험들은 CI 밖이다(옮기기 전과 같다).
 
 ```sh

@@ -26,6 +26,7 @@ sys.path.insert(0, str(HERE))
 import test_reduce_inputs as reduce  # noqa: E402  (installs the offline guards first)
 import test_stage_inputs as base  # noqa: E402
 import retry_policy  # noqa: E402
+import machine_settings as machine  # noqa: E402
 
 stage_inputs, stage, workflow, CAP = reduce.stage_inputs, reduce.stage, reduce.workflow, reduce.CAP
 
@@ -628,7 +629,7 @@ class ContinueFromExtractStageReduceTests(reduce.ReducedCase):
                                                                          "bound-continuation")))
 
 
-EVIDENCE_R2 =Path("/Users/lee-kyu-hwan/.oss-research-vm/logs/a78-period-analysis-eslint-r2-20261004T131350Z")
+EVIDENCE_R2 = machine.VM_LOGS / "a78-period-analysis-eslint-r2-20261004T131350Z"
 
 
 class RunR2Case(unittest.TestCase):
@@ -690,7 +691,7 @@ class RunR2ContinuationTests(RunR2Case):
 
 
 
-EVIDENCE_R3 = Path("/Users/lee-kyu-hwan/.oss-research-vm/logs/a78-period-analysis-eslint-r3-20261005T025628Z")
+EVIDENCE_R3 = machine.VM_LOGS / "a78-period-analysis-eslint-r3-20261005T025628Z"
 
 
 @unittest.skipUnless((EVIDENCE_R3 / "answers/synthesis-07.result.json").is_file()
@@ -816,7 +817,7 @@ class RunR2NewLimitsTests(RunR2Case):
         self.assertFalse(any((self.root / name).exists() for name in ("s", "v", "chain")))
 
 
-EVIDENCE_R6 = Path("/Users/lee-kyu-hwan/.oss-research-vm/logs/a78-period-analysis-eslint-r6-20261005T043448Z")
+EVIDENCE_R6 = machine.VM_LOGS / "a78-period-analysis-eslint-r6-20261005T043448Z"
 
 
 @unittest.skipUnless((EVIDENCE_R6 / "in-continue/stage.json").is_file() and (EVIDENCE_R6 / "ledger-limit.json").is_file()
@@ -860,7 +861,7 @@ class RunR6ChainTests(RunR2Case):
 
 
 
-SPLIT_GATE = Path("/Users/lee-kyu-hwan/.oss-research-vm/logs/a78-split-gate-20261006T055754Z")
+SPLIT_GATE = machine.VM_LOGS / "a78-split-gate-20261006T055754Z"
 # The ten extract answers the split gate run adopted (docs/research/2026-10-06-split-gate-run/README.md).
 SPLIT_GATE_ANSWERS = {
     "extract-blind-01": "a10f20ff3842031dbdf1cb121cd4ed73c37688020ba66f6907ec546e70055a38",
@@ -941,7 +942,7 @@ class SplitGateContinuationTests(unittest.TestCase):
 
 
 
-FRESH = Path("/Users/lee-kyu-hwan/.oss-research-vm/logs/a78-split-gate-fresh-20261006T081016Z")
+FRESH = machine.VM_LOGS / "a78-split-gate-fresh-20261006T081016Z"
 
 
 def rebuild_run(test, evidence: Path, root: Path) -> str:

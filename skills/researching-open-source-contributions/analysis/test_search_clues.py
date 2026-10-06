@@ -30,6 +30,7 @@ sys.path.insert(0, str(HERE))
 sys.dont_write_bytecode = True
 
 import selftest_verify_kinds as kinds  # noqa: E402
+import machine_settings as machine  # noqa: E402
 
 
 def final_with_clues(clues):
@@ -77,7 +78,7 @@ class FinalAnswerSearchClues(unittest.TestCase):
         self.assertIn("no search_clues", details["R6-search-clues"])
 
 
-EVIDENCE_R6 = Path("/Users/lee-kyu-hwan/.oss-research-vm/logs/a78-period-analysis-eslint-r6-20261005T043448Z")
+EVIDENCE_R6 = machine.VM_LOGS / "a78-period-analysis-eslint-r6-20261005T043448Z"
 
 
 @unittest.skipUnless((EVIDENCE_R6 / "final/verdict.json").is_file(), "the r6 final call is only on the machine that made it")

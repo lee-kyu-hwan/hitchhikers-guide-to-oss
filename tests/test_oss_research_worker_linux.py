@@ -3239,7 +3239,7 @@ class AnalysisCallLedgerTests(unittest.TestCase):
     unit, so each accepted call appends one token line to the ledger and nothing is picked up."""
 
     HARNESS = REPO / "dot_agents/skills/researching-open-source-contributions/analysis/harness/analysis_call.sh"
-    VM_ROOT = "W=/Users/lee-kyu-hwan/.oss-research-vm\n"
+    VM_ROOT = "W=${OSS_RESEARCH_VM_ROOT:-/Users/lee-kyu-hwan/.oss-research-vm}\n"
     FAKE_LIMACTL = """#!/bin/bash
 echo "$*" >> "$(dirname "$0")/../../calls.log"
 case "$*" in
@@ -3713,7 +3713,9 @@ exit 0
         self.assertEqual(self.call(plan, ledger=child, parent=self.ledger_dir).returncode, 0)
         self.assertEqual(self.limactl_calls(), before + 3)
 
-    EVIDENCE_R6 = Path("/Users/lee-kyu-hwan/.oss-research-vm/logs/a78-period-analysis-eslint-r6-20261005T043448Z")
+    # The VM root as analysis/machine_settings.py resolves it (#290): OSS_RESEARCH_VM_ROOT, else the default.
+    EVIDENCE_R6 = (Path(os.environ.get("OSS_RESEARCH_VM_ROOT") or "/Users/lee-kyu-hwan/.oss-research-vm")
+                   / "logs/a78-period-analysis-eslint-r6-20261005T043448Z")
 
     @unittest.skipUnless((EVIDENCE_R6 / "ledger-limit.json").is_file() and (EVIDENCE_R6 / "in-continue/stage.json").is_file(),
                          "the 2026-10-05 eslint r6 ledger is only on the machine that made it")

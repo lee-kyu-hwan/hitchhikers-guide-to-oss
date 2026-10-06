@@ -22,13 +22,16 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 VERIFY = HERE / "verify_e2e_result.py"
+sys.path.insert(0, str(HERE))
+sys.dont_write_bytecode = True
+import machine_settings as machine  # noqa: E402
+
 # The 2026-09-28 run record beside this bundle's history: its fixtures and legacy limits stay there (#261).
-RECORD = HERE.parents[3] / "docs/research/oss-e2e-2026-09-28"
+RECORD = machine.RECORDS_ROOT / "oss-e2e-2026-09-28"
 CORPUS = next(p for p in (RECORD / "fixtures/corpus-min.json",
                           RECORD.parent / "oss-functional-validation-2026-09-28/raw/corpus.json") if p.exists())
 KEY, QUOTE = "npm-eslint-markdown#677", "Updates `editorconfig-checker` from 6.1.1 to 6.2.0"
 sys.path.insert(0, str(HERE.parents[3] / "dot_codex/skills/analyzing-open-source-pr-patterns/scripts"))
-sys.dont_write_bytecode = True
 from build_digest import records_by_key  # noqa: E402
 
 KEYS = records_by_key(json.loads(CORPUS.read_text(encoding="utf-8")))

@@ -1135,7 +1135,9 @@ class SearchPacingTimeoutTests(unittest.TestCase):
         self.assertEqual(verifier.SEARCH_RATE_LIMIT_RETRIES, 1)
 
 
-REAL_LOCUS_EVIDENCE = Path.home() / ".oss-research-vm/logs/a78-assess-rerun-20261006T054747Z"
+# OSS_RESEARCH_VM_ROOT names the VM root as analysis/machine_settings.py does (#290); unset, this test keeps $HOME.
+REAL_LOCUS_EVIDENCE = (Path(os.environ.get("OSS_RESEARCH_VM_ROOT") or Path.home() / ".oss-research-vm")
+                       / "logs/a78-assess-rerun-20261006T054747Z")
 
 
 @unittest.skipUnless(

@@ -30,6 +30,7 @@ sys.dont_write_bytecode = True
 import offline_fixture as fx  # noqa: E402  (installs the offline guards first)
 import stage_inputs  # noqa: E402
 import verify_e2e_result  # noqa: E402
+import machine_settings as machine  # noqa: E402
 
 vc = fx.vc
 PROMPT_CAP = 64 * 1024
@@ -561,8 +562,8 @@ class AssessPrompt(unittest.TestCase):
                 self.assertIn(reason, text, reason)
 
 
-EVIDENCE_R6 = Path("/Users/lee-kyu-hwan/.oss-research-vm/logs/a78-period-analysis-eslint-r6-20261005T043448Z")
-EVIDENCE_DISCOVERY = Path("/Users/lee-kyu-hwan/.oss-research-vm/logs/a78-candidate-discovery-20261005T052747Z")
+EVIDENCE_R6 = machine.VM_LOGS / "a78-period-analysis-eslint-r6-20261005T043448Z"
+EVIDENCE_DISCOVERY = machine.VM_LOGS / "a78-candidate-discovery-20261005T052747Z"
 
 
 @unittest.skipUnless((EVIDENCE_R6 / "analysis.json").is_file() and EVIDENCE_DISCOVERY.is_dir(),

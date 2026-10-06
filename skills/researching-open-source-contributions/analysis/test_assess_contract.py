@@ -28,6 +28,7 @@ import test_assess as base  # noqa: E402  (installs the offline guards first)
 
 fx, vc, stage, stage_inputs, verify_e2e_result = base.fx, base.vc, base.stage, base.stage_inputs, base.verify_e2e_result
 import assess_contract  # noqa: E402
+import machine_settings as machine  # noqa: E402
 
 OBSERVED_AT = "2026-10-05T00:00:00Z"
 HEAD = "a" * 40
@@ -195,7 +196,7 @@ class PromptAndStrictCheck(base.AssessCase):
         self.assert_status(items, {"R3-report-schema": "PASS"})
 
 
-EVIDENCE_R2 = Path("/Users/lee-kyu-hwan/.oss-research-vm/logs/a78-candidate-discovery-r2-20261005T140504Z")
+EVIDENCE_R2 = machine.VM_LOGS / "a78-candidate-discovery-r2-20261005T140504Z"
 
 
 @unittest.skipUnless((EVIDENCE_R2 / "assess-ledger/assess/result/report.md").is_file(),

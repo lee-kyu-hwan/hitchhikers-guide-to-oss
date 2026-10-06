@@ -49,9 +49,10 @@ import prompt_contract as contract  # noqa: E402
 import stage_inputs  # noqa: E402
 import verify_e2e_result as strict  # noqa: E402
 import assess_contract  # noqa: E402
+import machine_settings as machine  # noqa: E402
 
-CORPUS = next(path for path in (REPO / "docs/research/oss-e2e-2026-09-28/fixtures/corpus-min.json",
-                                REPO / "docs/research/oss-functional-validation-2026-09-28/raw/corpus.json")
+CORPUS = next(path for path in (machine.RECORDS_ROOT / "oss-e2e-2026-09-28/fixtures/corpus-min.json",
+                                machine.RECORDS_ROOT / "oss-functional-validation-2026-09-28/raw/corpus.json")
               if path.exists())
 LIMITS = json.loads((HERE / "run_limits.json").read_text(encoding="utf-8"))
 RECORDS = build_digest.records_by_key(json.loads(CORPUS.read_text(encoding="utf-8")))
@@ -595,7 +596,7 @@ class S2VerifyPromptStatesTheSize(ContractCase):
 
 
 
-FRESH = Path("/Users/lee-kyu-hwan/.oss-research-vm/logs/a78-split-gate-fresh-20261006T081016Z")
+FRESH = machine.VM_LOGS / "a78-split-gate-fresh-20261006T081016Z"
 
 
 @unittest.skipUnless((FRESH / "ledger/verify-c1-r2/result/report.md").is_file() and (FRESH / "wf-run/state.json").is_file(),

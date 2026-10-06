@@ -27,6 +27,7 @@ sys.path.insert(0, str(HERE))
 
 import test_reduce_inputs as reduce  # noqa: E402  (installs the offline guards first)
 import test_stage_inputs as base  # noqa: E402
+import machine_settings as machine  # noqa: E402
 
 stage_inputs, stage, workflow, fx, CAP = reduce.stage_inputs, reduce.stage, reduce.workflow, reduce.fx, reduce.CAP
 
@@ -431,8 +432,8 @@ class PackingTests(reduce.ReducedCase):
                 self.assertEqual(by_lens, stage_inputs.plan_synthesis_groups(self.context, results, report, stems))
 
 
-E = Path("/Users/lee-kyu-hwan/.oss-research-vm/logs/a78-period-20261004T055447Z")
-PERIOD_REQUEST = HERE.parents[3] / "docs/research/2026-10-04-period-research/analysis-eslint-request.json"
+E = machine.VM_LOGS / "a78-period-20261004T055447Z"
+PERIOD_REQUEST = machine.RECORDS_ROOT / "2026-10-04-period-research/analysis-eslint-request.json"
 OWNERS = {"eslint": "eslint/eslint", "tseslint": "typescript-eslint/typescript-eslint", "markdown": "eslint/markdown",
           "css": "eslint/css"}
 

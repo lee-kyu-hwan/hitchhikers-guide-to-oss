@@ -201,7 +201,10 @@ PY
     echo "a continue-plan call plan needs its PARENT_LEDGER_DIR" >&2; exit 2
   fi
 fi
-W=/Users/lee-kyu-hwan/.oss-research-vm
+# This machine's VM (#290; unset or empty keeps the default, as analysis/machine_settings.py does):
+# OSS_RESEARCH_VM_ROOT is the host work root of the Lima VM, OSS_RESEARCH_VM_NAME its instance.
+W=${OSS_RESEARCH_VM_ROOT:-/Users/lee-kyu-hwan/.oss-research-vm}
+VM=${OSS_RESEARCH_VM_NAME:-oss-research-debian}
 HARNESS_DIR=$(cd "$(dirname "$0")" && pwd)
 L() { env -i HOME="$W/home" LIMA_HOME="$W/lima" TMPDIR="$W/tmp" PATH="$W/tool/bin:/usr/bin:/bin:/usr/sbin:/sbin" "$W/tool/bin/limactl" "$@"; }
 REPO=$(cd "$(dirname "$0")/../../../../.." && pwd)
@@ -275,18 +278,18 @@ fi
 D="$LEDGER_DIR/$NAME"; mkdir -m 0700 "$D" || { echo "call directory exists: $D" >&2; exit 2; }
 input_sha=$(shasum -a 256 "$PROMPT_FILE" | cut -c1-64)
 STAGE=/var/lib/oss-research-staging/$NAME
-L shell --workdir / oss-research-debian -- sudo bash -c "install -d -m 0700 /var/lib/oss-research-staging && \
+L shell --workdir / "$VM" -- sudo bash -c "install -d -m 0700 /var/lib/oss-research-staging && \
   install -d -m 0700 $STAGE && umask 077 && cat > $STAGE/task.txt && chmod 0600 $STAGE/task.txt && \
   sha256sum $STAGE/task.txt | cut -c1-64" < "$PROMPT_FILE" > "$D/staged.sha256"
 [ "$(cat "$D/staged.sha256")" = "$input_sha" ] || { echo "staged prompt differs" >&2; exit 4; }
 MODE=analysis; EGRESS=pin; [ "$KIND" = sentinel ] && { MODE=analysis-dry; EGRESS=none; }
 began=$(date -u +%FT%TZ)
-L shell --workdir / oss-research-debian -- bash "$S/dot_local/share/oss-research/linux/model_once.sh" \
+L shell --workdir / "$VM" -- bash "$S/dot_local/share/oss-research/linux/model_once.sh" \
   "$KIND" "$S" /opt/oss-research/srt-0.0.77 /opt/oss-research/node-v24.20.0-linux-arm64/bin "$EGRESS" normal 330 300 \
   "$MODE" "$STAGE/task.txt" < "$CREDENTIAL" > "$D/harness.log" 2>&1
 harness_rc=$?
 ended=$(date -u +%FT%TZ)
-L shell --workdir / oss-research-debian -- sudo rm -rf "$STAGE"
+L shell --workdir / "$VM" -- sudo rm -rf "$STAGE"
 grep -qF -f "$CREDENTIAL" "$D/harness.log"; leak=$?
 if [ "$leak" != 1 ] || [ ! -s "$D/harness.log" ]; then
   echo "log not proven clean (grep exit $leak): not shown, not picked up" >&2
@@ -300,7 +303,7 @@ summary=$(grep '^SUMMARY' "$D/harness.log" | tail -1)
 tar_sha=""; pickup_rc=""; judge_rc=""
 if [ -n "$unit" ]; then
   for f in record.json task.txt result.tar; do
-    L shell --workdir / oss-research-debian -- sudo cat "/var/lib/oss-research-evidence/$unit/$f" > "$D/$f" 2>/dev/null || rm -f "$D/$f"
+    L shell --workdir / "$VM" -- sudo cat "/var/lib/oss-research-evidence/$unit/$f" > "$D/$f" 2>/dev/null || rm -f "$D/$f"
   done
   for f in "$D"/record.json "$D"/task.txt "$D"/result.tar; do
     [ -f "$f" ] || continue

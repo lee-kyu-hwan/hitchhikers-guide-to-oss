@@ -16,8 +16,12 @@ import hashlib, json, shutil, subprocess, sys, tempfile
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE))
+sys.dont_write_bytecode = True
+import machine_settings as machine  # noqa: E402
+
 # The 2026-09-28 run record beside this bundle's history: its fixtures and legacy limits stay there (#261).
-RECORD = HERE.parents[3] / "docs/research/oss-e2e-2026-09-28"
+RECORD = machine.RECORDS_ROOT / "oss-e2e-2026-09-28"
 CORPUS = RECORD / "fixtures/corpus-min.json"
 if sys.argv[1:2] == ["--corpus"] and len(sys.argv) == 3:
     CORPUS = Path(sys.argv[2]).resolve()

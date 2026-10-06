@@ -22,6 +22,7 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 
 import test_stage_inputs as base  # noqa: E402  (installs the offline guards first)
+import machine_settings as machine  # noqa: E402
 
 fx, stage_inputs, stage, workflow, LENSES = base.fx, base.stage_inputs, base.stage, base.workflow, base.LENSES
 START, MID, END = "2026-09-01T00:00:00Z", "2026-09-04T00:00:00Z", "2026-09-08T00:00:00Z"
@@ -746,7 +747,7 @@ class MinimalFinalTests(LensQuoteCase):
         self.assertNotIn(keys[5], [item["pr"] for item in report["verified_evidence"]])
 
 
-EVIDENCE_1010 = Path("/Users/lee-kyu-hwan/.oss-research-vm/logs/a78-docs-first-20261004T021348Z")
+EVIDENCE_1010 = machine.VM_LOGS / "a78-docs-first-20261004T021348Z"
 COLLECTIONS_1010 = ("P1-eslint-eslint", "P5-typescript-eslint", "P2-eslint-markdown", "P3-eslint-css")
 
 
