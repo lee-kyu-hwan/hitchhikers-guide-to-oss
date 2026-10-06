@@ -420,8 +420,22 @@ def load_verifier():
     return module
 
 
+def load_assess_contract():
+    """assess_contract.py beside this file: the assessment field types the assess prompt states (#266)."""
+    existing = sys.modules.get("assess_contract")
+    if existing is not None and os.path.realpath(getattr(existing, "__file__", "")) == os.path.realpath(HERE / "assess_contract.py"):
+        return existing
+    spec = importlib.util.spec_from_file_location("assess_contract", HERE / "assess_contract.py")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["assess_contract"] = module
+    spec.loader.exec_module(module)
+    return module
+
+
 def assess_problems(answer: object, scope: dict, vc) -> list:
-    """R3 of an assess answer: the verifier's assessment document shape, and the combinations of its input."""
+    """R3 of an assess answer: the verifier's assessment document shape, every field's type from the one table the
+    assess prompt states too (assess_contract, kept equal to the verifier's record checks, #266), and the
+    combinations of its input."""
     if not isinstance(answer, dict) or set(answer) != {"schema_version", "discovery_sha256", "assessments"}:
         return ["keys must be exactly schema_version, discovery_sha256, assessments"]
     problems = []
@@ -436,6 +450,7 @@ def assess_problems(answer: object, scope: dict, vc) -> list:
     seen = set()
     for index, item in enumerate(items):
         problems.extend(vc._assessment_shape_violations(item, "assessments[%d]" % index))
+        problems.extend(load_assess_contract().type_problems(item, "assessments[%d]" % index, vc))
         if isinstance(item, dict):
             combination = (item.get("pattern_id"), item.get("repository"))
             if not all(isinstance(value, str) for value in combination):

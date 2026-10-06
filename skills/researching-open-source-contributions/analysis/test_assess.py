@@ -242,6 +242,8 @@ class S1AssessInputs(AssessCase):
         _, out = self.inputs()
         text = (out / "assess" / "task.txt").read_text(encoding="utf-8")
         template = (HERE / "prompts" / "assess.md").read_text(encoding="utf-8")
+        # the field types come from the one table the strict check uses (assess_contract, #266)
+        template = template.replace("{{assessment_field_types}}", stage_inputs.load_assess_contract().prompt_lines(vc))
         self.assertTrue(text.startswith(template))
         for title in ("판정 단위", "패턴 " + fx.PATTERN_ID, "저장소 사실 " + fx.REPO, "정책 관찰 " + fx.REPO,
                       "정책 키별 허용 값 " + fx.REPO, "discovery 관찰 %s × %s" % (fx.PATTERN_ID, fx.REPO),
@@ -387,8 +389,9 @@ class S3OutsideTheInput(AssessCase):
         item = assessment(self.world)
         item["policy_checks"]["program_rules"].update(found=True, source="rules.md", sha256=OTHER_SHA)
         code, items, _ = self.strict(document(self.world, item))
-        self.assert_status(items, {"A2-policy-bytes": "FAIL"})
-        self.assertIn("program_rules", items["A2-policy-bytes"]["detail"])
+        # without a program rules input the record gate takes only null there; R3 says so first now (#266)
+        self.assert_status(items, {"R3-report-schema": "FAIL", "A2-policy-bytes": "BLOCKED"})
+        self.assertIn("policy_checks.program_rules.found: expected null (got boolean)", items["R3-report-schema"]["detail"])
 
     def test_a_policy_value_not_found_names_no_source(self):
         item = assessment(self.world)

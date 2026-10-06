@@ -1991,6 +1991,18 @@ def assess_call_plan(calls: int = 1) -> dict:
                        % (calls, calls)}
 
 
+def load_assess_contract():
+    """assess_contract.py beside this file (the assessment field types, #266)."""
+    existing = sys.modules.get("assess_contract")
+    if existing is not None and os.path.realpath(getattr(existing, "__file__", "")) == os.path.realpath(HERE / "assess_contract.py"):
+        return existing
+    spec = importlib.util.spec_from_file_location("assess_contract", HERE / "assess_contract.py")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["assess_contract"] = module
+    spec.loader.exec_module(module)
+    return module
+
+
 def load_verifier(skills_root: str | None):
     """The candidate verifier, resolved like the workflow resolves its siblings (never from input data)."""
     wf = load_workflow()
@@ -2058,6 +2070,37 @@ def assess_pattern(pattern: dict, urls: dict) -> dict:
     return view
 
 
+def static_reads_not_assessable(discovery: dict, records: list) -> list:
+    """The discovery's top-level ``static_reads`` (verifier discover --static-reads rest, #266 defect 2): one entry per
+    repository whose finished static reads stay even when the budget ended its combinations.
+
+    A repository with a discovery record is assessed from that record, whose ``static_search`` must be the entry's
+    copy (refused otherwise: the input would hold two readings). A repository without one is not assessable: the
+    record gate refuses an assessment of a combination that is absent, skipped or failed. Its reads are listed for the
+    report only, never put into the prompt."""
+    entries = discovery.get("static_reads")
+    if entries is None:
+        return []
+    if not isinstance(entries, list) or not all(
+            isinstance(entry, dict) and isinstance(entry.get("repository"), str)
+            and isinstance(entry.get("static_search"), dict) for entry in entries):
+        raise StageError("discovery static_reads must be a list of {repository, head_sha, static_search}")
+    listed = []
+    for entry in entries:
+        recorded = [record for record in records if record.get("repository") == entry["repository"]]
+        if recorded:
+            if any(record.get("static_search") != entry["static_search"] for record in recorded):
+                raise StageError("the static_reads of %s are not the static_search its discovery records hold"
+                                 % entry["repository"])
+            continue
+        static = entry["static_search"]
+        listed.append({"repository": entry["repository"], "head_sha": entry.get("head_sha"),
+                       "hits": len(static.get("hits") or []), "files": len(static.get("files") or []),
+                       "error": static.get("error"),
+                       "reason": "no discovery record: the record gate refuses its combinations"})
+    return listed
+
+
 def cmd_assess_inputs(args) -> dict:
     """One assess call for one discovery document: its prompt, its scope and its call plan (#259).
 
@@ -2081,8 +2124,12 @@ def cmd_assess_inputs(args) -> dict:
         raise StageError("the analysis is not the one this discovery read (inputs.analysis_sha256 %s, analysis %s)"
                          % (discovery["inputs"].get("analysis_sha256"), analysis_sha))
     records = discovery["records"]
+    not_assessable_reads = static_reads_not_assessable(discovery, records)
     if not records:
-        raise StageError("no discovery record to assess (skipped or failed scopes cannot be assessed)")
+        held = "; ".join("static_reads of %s (%d hits) stay in the discovery for the report"
+                         % (item["repository"], item["hits"]) for item in not_assessable_reads if item["hits"])
+        raise StageError("no discovery record to assess (skipped or failed scopes cannot be assessed)"
+                         + ("; " + held if held else ""))
     if len(records) > ASSESS_MAX_ASSESSMENTS:
         raise StageError("%d combinations are more than one call may assess (%d)" % (len(records), ASSESS_MAX_ASSESSMENTS))
     patterns = {pattern.get("pattern_id"): pattern for pattern in analysis.get("patterns") or [] if isinstance(pattern, dict)}
@@ -2120,6 +2167,8 @@ def cmd_assess_inputs(args) -> dict:
     links = sorted(set(links))
 
     text = read_bounded(PROMPTS / "assess.md", PROMPT_MAX_BYTES, "assess template").decode("utf-8")
+    # every field's type from the one table the strict check uses (assess_contract, #266)
+    text = text.replace("{{assessment_field_types}}", load_assess_contract().prompt_lines(vc))
     text += block("판정 단위", {"discovery_sha256": discovery_sha, "combinations": combinations,
                               "max_assessments": ASSESS_MAX_ASSESSMENTS,
                               "not_assessable": [{"section": section, "pattern_id": item.get("pattern_id"),
@@ -2175,6 +2224,7 @@ def cmd_assess_inputs(args) -> dict:
     summary = {"stage": "assess", "mode": "assess", "calls": [entry], "max_model_calls": plan["max_model_calls"],
                "call_plan": plan, "discovery_sha256": discovery_sha, "analysis_sha256": analysis_sha,
                "policy_evidence_sha256": evidence_sha, "combinations": combinations,
+               "static_reads_not_assessable": not_assessable_reads,
                "prompt_budget": {"bytes": entry["bytes"], "cap": PROMPT_MAX_BYTES}}
     write_json(out / "stage.json", summary)
     return summary

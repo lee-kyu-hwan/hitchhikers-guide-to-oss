@@ -57,9 +57,12 @@ ready 조건(전부):
 - `sensitivity` 는 `normal` 또는 `security-sensitive` 다.
 - `summary`·`impact` 는 한국어 문장이다(입력에 근거한 사실만).
 - `private_evidence_reference` 는 `private-report-ready` 가 아니면 `null` 이다.
-- `execution_evidence` 는 `null` 이다(이 판정은 아무것도 실행하지 않는다). 그래서 `reproduction.method` 는 `static` 또는 `none` 이다. `none` 이면 `reproduction.evidence_links` 는 빈 배열, `public_steps` 는 `null` 이다.
+- `execution_evidence` 는 `null` 이다(이 판정은 아무것도 실행하지 않는다). 그래서 `reproduction.method` 는 `static` 또는 `none` 이다. `none` 이면 `reproduction.evidence_links` 는 빈 배열, `public_steps` 는 `null` 이다. `static` 이면 `public_steps` 는 단계 문장의 **문자열 배열**이거나 `null` 이다(문자열 하나는 거부된다).
 - `blocking_gaps` 는 문자열 배열, `superseded_by` 는 `null` 이다.
 - `verified_at`·`verified_base_sha` 는 쓰지 마라(호스트가 discovery 관찰 값으로 채운다).
+
+필드 타입(verifier `record` 게이트가 검사하는 타입이다. strict 검사가 같은 표로 먼저 검사하고, 타입이 하나라도 다르면 답 전체가 거부된다):
+{{assessment_field_types}}
 
 출력 형식:
 - 설명·코드펜스 없이 아래 형태의 JSON 객체 하나만 출력한다. 최상위 키는 정확히 `"schema_version"`, `"discovery_sha256"`, `"assessments"` 다. 항목의 키는 아래 19개뿐이다. 다른 키를 더하면 거부된다.
