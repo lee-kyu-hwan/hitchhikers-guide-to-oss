@@ -75,7 +75,7 @@ verification-manifest.json, transport.json} from the child, and in result/
 manifest.json (this run), relay.log, stderr.log and read-envelope.json, which
 binds every file's and every input's size and sha256 to the request, the child's
 exit code and the relay's ready sources. The host checks it with
-tests/fixtures/oss_research_worker/linux/verify_pickup.py --candidate-reads.
+dot_local/share/oss-research/linux/verify_pickup.py --candidate-reads.
 """
 
 from __future__ import annotations

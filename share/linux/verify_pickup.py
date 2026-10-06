@@ -451,7 +451,7 @@ ISSUE_DATE_FIELDS = ("created", "updated", "closed")
 ISSUE_STATES = ("open", "closed", "all")
 ISSUE_REQUEST_FIELDS = {"repositories", "date_field", "state", "start_at", "end_at", "max_per_repo",
                         "request_budget"}
-# The host's own reviewed tree: this file is tests/fixtures/oss_research_worker/linux/.
+# The host's own reviewed tree: this file is dot_local/share/oss-research/linux/ (four levels below it).
 HOST_SKILLS = Path(__file__).resolve().parents[4] / "dot_codex/skills"
 HOST_ISSUE_COLLECTOR = HOST_SKILLS / "collecting-open-source-issues/scripts/collect_open_source_issues.py"
 HOST_SIBLING = HOST_SKILLS / "collecting-recent-closed-prs/scripts/collect_recent_closed_prs.py"

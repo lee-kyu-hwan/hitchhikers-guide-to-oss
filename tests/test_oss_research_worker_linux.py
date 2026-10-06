@@ -887,9 +887,9 @@ class ProcScanTests(unittest.TestCase):
 
 
 class PickupVerifierTests(unittest.TestCase):
-    """fixtures/oss_research_worker/linux/verify_pickup.py on crafted tars."""
+    """dot_local/share/oss-research/linux/verify_pickup.py on crafted tars."""
 
-    VERIFY = REPO / "tests/fixtures/oss_research_worker/linux/verify_pickup.py"
+    VERIFY = REPO / "dot_local/share/oss-research/linux/verify_pickup.py"
 
     def setUp(self):
         self.root = Path(tempfile.mkdtemp(prefix="osrl-pickup-")).resolve()
@@ -1556,7 +1556,7 @@ class EgressVerdictTests(unittest.TestCase):
         self.assertEqual(run(str(broken)).returncode, 1)
 
 
-MO_VERDICT = REPO / "tests/fixtures/oss_research_worker/linux/model_once_verdict.py"
+MO_VERDICT = REPO / "dot_local/share/oss-research/linux/model_once_verdict.py"
 MO_LOADER = importlib.machinery.SourceFileLoader("oss_research_model_once_verdict", str(MO_VERDICT))
 model_once_verdict = importlib.util.module_from_spec(importlib.util.spec_from_loader(
     MO_LOADER.name, MO_LOADER))
@@ -1567,7 +1567,7 @@ class AutoObservationPickupTests(unittest.TestCase):
     """verify_pickup.py --auto-observation: the same structure checks, and only
     the exact failure the stream format causes. The default contract is kept."""
 
-    VERIFY = REPO / "tests/fixtures/oss_research_worker/linux/verify_pickup.py"
+    VERIFY = REPO / "dot_local/share/oss-research/linux/verify_pickup.py"
 
     def setUp(self):
         self.root = Path(tempfile.mkdtemp(prefix="osrl-autopick-")).resolve()
@@ -1849,7 +1849,7 @@ class CollectEntryTests(unittest.TestCase):
 class CollectPickupTests(unittest.TestCase):
     """verify_pickup.py --collect on crafted tars. Synthetic members, not a real run."""
 
-    VERIFY = REPO / "tests/fixtures/oss_research_worker/linux/verify_pickup.py"
+    VERIFY = REPO / "dot_local/share/oss-research/linux/verify_pickup.py"
     SIBLING = {"role": "sibling", "path": "/opt/x/collect_recent_closed_prs.py", "sha256": "c" * 64}
     SOURCES = [{"role": "issues", "path": "/opt/x/issues.py", "sha256": "d" * 64}, SIBLING]
 

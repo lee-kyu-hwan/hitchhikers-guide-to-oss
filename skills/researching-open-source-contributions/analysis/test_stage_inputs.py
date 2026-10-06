@@ -401,7 +401,9 @@ class StagePipelineTests(unittest.TestCase):
                 "try:\n    stage_inputs.read_bounded(stage_inputs.Path(%r), 1024, 'answer')\n"
                 "except stage_inputs.StageError as error:\n    print(error); sys.exit(0)\n"
                 "sys.exit(1)\n") % (str(HERE), str(fifo))
-        with mock.patch.object(subprocess.Popen, "_execute_child", _REAL_EXECUTE_CHILD):
+        # On Linux the real _execute_child spawns through os.posix_spawn, which the guard also blocks: use fork_exec (#274)
+        with mock.patch.object(subprocess.Popen, "_execute_child", _REAL_EXECUTE_CHILD), \
+                mock.patch.object(subprocess, "_USE_POSIX_SPAWN", False):
             completed = subprocess.run([sys.executable, "-B", "-c", code], capture_output=True, text=True, timeout=10)
         self.assertEqual(completed.returncode, 0, completed.stderr)
         self.assertIn("not a regular file", completed.stdout)

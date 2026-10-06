@@ -34,7 +34,7 @@ import tests.test_oss_research_worker_linux as linux_tests
 relay_module = relay_tests.relay_module
 REPO = relay_tests.ROOT
 BIN = REPO / "dot_local/bin"
-VERIFY = REPO / "tests/fixtures/oss_research_worker/linux/verify_pickup.py"
+VERIFY = REPO / "dot_local/share/oss-research/linux/verify_pickup.py"
 SENTINEL = "ghp_SENTINEL0123456789ABCDEFGHIJKLMNOP"  # only ever in a test's temporary directory
 OTHER = "ghp_PARENTSECRETZYXWVUTSRQPONMLKJIHGFE"
 

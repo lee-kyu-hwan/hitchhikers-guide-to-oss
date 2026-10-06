@@ -234,7 +234,7 @@ L shell --workdir / oss-research-debian -- sudo bash -c "install -d -m 0700 /var
 [ "$(cat "$D/staged.sha256")" = "$input_sha" ] || { echo "staged prompt differs" >&2; exit 4; }
 MODE=analysis; EGRESS=pin; [ "$KIND" = sentinel ] && { MODE=analysis-dry; EGRESS=none; }
 began=$(date -u +%FT%TZ)
-L shell --workdir / oss-research-debian -- bash "$S/tests/fixtures/oss_research_worker/linux/model_once.sh" \
+L shell --workdir / oss-research-debian -- bash "$S/dot_local/share/oss-research/linux/model_once.sh" \
   "$KIND" "$S" /opt/oss-research/srt-0.0.77 /opt/oss-research/node-v24.20.0-linux-arm64/bin "$EGRESS" normal 330 300 \
   "$MODE" "$STAGE/task.txt" < "$CREDENTIAL" > "$D/harness.log" 2>&1
 harness_rc=$?
@@ -261,13 +261,13 @@ if [ -n "$unit" ]; then
   JKIND=analysis; [ "$KIND" = sentinel ] && JKIND=dry
   if [ -f "$D/result.tar" ]; then
     tar_sha=$(shasum -a 256 "$D/result.tar" | cut -c1-64)
-    PYTHONDONTWRITEBYTECODE=1 python3 -I -B "$REPO/tests/fixtures/oss_research_worker/linux/verify_pickup.py" \
+    PYTHONDONTWRITEBYTECODE=1 python3 -I -B "$REPO/dot_local/share/oss-research/linux/verify_pickup.py" \
       "$D/result.tar" 67108864 "$D/result" > "$D/pickup.json"; pickup_rc=$?
     RESULT="$D/result"
   else
     RESULT="$D/no-result"
   fi
-  PYTHONDONTWRITEBYTECODE=1 python3 -I -B "$REPO/tests/fixtures/oss_research_worker/linux/model_once_verdict.py" \
+  PYTHONDONTWRITEBYTECODE=1 python3 -I -B "$REPO/dot_local/share/oss-research/linux/model_once_verdict.py" \
     judge-worker "$D/record.json" "$RESULT" "$D/task.txt" "$JKIND" > "$D/judge.txt"; judge_rc=$?
 fi
 PYTHONDONTWRITEBYTECODE=1 python3 -I -B - "$D" "$NAME" "$KIND" "$began" "$ended" "$input_sha" "$tar_sha" \

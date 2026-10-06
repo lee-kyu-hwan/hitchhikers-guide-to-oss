@@ -30,7 +30,7 @@ from unittest import mock
 REPO = Path(__file__).resolve().parents[1]
 BIN = REPO / "dot_local/bin"
 SKILLS = REPO / "dot_codex/skills"
-VERIFY = REPO / "tests/fixtures/oss_research_worker/linux/verify_pickup.py"
+VERIFY = REPO / "dot_local/share/oss-research/linux/verify_pickup.py"
 VERIFIER_SOURCE = SKILLS / "verifying-open-source-contribution-candidates/scripts/verify_candidates.py"
 
 

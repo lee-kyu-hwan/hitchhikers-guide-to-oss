@@ -41,7 +41,7 @@ entry = load("oss_research_collect_issues", ISSUES_ENTRY)
 collect_entry = entry.load_collect_entry()
 worker = collect_entry.load_worker()
 wrapper = load("oss_research_linux_run_for_issues", BIN / "executable_oss-research-linux-run")
-VERIFY = REPO / "tests/fixtures/oss_research_worker/linux/verify_pickup.py"
+VERIFY = REPO / "dot_local/share/oss-research/linux/verify_pickup.py"
 SKILLS = REPO / "dot_codex/skills"
 
 

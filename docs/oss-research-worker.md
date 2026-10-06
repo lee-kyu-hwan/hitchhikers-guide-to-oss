@@ -725,7 +725,7 @@ Linux 게스트 안의 별도 로그인(`.credentials.json`), API key·`apiKeyHe
   근거는 `docs/research/2026-09-28-189-cgroup-integration.md`에 있다. 실제 조사 실행은 아직
   unit으로 돌리지 않았다(게이트 닫힘).
 - **결과 회수**: `linux/supervised_run.py`(실 srt + relay + 비AI probe)의 run/result를
-  호스트가 `limactl shell … tar` 스트림(상한 64 MiB)으로 받는다. `linux/verify_pickup.py`가
+  호스트가 `limactl shell … tar` 스트림(상한 64 MiB)으로 받는다. `dot_local/share/oss-research/linux/verify_pickup.py`가
   `data` filter로 풀고 파일 집합·manifest `succeeded`·`report.md` 해시를 확인한다.
 - **Linux setsid 시험**: 자손이 보고한 pid는 namespace pid라 `os.kill`로 판정하지
   않는다. 자손 argv에 있는 고유 marker 경로를 호스트 `/proc/*/cmdline`에서 찾는다

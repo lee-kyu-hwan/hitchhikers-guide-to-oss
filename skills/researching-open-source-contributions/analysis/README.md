@@ -41,14 +41,14 @@ for f in dot_agents/skills/researching-open-source-contributions/analysis/selfte
 | `tests/fixtures/oss_research_worker/linux/analysis_call.sh` | `dot_agents/skills/researching-open-source-contributions/analysis/harness/analysis_call.sh` |
 | `docs/research/oss-e2e-2026-09-28/README.md`, `fixtures/`, `request.json`, `run_limits.legacy-fixture.json` | 그대로(실행 기록·증거) |
 
-## 분리 전 남은 이동
+## 격리 스택 (#274에서 옮김)
 
-격리 스택 공용 파일은 아직 `tests/fixtures/oss_research_worker/linux/`에 있다(#261에서 옮기지 않음, 조정자 결정 A). 분석 전용이 아니라 수집·후보 읽기·egress·gate 시험이 함께 쓰고, `model_once.sh`·`unit_inner.py`는 게스트 안에서 배포된 커밋 트리의 이 경로로 실행된다. 하네스(`harness/analysis_call.sh`)는 새 위치에서 이 경로를 그대로 부른다. 별도 이슈로 옮긴다. 참조 수는 2026-10-06 `git grep -l`로 센 실사용 파일 수다(날짜로 시작하는 기록과 자기 자신 제외).
+#261 때 `tests/fixtures/oss_research_worker/linux/`에 남겼던 격리 스택의 실행 파일은 #274에서 `dot_local/share/oss-research/linux/`로 옮겼다. 하네스(`harness/analysis_call.sh`)는 그 경로(호스트 `$REPO/dot_local/share/oss-research/linux/…`, 게스트 `$S/dot_local/share/oss-research/linux/model_once.sh`)를 부른다. 게스트 수락 시험(`unit_inner.py`·탐침·사례 스크립트)과 시험 데이터는 시험이라 `tests/fixtures/`에 남는다. 구분표와 결정은 `dot_local/share/oss-research/README.md`.
 
-| 파일 | 쓰임 | 참조 파일 수 |
-|---|---|---:|
-| `verify_pickup.py` | 게스트 결과 회수 검사(수집·후보 읽기·분석 호출) | 15 |
-| `unit_inner.py` | 게스트 unit 안의 측정 launch | 7 |
-| `model_once_verdict.py` | 모델 호출 판정(analysis·dry) | 4 |
-| `model_once.sh` | 게스트에서 모델 1회 실행 | 3 |
-| `supervised_run.py` | 감독 실행 | 1 |
+| 옛 경로 | 새 경로 |
+|---|---|
+| `tests/fixtures/oss_research_worker/linux/verify_pickup.py` | `dot_local/share/oss-research/linux/verify_pickup.py` |
+| `tests/fixtures/oss_research_worker/linux/model_once.sh` | `dot_local/share/oss-research/linux/model_once.sh` |
+| `tests/fixtures/oss_research_worker/linux/model_once_verdict.py` | `dot_local/share/oss-research/linux/model_once_verdict.py` |
+| `tests/fixtures/oss_research_worker/linux/collect_live.sh` | `dot_local/share/oss-research/linux/collect_live.sh` |
+| `tests/fixtures/oss_research_worker/linux/candidate_reads_live.sh` | `dot_local/share/oss-research/linux/candidate_reads_live.sh` |
