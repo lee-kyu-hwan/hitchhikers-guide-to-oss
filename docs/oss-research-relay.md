@@ -215,6 +215,8 @@ query string은 붙일 수 없다.
 upstream 헤더(`Set-Cookie`, `Authorization` 등)는 전달하지 않는다. adapter는 이 값으로 요청마다
 `rate_limit {limit, remaining, used, resource}`를 transport 기록에 남긴다(정수·식별자만, `reset`은 아님).
 
+- 검색 pacing(#279)은 **verifier 쪽**에서 하고 relay 허용 범위·예산·기한은 바꾸지 않았다. verifier는 이슈 검색을 2.1초에 하나, 코드 검색을 6.1초에 하나 보내고(인증 한도 분당 30·10에 5% 여유), 검색 응답이 `x-ratelimit-remaining: 0`이면 다음 검색을 `x-ratelimit-reset`까지(최대 61초) 미룬다. 검색의 rate-limit 응답(403·429)은 reset 뒤 **1회만** 다시 보내고, 두 번째면 그 질의를 실패로 남긴다(검색 incomplete). 이 대기는 모두 adapter의 deadline 제한 sleeper를 거치므로 deadline을 넘는 대기는 `a wait of …s would pass the step deadline`으로 멈춘다(시험 `test_a_pacing_wait_past_the_deadline_stops_the_step`). entry 기본 `--timeout 300`(`DEFAULT_TIMEOUT_SECONDS`)의 adapter deadline은 270초이고, 예산 상한 60건을 2.1초 간격으로 보내는 하한 123.9초와 reset 대기 1회 61초를 더한 184.9초를 덮는다(시험 `SearchPacingTimeoutTests`). locus-search는 첫 요청 전에 stderr(`stderr.log`)에 `locus-search plan: <locus 수> loci, <요청 수> search requests, at least <초> s …`를 남긴다. 익명 검색(분당 10)은 한도 헤더로 reset을 기다리므로 더 오래 걸리며, 기본 timeout을 넘으면 deadline에서 멈춘다.
+
 실패 응답은 `{"ok":false,"error":<code>,"message":...,"budget":{...}}`다.
 upstream 실패에는 `endpoint`와 `upstream_status`가 붙을 수 있다.
 

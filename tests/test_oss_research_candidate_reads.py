@@ -1121,6 +1121,61 @@ class OfflineStaticDiscoverTests(PickupCase):
         self.expect("discover", members, "output static reads differ from the request")
 
 
+
+class SearchPacingTimeoutTests(unittest.TestCase):
+    """#279: the entry's default timeout leaves room for paced searches at the budget cap."""
+
+    def test_the_default_deadline_covers_a_full_budget_of_paced_searches_and_one_reset_wait(self):
+        verifier = relay_verify_tests.verifier
+        seconds = entry.DEFAULT_TIMEOUT_SECONDS
+        deadline = max(seconds - entry.ADAPTER_DEADLINE_MARGIN, seconds / 2)
+        paced = (entry.MAX_REQUEST_BUDGET - 1) * verifier.SEARCH_ISSUES_INTERVAL_SECONDS
+        reset_wait = verifier.SEARCH_WINDOW_SECONDS + 1.0
+        self.assertLessEqual(paced + reset_wait, deadline)
+        self.assertEqual(verifier.SEARCH_RATE_LIMIT_RETRIES, 1)
+
+
+REAL_LOCUS_EVIDENCE = Path.home() / ".oss-research-vm/logs/a78-assess-rerun-20261006T054747Z"
+
+
+@unittest.skipUnless(
+    (REAL_LOCUS_EVIDENCE / "L1-eslint-json/unpacked/locus-search.json").is_file(),
+    "the 2026-10-06 locus-search evidence exists only on the research host",
+)
+class RealLocusEvidenceTests(unittest.TestCase):
+    """#279 S2: record over the 2026-10-06 evidence (read only) shows eslint/json#290."""
+
+    def test_s2_record_shows_pr_290_as_the_locus_duplicate(self):
+        verifier = relay_verify_tests.verifier
+        base = REAL_LOCUS_EVIDENCE
+        url = "https://github.com/eslint/json/pull/290"
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary) / "candidates.json"
+            markdown = Path(temporary) / "candidates.md"
+            with mock.patch("sys.stdout"), mock.patch("sys.stderr"):
+                code = verifier.main([
+                    "record",
+                    "--discovery", str(base / "workflow/run/stages/discovery/gen-001/discovery.json"),
+                    "--assessment", str(base / "answers/assessment.json"),
+                    "--locus-search", str(base / "L1-eslint-json/unpacked/locus-search.json"),
+                    "--output", str(output), "--manifest", str(Path(temporary) / "manifest.json"),
+                    "--markdown-output", str(markdown),
+                ], runner=None, sleeper=lambda seconds: None)
+            self.assertEqual(code, 0)
+            records = json.loads(output.read_text(encoding="utf-8"))["records"]
+            rendered = markdown.read_text(encoding="utf-8")
+        self.assertEqual(len(records), 4)
+        for record in records:
+            with self.subTest(locus=record["locus"]):
+                self.assertEqual((record["status"], record["status_reason"]),
+                                 ("duplicate", "duplicate-closed-other"))
+                verdict = record["verification_history"][-1]["evidence"]["duplicate_verdict"]
+                self.assertIn(url, verdict["matched_items"])
+                self.assertTrue(any(gap.startswith("locus-duplicate: ") and url in gap
+                                    for gap in record["blocking_gaps"]))
+        self.assertIn(url, rendered)
+
+
 def entry_common():
     return ("verification-manifest.json", "transport.json", "relay.log", "run-manifest.json", "read-envelope.json")
 

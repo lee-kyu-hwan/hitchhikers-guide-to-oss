@@ -21,8 +21,10 @@ by path and calls its own ``main`` with two injections, the way its tests do:
   checked GET goes to ``http://127.0.0.1:<port>/v1/rest/<path>``; the
   ``https://api.github.com/...`` URL the verifier built is the *logical*
   request, never evidence of a direct TLS connection.
-- ``sleeper``: the verifier's retry wait, bounded by ``--deadline-seconds``; a
-  wait past it stops the run (the verifier's ``HttpRequestRefused``).
+- ``sleeper``: the verifier's retry wait and its search pacing wait (one issue
+  search per 2.1 s, one code search per 6.1 s, the next search held to a
+  ``X-RateLimit-Reset`` after a zero remaining), bounded by ``--deadline-seconds``;
+  a wait past it stops the run (the verifier's ``HttpRequestRefused``).
 
 No credential: the step refuses to start when GH_TOKEN or GITHUB_TOKEN is set
 (the verifier would read it), the adapter refuses an Authorization header, and
@@ -125,12 +127,12 @@ class VerifierRelayOpener:
 
 
 def bounded_sleeper(verifier: Any, deadline_seconds: float, clock=time.monotonic, sleep=time.sleep):
-    """The verifier's retry wait, refused when it would pass the step's deadline."""
+    """The verifier's retry and search pacing waits, refused when one would pass the step's deadline."""
     deadline = clock() + deadline_seconds
 
     def sleeper(seconds: float) -> None:
         if clock() + seconds >= deadline:
-            raise verifier.HttpRequestRefused("a retry wait of %gs would pass the step deadline" % seconds)
+            raise verifier.HttpRequestRefused("a wait of %gs would pass the step deadline" % seconds)
         sleep(seconds)
 
     return sleeper

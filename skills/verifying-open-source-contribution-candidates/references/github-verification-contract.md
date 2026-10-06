@@ -57,7 +57,7 @@ The pattern-level duplicate search in R3.3 runs before a locus exists, so it can
 
 Clues are derived from the locus itself so the step cannot be satisfied with unrelated terms: the locus is split on non-identifier characters, and tokens shorter than three characters, purely numeric tokens, and common path and extension words are dropped. Operator-supplied clues are appended after the derived ones, and the clue cap bounds the total. A locus that yields no usable clue is recorded with an empty clue list and `complete: false`.
 
-Each search records `pattern_id`, `repository`, `locus`, `clues`, `queries`, `complete`, `unused_clues`, and `method_limitations`. Any failed or incomplete query makes `complete` false. `complete` means every query returned a response; it never means no duplicate exists.
+Before its first request the command writes one stderr line with the planned number of loci and search requests (four per used clue) and the floor time at one request per search interval; latency and any reset wait come on top. Each search records `pattern_id`, `repository`, `locus`, `clues`, `queries`, `complete`, `unused_clues`, and `method_limitations`. Any failed or incomplete query makes `complete` false. `complete` means every query returned a response; it never means no duplicate exists.
 
 ## Fixed request order and budget
 
@@ -77,6 +77,10 @@ A locus search runs as its own later command and is not part of this order.
 The request budget counts every attempt, including retries. No request begins once it is exhausted. A clue cap bounds both issue and code requests. Repository order is caller order; combination order is repository order followed by analysis pattern order.
 
 Each request permits maximum 3 retries. Delay precedence is `Retry-After`, then `X-RateLimit-Reset`, then a 60-second exponential backoff capped at 300 seconds. Retry events and consumed attempts are recorded without secret headers.
+
+Search requests are paced to GitHub's per-minute search limits (30 for issue search, 10 for code search). Each `GET /search/issues` attempt starts at least 2.1 seconds after the previous one and each `GET /search/code` attempt at least 6.1 seconds after the previous one, which is 60 seconds divided by the limit plus a 5% margin; other endpoints are not paced. A fixed interval is used rather than waiting only on headers because it keeps the run under the limit from the first request and makes the duration computable before the run. Headers still guard it: when a search answer reports `X-RateLimit-Remaining` exactly `0` with a valid `X-RateLimit-Reset`, the next request to that search endpoint waits until the reset, at most 61 seconds ahead, which covers a quota shared with another client or the lower anonymous limit. Every pacing wait uses the same injected sleeper as a retry wait, so a caller's deadline bounds both.
+
+A search request retries a rate-limit answer (`retry-after`, `remaining-zero-and-reset`, or `http-429`) at most once, after the delay above. A second rate-limit answer returns with `retry-limit-reached` and the request fails like any other exhausted retry; the search is then incomplete. Transport errors and 5xx answers on search keep the general limit.
 
 Statuses 429 and 500–599 retain that retry behavior. Status 403 is retried only when sanitized headers supply explicit rate-limit evidence: a finite nonnegative numeric `Retry-After`, or `X-RateLimit-Remaining` exactly `0` together with a finite nonnegative numeric `X-RateLimit-Reset`. The retry reasons are `retry-after` and `remaining-zero-and-reset`. Missing, malformed, negative, non-finite, reset-only, limit-only, and nonzero-remaining evidence is `ambiguous-403` and returns immediately as permission denied. The last explicit rate-limit attempt records `retry-limit-reached` and maps to the generic failed transport/server outcome, not forbidden.
 

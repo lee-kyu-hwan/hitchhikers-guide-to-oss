@@ -7,7 +7,9 @@ import hashlib
 import http.client
 import io
 import json
+import math
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
@@ -6966,6 +6968,369 @@ class RestStaticReadsTests(unittest.TestCase):
         code, _, discovery, _, _ = self.run_rest(analysis, responses, extra=("--static-reads", "none"))
         self.assertEqual((code, discovery["records"][0]["static_search"]["error"]), (0, "clone-not-requested"))
         self.assertNotIn("static_reads", discovery["inputs"])
+
+
+
+def locus_pr_item(number, state="closed", title="docs: fix the same locus"):
+    return {
+        "number": number,
+        "title": verify_candidates._untrusted_text(
+            title, "https://github.com/example-org/example-repo/pull/%d" % number, False
+        ),
+        "state": state,
+        "html_url": "https://github.com/example-org/example-repo/pull/%d" % number,
+        "created_at": FIXTURE_TIME,
+        "closed_at": FIXTURE_TIME if state == "closed" else None,
+        "pull_request": True,
+        "state_reason": None,
+    }
+
+
+def place_locus_items(document, hits, total_counts=None):
+    """Put PR items into a locus search's PR queries, keyed by clue and state.
+
+    ``hits`` maps a clue to ``[(state, item), ...]``; ``total_counts`` maps
+    ``(clue, state)`` to a total_count larger than the listed items.
+    """
+    for search in document["searches"]:
+        for query in search["queries"]:
+            for clue, entries in hits.items():
+                for state, item in entries:
+                    if query["q"] == 'repo:%s "%s" is:pr is:%s' % (
+                        search["repository"], clue, state
+                    ):
+                        query["items"].append(item)
+            for query_clue in search["clues"]:
+                for state in ("open", "closed"):
+                    if query["q"] == 'repo:%s "%s" is:pr is:%s' % (
+                        search["repository"], query_clue, state
+                    ):
+                        query["total_count"] = max(
+                            len(query["items"]),
+                            (total_counts or {}).get((query_clue, state), 0),
+                        )
+    return document
+
+
+class LocusDuplicateGateTests(unittest.TestCase):
+    """#279: a PR the locus search finds at the same locus blocks ready."""
+
+    run_main = VerifyCandidatesTests.run_main
+    write_record_inputs = VerifyCandidatesTests.write_record_inputs
+
+    CLUES = verify_candidates._locus_clues(POSITIVE_LOCUS)
+
+    def record_with_hits(self, root, hits, total_counts=None, **assessment_changes):
+        record = discovery_record("example-org/example-repo")
+        assessments = [assessment_for(record, **assessment_changes)]
+        discovery, assessment = self.write_record_inputs(root, [record], assessments)
+        locus_path = Path(root) / "locus-search.json"
+        document = json.loads(locus_path.read_text(encoding="utf-8"))
+        place_locus_items(document, hits, total_counts)
+        locus_path.write_text(json.dumps(document, indent=2) + "\n", encoding="utf-8")
+        output = Path(root) / "candidates.json"
+        markdown = Path(root) / "candidates.md"
+        code, stdout, stderr, _ = self.run_main([
+            "record", "--discovery", str(discovery), "--assessment", str(assessment),
+            "--locus-search", str(locus_path), "--output", str(output),
+            "--manifest", str(Path(root) / "manifest.json"),
+            "--markdown-output", str(markdown),
+        ])
+        self.assertEqual(0, code, stderr)
+        candidate = json.loads(output.read_text(encoding="utf-8"))["records"][0]
+        validate = self.run_main(["validate", "--candidates", str(output)])
+        self.assertEqual(0, validate[0], validate[2])
+        return candidate, markdown.read_text(encoding="utf-8")
+
+    def test_s1_a_merged_pr_matching_every_locus_clue_makes_a_ready_candidate_duplicate(self):
+        merged = locus_pr_item(290)
+        hits = {clue: [("closed", merged)] for clue in self.CLUES}
+        with tempfile.TemporaryDirectory() as temporary:
+            candidate, rendered = self.record_with_hits(temporary, hits)
+        self.assertEqual(("duplicate", "duplicate-closed-other"),
+                         (candidate["status"], candidate["status_reason"]))
+        self.assertFalse(candidate["next_recheck_required"])
+        snapshot = candidate["verification_history"][-1]
+        self.assertEqual(("duplicate", "duplicate-closed-other"),
+                         (snapshot["status"], snapshot["status_reason"]))
+        verdict = snapshot["evidence"]["duplicate_verdict"]
+        self.assertIn(merged["html_url"], verdict["matched_items"])
+        self.assertIn("locus-search", verdict["judgment"])
+        self.assertTrue(any(
+            gap.startswith("locus-duplicate:") and merged["html_url"] in gap
+            for gap in candidate["blocking_gaps"]
+        ), candidate["blocking_gaps"])
+        self.assertIn(merged["html_url"], rendered)
+
+    def test_s1_an_open_pr_matching_every_locus_clue_is_duplicate_open(self):
+        opened = locus_pr_item(301, state="open")
+        hits = {clue: [("open", opened)] for clue in self.CLUES}
+        with tempfile.TemporaryDirectory() as temporary:
+            candidate, _ = self.record_with_hits(temporary, hits)
+        self.assertEqual(("duplicate", "duplicate-open"),
+                         (candidate["status"], candidate["status_reason"]))
+
+    def test_a_pr_matching_only_some_locus_clues_keeps_the_ready_status(self):
+        noise = locus_pr_item(283, title="fix: unrelated rule")
+        hits = {self.CLUES[0]: [("closed", noise)], self.CLUES[1]: [("closed", noise)]}
+        with tempfile.TemporaryDirectory() as temporary:
+            candidate, _ = self.record_with_hits(temporary, hits)
+        self.assertEqual(("issue-ready", "ready"),
+                         (candidate["status"], candidate["status_reason"]))
+        self.assertEqual([], candidate["blocking_gaps"])
+        self.assertEqual([], candidate["verification_history"][-1]["evidence"]["duplicate_verdict"]["matched_items"])
+
+    def test_a_truncated_listing_that_may_hide_the_missing_clue_needs_a_person(self):
+        maybe = locus_pr_item(284)
+        hits = {self.CLUES[0]: [("closed", maybe)], self.CLUES[1]: [("closed", maybe)]}
+        truncated = {(self.CLUES[2], "closed"): 250}
+        with tempfile.TemporaryDirectory() as temporary:
+            candidate, rendered = self.record_with_hits(temporary, hits, truncated)
+        self.assertEqual(("policy-review", "none"),
+                         (candidate["status"], candidate["status_reason"]))
+        self.assertTrue(any(
+            gap.startswith("locus-duplicate-undetermined:") and maybe["html_url"] in gap
+            for gap in candidate["blocking_gaps"]
+        ), candidate["blocking_gaps"])
+        self.assertIn("locus-duplicate-undetermined:", rendered)
+
+    def test_a_single_locus_clue_cannot_decide_a_pr_match_so_ready_waits_for_a_person(self):
+        single_locus = "lib/needle.js"
+        self.assertEqual(["needle"], verify_candidates._locus_clues(single_locus))
+        item = locus_pr_item(285)
+        with tempfile.TemporaryDirectory() as temporary:
+            candidate, _ = self.record_with_hits(
+                temporary, {"needle": [("closed", item)]}, locus=single_locus
+            )
+        self.assertEqual(("policy-review", "none"),
+                         (candidate["status"], candidate["status_reason"]))
+
+    def test_a_non_ready_candidate_shows_the_locus_duplicate_as_its_status(self):
+        merged = locus_pr_item(290)
+        hits = {clue: [("closed", merged)] for clue in self.CLUES}
+        with tempfile.TemporaryDirectory() as temporary:
+            candidate, rendered = self.record_with_hits(
+                temporary, hits, status="policy-review", status_reason="policy-unknown"
+            )
+        self.assertEqual(("duplicate", "duplicate-closed-other"),
+                         (candidate["status"], candidate["status_reason"]))
+        self.assertIn(merged["html_url"], rendered)
+
+    def test_a_concluded_status_is_kept_and_only_gains_the_gap(self):
+        merged = locus_pr_item(290)
+        hits = {clue: [("closed", merged)] for clue in self.CLUES}
+        with tempfile.TemporaryDirectory() as temporary:
+            candidate, _ = self.record_with_hits(
+                temporary, hits, status="not-applicable", status_reason="already-fixed"
+            )
+        self.assertEqual(("not-applicable", "already-fixed"),
+                         (candidate["status"], candidate["status_reason"]))
+        self.assertTrue(any(gap.startswith("locus-duplicate:") for gap in candidate["blocking_gaps"]))
+
+    def test_the_contract_states_the_locus_duplicate_rule(self):
+        sentence = ("A pull request returned for every locus-derived clue makes the candidate "
+                    "duplicate, and an undecided one keeps it out of a ready status.")
+        contract = (SKILL_DIR / "references/verification-contract.md").read_text(encoding="utf-8")
+        for name in ("SKILL.md", "references/verification-contract.md"):
+            self.assertIn(sentence, (SKILL_DIR / name).read_text(encoding="utf-8"))
+        open_statuses = re.search(r"still open for a proposal \(([^)]*)\)", contract).group(1)
+        self.assertEqual(set(verify_candidates.LOCUS_DUPLICATE_STATUSES),
+                         set(re.findall(r"`([^`]+)`", open_statuses)))
+
+    def test_an_issue_is_not_a_locus_pr_match(self):
+        issue = dict(locus_pr_item(286), pull_request=False)
+        hits = {clue: [("closed", issue)] for clue in self.CLUES}
+        with tempfile.TemporaryDirectory() as temporary:
+            candidate, _ = self.record_with_hits(temporary, hits)
+        self.assertEqual("issue-ready", candidate["status"])
+
+
+
+class FakeSearchQuota:
+    """A fake clock and GitHub search quota: a request past the limit in any 60 s is a 403."""
+
+    def __init__(self, limit=30, start=1000.0, latency=0.2):
+        self.now = start
+        self.limit = limit
+        self.latency = latency
+        self.sent = []
+        self.statuses = []
+        self.sleeps = []
+
+    def clock(self):
+        return self.now
+
+    def sleeper(self, seconds):
+        self.sleeps.append(seconds)
+        self.now += seconds
+
+    def opener(self, request, timeout):
+        del timeout
+        path = request.full_url[len(verify_candidates.GITHUB_API_ORIGIN):]
+        recent = [moment for moment in self.sent if moment > self.now - 60.0]
+        headers = {"Content-Type": "application/json", "X-RateLimit-Limit": str(self.limit)}
+        if path.startswith("/search/") and len(recent) >= self.limit:
+            headers.update({"X-RateLimit-Remaining": "0",
+                            "X-RateLimit-Reset": "%d" % math.ceil(recent[0] + 60.0)})
+            self.statuses.append(403)
+            self.now += self.latency
+            raise urllib.error.HTTPError(request.full_url, 403, "rate limit", headers,
+                                         io.BytesIO(b'{"message": "API rate limit exceeded"}'))
+        if path.startswith("/search/"):
+            self.sent.append(self.now)
+            headers.update({"X-RateLimit-Remaining": str(self.limit - len(recent) - 1),
+                            "X-RateLimit-Reset": "%d" % math.ceil((recent or [self.now])[0] + 60.0)})
+        self.statuses.append(200)
+        self.now += self.latency
+        body = json.dumps({"total_count": 0, "incomplete_results": False, "items": []}).encode()
+        return FakeHttpResponse(request.full_url, 200, body, headers)
+
+    def busiest_minute(self):
+        return max(
+            (sum(1 for other in self.sent if moment <= other < moment + 60.0) for moment in self.sent),
+            default=0,
+        )
+
+
+class SearchPacingTests(unittest.TestCase):
+    """#279: search requests are spread to the per-minute limit and retried at most once."""
+
+    write_record_inputs = VerifyCandidatesTests.write_record_inputs
+
+    LOCI = (
+        "lib/rules/alpha-one.js#AlphaOne",
+        "lib/rules/beta-two.js#BetaTwo",
+        "lib/rules/gamma-three.js#GammaThree",
+        "lib/rules/delta-four.js#DeltaFour",
+    )
+
+    def client(self, quota, replies=None, calls=None):
+        return verify_candidates.GhApiClient(
+            opener=quota.opener if replies is None else fake_opener(calls, replies),
+            sleeper=quota.sleeper, clock=quota.clock,
+            budget=verify_candidates.RequestBudget(200),
+        )
+
+    def run_locus_search(self, root, quota):
+        record = discovery_record("example-org/example-repo")
+        assessments = [assessment_for(record, locus=locus) for locus in self.LOCI]
+        discovery, assessment = self.write_record_inputs(root / "inputs", [record], assessments)
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with mock.patch.dict(verify_candidates.os.environ, {}), \
+                redirect_stdout(stdout), redirect_stderr(stderr):
+            verify_candidates.os.environ.pop("GH_TOKEN", None)
+            verify_candidates.os.environ.pop("GITHUB_TOKEN", None)
+            code = verify_candidates.main([
+                "locus-search", "--discovery", str(discovery), "--assessment", str(assessment),
+                "--output", str(root / "locus-search.json"),
+                "--manifest", str(root / "manifest.json"),
+            ], sleeper=quota.sleeper, clock=quota.clock, opener=quota.opener)
+        return code, stdout.getvalue(), stderr.getvalue()
+
+    def test_s3_forty_eight_locus_searches_stay_under_thirty_a_minute(self):
+        quota = FakeSearchQuota()
+        with tempfile.TemporaryDirectory() as temporary:
+            code, stdout, stderr = self.run_locus_search(Path(temporary), quota)
+        self.assertEqual(0, code, stderr)
+        self.assertTrue(stdout.startswith("complete"), stdout)
+        self.assertEqual(48, len(quota.sent))
+        self.assertNotIn(403, quota.statuses)
+        self.assertLessEqual(quota.busiest_minute(), 30)
+
+    def test_locus_search_prints_the_planned_requests_and_minimum_time_first(self):
+        quota = FakeSearchQuota()
+        with tempfile.TemporaryDirectory() as temporary:
+            code, _, stderr = self.run_locus_search(Path(temporary), quota)
+        self.assertEqual(0, code, stderr)
+        self.assertIn("locus-search plan: 4 loci, 48 search requests", stderr)
+        self.assertIn("at least 98.7 s", stderr)
+
+    def test_issue_searches_start_at_least_the_interval_apart(self):
+        quota = FakeSearchQuota(latency=0.0)
+        client = self.client(quota)
+        for index in range(3):
+            client.get_json("/search/issues", {"q": 'repo:o/n "c%d" is:pr is:open' % index})
+        gaps = [later - earlier for earlier, later in zip(quota.sent, quota.sent[1:])]
+        self.assertEqual([verify_candidates.SEARCH_ISSUES_INTERVAL_SECONDS] * 2,
+                         [round(gap, 6) for gap in gaps])
+
+    def test_code_searches_use_the_ten_a_minute_interval_and_other_paths_are_not_paced(self):
+        quota = FakeSearchQuota(latency=0.0)
+        client = self.client(quota)
+        client.get_json("/search/code", {"q": 'repo:o/n "a"'})
+        client.get_json("/repos/o/n")
+        client.get_json("/search/code", {"q": 'repo:o/n "b"'})
+        self.assertEqual([verify_candidates.SEARCH_CODE_INTERVAL_SECONDS],
+                         [round(seconds, 6) for seconds in quota.sleeps])
+
+    def test_a_search_reporting_zero_remaining_waits_for_the_reset_before_the_next(self):
+        quota = FakeSearchQuota(latency=0.0)
+        calls = []
+        replies = [
+            fixture_response({"total_count": 0, "incomplete_results": False, "items": []},
+                             headers={"Content-Type": "application/json",
+                                      "X-RateLimit-Remaining": "0", "X-RateLimit-Reset": "1030"}),
+            fixture_response({"total_count": 0, "incomplete_results": False, "items": []}),
+        ]
+        client = self.client(quota, replies, calls)
+        client.get_json("/search/issues", {"q": 'repo:o/n "a" is:pr is:open'})
+        client.get_json("/search/issues", {"q": 'repo:o/n "b" is:pr is:open'})
+        self.assertEqual(2, len(calls))
+        self.assertEqual([30.0], quota.sleeps)
+
+    def test_s4_a_search_rate_limit_waits_for_the_reset_and_retries_once(self):
+        quota = FakeSearchQuota(latency=0.0)
+        calls = []
+        limited = fixture_response({"message": "API rate limit exceeded"}, status=403, headers={
+            "Content-Type": "application/json", "X-RateLimit-Remaining": "0",
+            "X-RateLimit-Reset": "1040"})
+        ok = fixture_response({"total_count": 0, "incomplete_results": False, "items": []})
+        client = self.client(quota, [limited, ok], calls)
+        response = client.get_json("/search/issues", {"q": 'repo:o/n "a" is:pr is:open'})
+        self.assertEqual(200, response.status)
+        self.assertEqual([40.0], quota.sleeps)
+        first, second = client.request_events
+        self.assertEqual(("retry", "remaining-zero-and-reset", 40.0),
+                         (first["retry_decision"], first["retry_reason"], first["retry_delay"]))
+        self.assertEqual(("return", 2), (second["retry_decision"], second["attempt"]))
+
+    def test_a_second_search_rate_limit_is_not_retried(self):
+        quota = FakeSearchQuota(latency=0.0)
+        calls = []
+        limited = fixture_response({"message": "API rate limit exceeded"}, status=403, headers={
+            "Content-Type": "application/json", "X-RateLimit-Remaining": "0",
+            "X-RateLimit-Reset": "1040"})
+        ok = fixture_response({"total_count": 0, "incomplete_results": False, "items": []})
+        client = self.client(quota, [limited, dict(limited), ok], calls)
+        response = client.get_json("/search/issues", {"q": 'repo:o/n "a" is:pr is:open'})
+        self.assertEqual(403, response.status)
+        self.assertEqual(2, len(calls))
+        self.assertEqual("retry-limit-reached", client.request_events[-1]["retry_reason"])
+        self.assertEqual(verify_candidates.SEARCH_RATE_LIMIT_RETRIES, 1)
+
+    def test_the_contract_states_the_pacing_constants(self):
+        github = (SKILL_DIR / "references/github-verification-contract.md").read_text(encoding="utf-8")
+        self.assertIn("at least %g seconds after the previous one and each `GET /search/code`"
+                      % verify_candidates.SEARCH_ISSUES_INTERVAL_SECONDS, github)
+        self.assertIn("at least %g seconds after the previous one, which is"
+                      % verify_candidates.SEARCH_CODE_INTERVAL_SECONDS, github)
+        self.assertIn("at most %d seconds ahead" % (verify_candidates.SEARCH_WINDOW_SECONDS + 1), github)
+        self.assertEqual(1, verify_candidates.SEARCH_RATE_LIMIT_RETRIES)
+        self.assertIn("retries a rate-limit answer (`retry-after`, `remaining-zero-and-reset`, "
+                      "or `http-429`) at most once", github)
+        self.assertEqual(("retry-after", "remaining-zero-and-reset", "http-429"),
+                         verify_candidates.RATE_LIMIT_RETRY_REASONS)
+
+    def test_a_non_search_rate_limit_keeps_three_retries(self):
+        quota = FakeSearchQuota(latency=0.0)
+        calls = []
+        limited = fixture_response({"message": "API rate limit exceeded"}, status=403, headers={
+            "Content-Type": "application/json", "X-RateLimit-Remaining": "0",
+            "X-RateLimit-Reset": "1001"})
+        client = self.client(quota, [dict(limited) for _ in range(4)], calls)
+        response = client.get_json("/repos/o/n")
+        self.assertEqual(403, response.status)
+        self.assertEqual(verify_candidates.MAX_RETRIES + 1, len(calls))
 
 
 if __name__ == "__main__":

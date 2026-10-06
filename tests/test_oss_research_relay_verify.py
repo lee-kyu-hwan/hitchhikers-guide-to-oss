@@ -8,11 +8,13 @@ guard refuses any address but 127.0.0.1. Nothing reads a token.
 from __future__ import annotations
 
 import base64
+from contextlib import redirect_stderr, redirect_stdout
 import copy
 import http.client
 import http.server
 import importlib.machinery
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path
@@ -436,6 +438,31 @@ class IdentityTests(Harness):
         self.assertIn("not TLS evidence", transport["note"])
         self.assertEqual(transport["verifier"]["sha256"], verifier_source["sha256"])
         self.assertTrue(all(entry["outcome"] in ("relayed", "upstream-error") for entry in transport["requests"]))
+
+    def relayed_with_sleep(self, name, sleep, deadline="60"):
+        argv, out = self.discover_argv(name)
+        stderr = io.StringIO()
+        with redirect_stderr(stderr), redirect_stdout(io.StringIO()):
+            code = adapter.main(["discover", "--relay-url", "http://127.0.0.1:%d" % self.port,
+                                 "--skills-dir", str(SKILLS), "--transport-record", str(out) + "-transport.json",
+                                 "--timeout-seconds", "30", "--max-response-bytes", str(1 << 20),
+                                 "--deadline-seconds", deadline] + argv,
+                                environ={}, clock=lambda: FIXED_TIME, sleep=sleep)
+        return code, stderr.getvalue()
+
+    def test_search_pacing_waits_go_through_the_deadline_bounded_sleep(self):
+        """#279: the verifier's search pacing uses the adapter's sleeper, not its own clock."""
+        sleeps = []
+        code, _ = self.relayed_with_sleep("paced", sleeps.append)
+        self.assertEqual(code, 3)
+        waits = {round(seconds, 6) for seconds in sleeps}
+        self.assertIn(verifier.SEARCH_ISSUES_INTERVAL_SECONDS, waits)
+        self.assertIn(verifier.SEARCH_CODE_INTERVAL_SECONDS, waits)
+
+    def test_a_pacing_wait_past_the_deadline_stops_the_step(self):
+        code, stderr = self.relayed_with_sleep("late", lambda seconds: None, deadline="2")
+        self.assertEqual(code, 2)
+        self.assertIn("a wait of 2.1s would pass the step deadline", stderr)
 
     def test_token_variables_stop_the_step_before_any_request(self):
         for name in ("GH_TOKEN", "GITHUB_TOKEN"):

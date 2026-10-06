@@ -101,6 +101,9 @@ MAX_CLUES = 5
 MAX_CLUE_CHARS = 200
 MAX_REQUEST_BUDGET = 60
 MAX_TIMEOUT_SECONDS = 1800.0
+# Covers MAX_REQUEST_BUDGET searches one verifier pacing interval apart plus one
+# search rate-limit reset wait inside the adapter deadline (tests keep them in step).
+DEFAULT_TIMEOUT_SECONDS = 300.0
 MAX_INPUT_BYTES = 4 * 1024 * 1024
 RELAY_MAX_RESPONSE_BYTES = 4 * 1024 * 1024
 RELAY_RESPONSE_BYTE_BUDGET = 64 * 1024 * 1024
@@ -514,7 +517,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--max-clues-per-pattern", type=int)
     parser.add_argument("--max-clues-per-locus", type=int)
     parser.add_argument("--request-budget", type=int, default=MAX_REQUEST_BUDGET)
-    parser.add_argument("--timeout", type=float, default=300.0)
+    parser.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT_SECONDS)
     parser.add_argument("--github-token-file", default=None)
     parser.add_argument("--static-reads", default="none")
     parser.add_argument("--static-dir", action="append", default=[])

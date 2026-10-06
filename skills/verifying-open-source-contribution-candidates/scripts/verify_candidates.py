@@ -30,6 +30,19 @@ import urllib.request
 DEFAULT_API_VERSION = "2026-03-10"  # api_version default
 MAX_RETRIES = 3
 MAX_RETRY_DELAY_SECONDS = 300.0
+# GitHub search allows 30 issue searches and 10 code searches a minute per
+# user. One request per 60/limit seconds plus a 5% margin stays under both.
+SEARCH_ISSUES_INTERVAL_SECONDS = 2.1
+SEARCH_CODE_INTERVAL_SECONDS = 6.1
+SEARCH_INTERVAL_SECONDS = {
+    "/search/issues": SEARCH_ISSUES_INTERVAL_SECONDS,
+    "/search/code": SEARCH_CODE_INTERVAL_SECONDS,
+}
+SEARCH_WINDOW_SECONDS = 60.0
+# A search rate-limit answer is retried once, after its reset; a second one
+# means another client shares the quota, so the request returns.
+SEARCH_RATE_LIMIT_RETRIES = 1
+RATE_LIMIT_RETRY_REASONS = ("retry-after", "remaining-zero-and-reset", "http-429")
 GITHUB_API_ORIGIN = "https://api.github.com"
 GITHUB_API_HOST = "api.github.com"
 HTTP_TIMEOUT_SECONDS = 30.0
@@ -308,6 +321,9 @@ SENSITIVITY_VALUES = ("normal", "security-sensitive")
 ACTIONABLE_STATUSES = (
     "reproduced", "issue-ready", "pr-ready", "private-report-ready",
 )
+# Statuses still open for a proposal: a pull request at the same locus turns
+# them into duplicate. duplicate, not-applicable, and stale are already settled.
+LOCUS_DUPLICATE_STATUSES = READY_STATUSES + ("reproduced", "policy-review", "unverified")
 
 
 class CliInputError(ValueError):
@@ -1312,6 +1328,21 @@ def _retryable(status: int, headers: Dict[str, str]) -> Tuple[bool, str]:
     return False, "not-retryable"
 
 
+def _search_endpoint(request_path: str) -> Optional[str]:
+    endpoint = request_path.split("?", 1)[0]
+    return endpoint if endpoint in SEARCH_INTERVAL_SECONDS else None
+
+
+def _rate_limit_retry_exhausted(
+    endpoint: Optional[str], retry_reason: str, rate_limit_retries: int
+) -> bool:
+    return (
+        endpoint is not None
+        and retry_reason in RATE_LIMIT_RETRY_REASONS
+        and rate_limit_retries >= SEARCH_RATE_LIMIT_RETRIES
+    )
+
+
 class _RefuseRedirects(urllib.request.HTTPRedirectHandler):
     """Surface every redirect as an HTTP error instead of following it."""
 
@@ -1451,6 +1482,29 @@ class GhApiClient:
         self.budget = budget if budget is not None else RequestBudget(300)
         self.api_version = api_version
         self.request_events = []  # type: List[Dict[str, object]]
+        self._search_not_before = {}  # type: Dict[str, float]
+
+    def _pace_search(self, endpoint: Optional[str]) -> None:
+        """Wait until this search endpoint may start its next request."""
+        if endpoint is None:
+            return
+        wait = self._search_not_before.get(endpoint, float("-inf")) - self.clock()
+        if wait > 0:
+            self.sleeper(wait)
+        self._search_not_before[endpoint] = (
+            self.clock() + SEARCH_INTERVAL_SECONDS[endpoint]
+        )
+
+    def _note_search_quota(self, endpoint: Optional[str], headers: Dict[str, str]) -> None:
+        """After a search answer with no quota left, hold the next one until the reset."""
+        if endpoint is None or headers.get("X-RateLimit-Remaining") != "0":
+            return
+        reset = _nonnegative_finite_number(headers.get("X-RateLimit-Reset"))
+        if reset is None:
+            return
+        not_before = min(reset, self.clock() + SEARCH_WINDOW_SECONDS + 1.0)
+        if not_before > self._search_not_before.get(endpoint, float("-inf")):
+            self._search_not_before[endpoint] = not_before
 
     @property
     def transport(self) -> str:
@@ -1517,8 +1571,11 @@ class GhApiClient:
             exchange = self._https_exchange(request_path)
         else:
             exchange = self._gh_exchange(request_path)
+        search_endpoint = _search_endpoint(request_path)
+        rate_limit_retries = 0
         for attempt in range(MAX_RETRIES + 1):
             self.budget.consume()
+            self._pace_search(search_endpoint)
             event = {
                 "path": request_path,
                 "attempt": attempt + 1,
@@ -1530,6 +1587,7 @@ class GhApiClient:
                 status, headers, body = exchange()
                 event["status"] = status
                 event["headers"] = headers
+                self._note_search_quota(search_endpoint, headers)
                 response = ApiResponse(status, headers, _payload_from_body(body))
             except (
                 OSError,
@@ -1553,12 +1611,20 @@ class GhApiClient:
                 self.sleeper(delay)
                 continue
             retryable, retry_reason = _retryable(response.status, response.headers)
-            if not retryable or attempt == MAX_RETRIES:
+            if (
+                not retryable
+                or attempt == MAX_RETRIES
+                or _rate_limit_retry_exhausted(
+                    search_endpoint, retry_reason, rate_limit_retries
+                )
+            ):
                 event["retry_decision"] = "return"
                 event["retry_reason"] = (
                     "retry-limit-reached" if retryable else retry_reason
                 )
                 return response
+            if retry_reason in RATE_LIMIT_RETRY_REASONS:
+                rate_limit_retries += 1
             delay = _retry_delay(response.headers, attempt, self.clock)
             event["retry_decision"] = "retry"
             event["retry_reason"] = retry_reason
@@ -1622,6 +1688,8 @@ class FixtureTransport:
         request_path = _request_path(endpoint, params)
         raw = self.responses.get(request_path)
         sequence = raw if isinstance(raw, list) else None
+        search_endpoint = _search_endpoint(request_path)
+        rate_limit_retries = 0
         for attempt in range(MAX_RETRIES + 1):
             self.budget.consume()
             selected = sequence[min(attempt, len(sequence) - 1)] if sequence else raw
@@ -1657,12 +1725,20 @@ class FixtureTransport:
             }
             self.request_events.append(event)
             retryable, retry_reason = _retryable(response.status, response.headers)
-            if not retryable or attempt == MAX_RETRIES:
+            if (
+                not retryable
+                or attempt == MAX_RETRIES
+                or _rate_limit_retry_exhausted(
+                    search_endpoint, retry_reason, rate_limit_retries
+                )
+            ):
                 event["retry_decision"] = "return"
                 event["retry_reason"] = (
                     "retry-limit-reached" if retryable else retry_reason
                 )
                 return response
+            if retry_reason in RATE_LIMIT_RETRY_REASONS:
+                rate_limit_retries += 1
             delay = _retry_delay(response.headers, attempt, self.clock)
             event["retry_decision"] = "retry"
             event["retry_reason"] = retry_reason
@@ -4153,6 +4229,108 @@ def _merged_duplicate_search(
     return merged
 
 
+def _locus_pr_matches(
+    locus: object, search: Optional[Dict[str, object]]
+) -> Tuple[List[Dict[str, object]], List[Dict[str, object]]]:
+    """Split the locus search's pull requests into same-locus and undecided ones.
+
+    A pull request covers the locus when it is returned for every
+    locus-derived clue and there are at least two such clues. It is undecided
+    when it is missing only from listings that were cut short, or when fewer
+    than two locus-derived clues were searched.
+    """
+    if not isinstance(search, dict):
+        return [], []
+    repository = search.get("repository")
+    derived = [
+        clue for clue in search.get("clues", []) if clue in _locus_clues(locus)
+    ]
+    queries = {
+        query.get("q"): query
+        for query in search.get("queries", [])
+        if isinstance(query, dict)
+    }
+    found = {}  # type: Dict[str, Dict[str, object]]
+    clue_urls = {}  # type: Dict[str, set]
+    truncated = set()
+    for clue in derived:
+        clue_urls[clue] = set()
+        for state in ("open", "closed"):
+            query = queries.get(
+                'repo:%s "%s" is:pr is:%s' % (repository, clue, state)
+            )
+            if query is None:
+                truncated.add(clue)
+                continue
+            items = query.get("items") if isinstance(query.get("items"), list) else []
+            total = query.get("total_count")
+            if isinstance(total, bool) or not isinstance(total, int) or total > len(items):
+                truncated.add(clue)
+            for item in items:
+                if not isinstance(item, dict) or item.get("pull_request") is not True:
+                    continue
+                url = item.get("html_url")
+                if isinstance(url, str) and url:
+                    found.setdefault(url, item)
+                    clue_urls[clue].add(url)
+    same, undecided = [], []
+    for url, item in found.items():
+        if len(derived) >= 2 and all(url in clue_urls[clue] for clue in derived):
+            same.append(item)
+        elif len(derived) < 2 or all(
+            url in clue_urls[clue] or clue in truncated for clue in derived
+        ):
+            undecided.append(item)
+    return same, undecided
+
+
+def _with_locus_duplicates(
+    assessment: Dict[str, object], search: Optional[Dict[str, object]]
+) -> Dict[str, object]:
+    """Apply the locus search's pull request matches to an assessment copy."""
+    same, undecided = _locus_pr_matches(assessment.get("locus"), search)
+    if not same and not (undecided and assessment.get("status") in READY_STATUSES):
+        return assessment
+    effective = json.loads(json.dumps(assessment))
+    gaps = effective["blocking_gaps"]
+    verdict = effective["duplicate_verdict"]
+    if same:
+        urls = [str(item["html_url"]) for item in same]
+        clues = ", ".join(
+            clue for clue in search.get("clues", [])
+            if clue in _locus_clues(assessment.get("locus"))
+        )
+        gaps.append(
+            "locus-duplicate: %s returned for every locus clue (%s)"
+            % (" ".join(urls), clues)
+        )
+        for url in urls:
+            if url not in verdict["matched_items"]:
+                verdict["matched_items"].append(url)
+        verdict["judgment"] = (
+            verdict["judgment"].rstrip()
+            + (" " if verdict["judgment"].strip() else "")
+            + "record: the locus-search found a pull request returned for every "
+            "locus clue: %s." % " ".join(urls)
+        )
+        if effective["status"] in LOCUS_DUPLICATE_STATUSES:
+            effective["status"] = "duplicate"
+            effective["status_reason"] = (
+                "duplicate-open"
+                if any(item.get("state") == "open" for item in same)
+                else "duplicate-closed-other"
+            )
+    else:
+        urls = [str(item["html_url"]) for item in undecided]
+        gaps.append(
+            "locus-duplicate-undetermined: %s may cover the locus; a person must "
+            "check before a ready status" % " ".join(urls)
+        )
+        effective["status"] = "policy-review"
+        effective["status_reason"] = "none"
+    return effective
+
+
 def _run_outcome(records: Sequence[Dict[str, object]]) -> str:
     if not records:
         return "no-candidates"
@@ -4593,6 +4771,18 @@ def run_record(arguments: argparse.Namespace, *, clock: Callable[[], float]) -> 
         if not assessments:
             assessments = [_missing_assessment(discovery_record)]
         for assessment in assessments:
+            locus_search = (
+                None
+                if locus_search_index is None
+                else locus_search_index.get(
+                    (
+                        assessment["pattern_id"],
+                        discovery_record["repository"],
+                        assessment["locus"],
+                    )
+                )
+            )
+            assessment = _with_locus_duplicates(assessment, locus_search)
             key = _candidate_key(str(assessment["pattern_id"]), str(discovery_record["repository_node_id"]), str(assessment["locus"]))
             prior = by_key.get(key)
             if prior is None:
@@ -4629,16 +4819,7 @@ def run_record(arguments: argparse.Namespace, *, clock: Callable[[], float]) -> 
                 "blocking_gaps": list(assessment["blocking_gaps"]),
                 "superseded_by": assessment["superseded_by"],
                 "duplicate_search": _merged_duplicate_search(
-                    discovery_record["duplicate_search"],
-                    None
-                    if locus_search_index is None
-                    else locus_search_index.get(
-                        (
-                            assessment["pattern_id"],
-                            discovery_record["repository"],
-                            assessment["locus"],
-                        )
-                    ),
+                    discovery_record["duplicate_search"], locus_search
                 ),
                 "repository_checks": json.loads(json.dumps(discovery_record["repository_checks"])),
                 "verification_history": history,
@@ -5294,12 +5475,8 @@ def run_locus_search(
             runner, opener, sleeper, clock, budget, arguments.api_version
         )
 
-    searches = []
-    warnings = []  # type: List[str]
-    searched_repositories = []  # type: List[str]
+    planned = []  # type: List[Tuple[object, object, object, List[str]]]
     seen = set()
-    partial = False
-    exhausted = False
     for index, assessment in enumerate(assessment_document["assessments"]):
         pattern_id = assessment.get("pattern_id")
         repository = assessment.get("repository")
@@ -5319,6 +5496,30 @@ def run_locus_search(
         for clue in arguments.clue:
             if clue not in clues:
                 clues.append(clue)
+        planned.append((pattern_id, repository, locus, clues))
+    # One query per clue for open and closed issues and pull requests, sent one
+    # interval apart: the time is a floor, before latency and any reset wait.
+    planned_requests = sum(
+        4 * len(clues[:arguments.max_clues_per_locus])
+        for _, _, _, clues in planned
+    )
+    _write_stderr(
+        "locus-search plan: %d loci, %d search requests, at least %.1f s "
+        "at one request per %.1f s"
+        % (
+            len(planned),
+            planned_requests,
+            max(0, planned_requests - 1) * SEARCH_ISSUES_INTERVAL_SECONDS,
+            SEARCH_ISSUES_INTERVAL_SECONDS,
+        )
+    )
+
+    searches = []
+    warnings = []  # type: List[str]
+    searched_repositories = []  # type: List[str]
+    partial = False
+    exhausted = False
+    for pattern_id, repository, locus, clues in planned:
         used = clues[:arguments.max_clues_per_locus]
         if not used:
             partial = True

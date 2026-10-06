@@ -7,6 +7,7 @@ A request-failed policy observation cannot support issue-ready or pr-ready.
 A policy result recorded as unreviewed cannot support a ready status.
 A ready absence claim must match the observed absence, and an AI or CLA/DCO absence needs hand-reviewed evidence for every found file.
 A ready status requires a locus and a completed search repeated at that locus.
+A pull request returned for every locus-derived clue makes the candidate duplicate, and an undecided one keeps it out of a ready status.
 A reproduced status requires a static or executed reproduction, a reproduction evidence link, and a confirmed reproduction_evidence check.
 A failed recheck makes an actionable candidate unverified with status_reason insufficient-evidence.
 record and render preserve partial, failed, and unknown run states instead of defaulting them to complete.
@@ -144,6 +145,15 @@ Recheck re-observes only the conventional paths. A hand-reviewed digest therefor
 `discover` searches for duplicates before a locus exists, so its queries carry pattern-level clues only. The `locus-search` command runs after the assessment fixes each locus and repeats the search with clues derived from that locus. Its output is `{schema_version, generated_by, discovery_sha256, searches, status}`, and each search has exactly `pattern_id`, `repository`, `locus`, `clues`, `queries`, `complete`, `unused_clues`, and `method_limitations`.
 
 `record` takes that document through `--locus-search`. Its `discovery_sha256` must match the discovery input, every stored query must still be scoped to its own repository, and a ready status requires a matching `(pattern_id, repository, locus)` entry that is complete and has at least one clue. A ready status also requires a non-empty `locus`.
+
+### Locus duplicate rule
+
+The assessment is written before the locus search, so `record` applies the locus search's pull requests itself without another assessment. Only the matching `(pattern_id, repository, locus)` search counts, only items with `pull_request: true`, and only the clues derived from the locus (operator clues are left out).
+
+- **Same locus**: at least two locus-derived clues were searched and the pull request is returned for every one of them, open or closed. Search matches title, body, and comments, so this means its text names every token of the locus. Changed files are not read: that would need a request outside R3.5.
+- **Undecided**: the pull request is not a same-locus match, but every clue that did not return it had a listing cut short (`total_count` above the listed items, or no answer), or fewer than two locus-derived clues were searched.
+
+A same-locus pull request appends its URL to `duplicate_verdict.matched_items`, adds a `record:` sentence to `duplicate_verdict.judgment`, and adds a `locus-duplicate:` blocking gap. A candidate whose status is still open for a proposal (`issue-ready`, `pr-ready`, `private-report-ready`, `reproduced`, `policy-review`, `unverified`) becomes `duplicate` with `duplicate-open` when any match is open and `duplicate-closed-other` otherwise: a search item does not say whether a closed pull request was merged or why it closed. `duplicate`, `not-applicable`, and `stale` keep their status and gain only the gap. An undecided pull request matters only for a ready status: it becomes `policy-review` with reason `none` and a `locus-duplicate-undetermined:` gap for a person to check. These are values `record` writes into the `b` fields `status`, `status_reason`, and `blocking_gaps` and into the snapshot; the assessment file is unchanged. The rule can over-match: a pull request that names every locus token without changing the locus file (for example one that edits every rule) is reported too, and the gap lists every URL so a person can tell them apart.
 
 The candidate's `duplicate_search` is the union of both rounds: locus queries are appended, `locus_clues` lists the locus-derived clues and is empty when no locus round ran, and `complete` is true only when both rounds returned every query. `complete` means every query returned a response. It never means no duplicate exists, and `method_limitations` says so on every record so the report cannot be read the other way.
 
