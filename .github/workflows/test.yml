@@ -1,0 +1,133 @@
+name: test
+
+# dotfiles 의 CI(dotfiles#271)와 같은 방식이다. PR 이 main 최신 위에 있으면 병합 결과는 PR 에서 시험한 트리와
+# 같으므로 main push 는 다시 돌리지 않고, 통합 검증은 workflow_dispatch 로 main 에서 돌린다 (docs/ci.md)
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  test:
+    # macOS 러너는 Linux 보다 분당 약 10배 비싸다 (dotfiles#271). macOS 에서만 검증되는 범위는 docs/ci.md
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      # __pycache__ 가 생기면 패키징 테스트가 깨진다 (dotfiles#139)
+      PYTHONDONTWRITEBYTECODE: "1"
+    steps:
+      # 새 클론이 clean checkout 검증을 대신하므로 어떤 캐시도 복원하지 않는다
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      # 표준 라이브러리만 쓰므로 pip install 은 하지 않는다
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.14"
+
+      # 모듈마다 별도 프로세스로 동시에 돌린다 (docs/ci.md)
+      - name: 저장소 테스트
+        run: |
+          logs="$RUNNER_TEMP/repo-tests"
+          mkdir -p "$logs"
+          # 시험은 대부분 하위 프로세스·timeout 을 기다리므로 CPU 수의 두 배를 동시에 돌린다.
+          # 큰 파일(대개 오래 걸리는 모듈)부터 시작해 마지막에 긴 모듈 하나만 남는 일을 줄인다
+          mapfile -t modules < <(ls -S tests/test_*.py)
+          modules=("${modules[@]#tests/}")
+          modules=("${modules[@]%.py}")
+          # discover 와 같은 sys.path 가 되도록 저장소 루트에서 모듈 하나씩 discover 한다
+          printf '%s\n' "${modules[@]}" |
+            xargs -P "$(( $(nproc) * 2 ))" -I{} sh -c '
+              start=$(date +%s)
+              python3 -m unittest discover -s tests -p "$1.py" -v > "$2/$1.log" 2>&1
+              echo "$? $(( $(date +%s) - start ))" > "$2/$1.status"
+            ' _ {} "$logs"
+          failed=()
+          for module in "${modules[@]}"; do
+            if [ -f "$logs/$module.status" ]; then
+              read -r code seconds < "$logs/$module.status"
+            else
+              code=missing seconds=?
+            fi
+            echo "::group::$module (${seconds}s, exit $code)"
+            cat "$logs/$module.log"
+            echo "::endgroup::"
+            [ "$code" = 0 ] || failed+=("$module")
+          done
+          if [ ${#failed[@]} -gt 0 ]; then
+            printf '::error::저장소 테스트 실패: %s\n' "${failed[@]}"
+            exit 1
+          fi
+
+      # 분석 번들(workflow 스킬의 analysis/)의 시험은 <스킬>/tests 밖이라 스킬 단계가 찾지 않는다. 한 프로세스에서
+      # 여러 모듈을 discover 하면 offline guard 가 하네스 시험의 하위 프로세스를 막으므로, 저장소 시험처럼 모듈마다
+      # 별도 프로세스로 돌린다. selftest_*.py 는 스크립트라 python3 로 바로 돈다 (dotfiles#274, docs/ci.md)
+      - name: 분석 번들 테스트
+        if: ${{ !cancelled() }}
+        run: |
+          logs="$RUNNER_TEMP/analysis-tests"
+          mkdir -p "$logs"
+          bundle=skills/researching-open-source-contributions/analysis
+          mapfile -t modules < <(ls -S "$bundle"/test_*.py "$bundle"/selftest_*.py)
+          printf '%s\n' "${modules[@]}" |
+            xargs -P "$(( $(nproc) * 2 ))" -I{} sh -c '
+              name=$(basename "$1" .py)
+              start=$(date +%s)
+              case "$name" in
+                selftest_*) python3 "$1" > "$2/$name.log" 2>&1 ;;
+                *) python3 -m unittest -v "$1" > "$2/$name.log" 2>&1 ;;
+              esac
+              echo "$? $(( $(date +%s) - start ))" > "$2/$name.status"
+            ' _ {} "$logs"
+          failed=()
+          for path in "${modules[@]}"; do
+            module=$(basename "$path" .py)
+            if [ -f "$logs/$module.status" ]; then
+              read -r code seconds < "$logs/$module.status"
+            else
+              code=missing seconds=?
+            fi
+            echo "::group::$module (${seconds}s, exit $code)"
+            cat "$logs/$module.log"
+            echo "::endgroup::"
+            [ "$code" = 0 ] || failed+=("$module")
+          done
+          if [ ${#failed[@]} -gt 0 ]; then
+            printf '::error::분석 번들 테스트 실패: %s\n' "${failed[@]}"
+            exit 1
+          fi
+
+      - name: 스킬 테스트
+        if: ${{ !cancelled() }}
+        run: |
+          shopt -s nullglob
+          failed=()
+          for dir in skills/*/tests; do
+            skill="$(dirname "$dir")"
+            echo "::group::$skill"
+            if ! (cd "$skill" && python3 -m unittest discover -s tests -v); then
+              failed+=("$skill")
+            fi
+            echo "::endgroup::"
+          done
+          if [ ${#failed[@]} -gt 0 ]; then
+            printf '::error::스킬 테스트 실패: %s\n' "${failed[@]}"
+            exit 1
+          fi
+
+      - name: __pycache__ 가 생기지 않았는지 확인
+        if: ${{ !cancelled() }}
+        run: |
+          found="$(find . -name __pycache__ -print)"
+          if [ -n "$found" ]; then
+            echo "::error::__pycache__ 가 생겼다"
+            echo "$found"
+            exit 1
+          fi
