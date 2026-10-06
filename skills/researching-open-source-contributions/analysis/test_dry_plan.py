@@ -44,6 +44,12 @@ class LimitsTests(unittest.TestCase):
         self.assertEqual(limits["candidate_max_bytes"], stage_inputs.CANDIDATE_MAX_BYTES)
         self.assertEqual(limits["extract_answer_max_bytes"], stage_inputs.EXTRACT_ANSWER_MAX_BYTES)
 
+    def test_the_extract_answer_target_leaves_a_margin_under_the_checked_limit(self):
+        """#280: the extract prompt asks for 6,500 bytes; the strict check stays at 7,680 (the same indent-1 measure)."""
+        limits = json.loads((HERE / "run_limits.json").read_text(encoding="utf-8"))
+        self.assertEqual((6500, 7680), (limits["extract_answer_target_bytes"], limits["extract_answer_max_bytes"]))
+        self.assertEqual(limits["extract_answer_target_bytes"], stage_inputs.EXTRACT_ANSWER_TARGET_BYTES)
+
     def test_every_synthesis_prompt_states_the_limits_its_answer_is_checked_against(self):
         for name in ("synthesize.md", "synthesize-reduced.md", "synthesize-merge.md"):
             with self.subTest(name):
@@ -102,6 +108,21 @@ class DryPlanTests(reduce.ReducedCase):
             _, stderr = self.stage("extract-inputs", "--run-dir", self.run, "--out", str(self.root / "x"), code=2)
             self.assertIn("the worst-case plan does not pass", stderr)
             self.assertFalse((self.root / "x").exists())
+
+    def test_s4_a_plan_within_the_cap_without_its_retry_share_is_refused_with_it(self):
+        """#280: the dry plan counts the retry share; a plan whose planned calls fit but whose share does not is
+        refused before any model call, the cap is not raised and the share is not cut."""
+        plan = stage_inputs.worst_case_plan(stage_inputs.plan_inputs(self.context))
+        planned, share = plan["planned_calls"], plan["call_plan"]["retry"]["total"]
+        self.assertGreater(share, 0)
+        self.assertEqual(planned + share, plan["total_calls"])
+        with mock.patch.object(stage_inputs, "ABSOLUTE_MAX_CALLS", planned + share - 1):
+            tight = stage_inputs.worst_case_plan(stage_inputs.plan_inputs(self.context))
+        self.assertFalse(tight["ok"])
+        self.assertEqual(["calls: %d model calls at the limits (%d planned + %d retry share), over the absolute cap %d"
+                          % (planned + share, planned, share, planned + share - 1)], tight["refusals"])
+        with mock.patch.object(stage_inputs, "ABSOLUTE_MAX_CALLS", planned + share):
+            self.assertTrue(stage_inputs.worst_case_plan(stage_inputs.plan_inputs(self.context))["ok"])
 
     def test_a_stage_input_over_the_cap_at_the_limits_is_refused(self):
         with mock.patch.object(stage_inputs, "VERIFY_ANSWER_MAX_BYTES", 40000):
@@ -188,7 +209,8 @@ class ReviewFixTests(reduce.ReducedCase):
 
 class DigestInFinalPlanTests(unittest.TestCase):
     """A one-shard run keeps the digest in its final prompt: that prompt carries every quote, which the output
-    limits do not bound, so its worst-case plan does not pass; extract-inputs still records its 10-call plan."""
+    limits do not bound, so its worst-case plan does not pass; extract-inputs still records its 10-call plan (15 with
+    its retry share, #280)."""
 
     def setUp(self):
         self.root = Path(tempfile.mkdtemp())
@@ -202,7 +224,7 @@ class DigestInFinalPlanTests(unittest.TestCase):
         self.assertNotIn("split", json.loads(stdout))          # nothing to split on the digest path
         code, summary, stderr = stage("extract-inputs", "--run-dir", self.run, "--out", str(self.root / "x"))
         self.assertEqual(0, code, stderr)
-        self.assertEqual(10, summary["max_model_calls"])
+        self.assertEqual(15, summary["max_model_calls"])          # 10 planned + the retry share 5 (#280)
         self.assertNotIn("worst_case", summary)
 
 
@@ -232,11 +254,13 @@ class SyntheticCorpusTests(unittest.TestCase):
 
     def test_more_pull_requests_need_more_levels_and_a_hundred_are_refused_before_any_model_call(self):
         plans = {records: stage_inputs.worst_case_plan(self.corpus(records)) for records in (21, 28, 40, 100)}
-        self.assertEqual((True, [5, 2, 1], 27), (plans[21]["ok"], plans[21]["synthesis_levels"], plans[21]["total_calls"]))
-        self.assertEqual((True, [7, 3, 1], 35), (plans[28]["ok"], plans[28]["synthesis_levels"], plans[28]["total_calls"]))
+        # every total holds the retry share of 5 (#280): 27 + 5 and 35 + 5
+        self.assertEqual((True, [5, 2, 1], 32), (plans[21]["ok"], plans[21]["synthesis_levels"], plans[21]["total_calls"]))
+        self.assertEqual((True, [7, 3, 1], 40), (plans[28]["ok"], plans[28]["synthesis_levels"], plans[28]["total_calls"]))
         self.assertGreater(plans[40]["levels"], plans[28]["levels"])          # 15 groups, then 8, 4, 2 and 1 merges
         self.assertEqual([15, 8, 4, 2, 1], plans[40]["synthesis_levels"])
-        self.assertIn("calls: 64 model calls at the limits, over the absolute cap 40", plans[40]["refusals"])
+        self.assertIn("calls: 69 model calls at the limits (64 planned + 5 retry share), over the absolute cap 40",
+                      plans[40]["refusals"])
         large = plans[100]
         self.assertFalse(large["ok"])
         self.assertGreater(large["total_calls"], 40)
@@ -244,7 +268,8 @@ class SyntheticCorpusTests(unittest.TestCase):
         self.assertTrue(any("over the absolute cap 40" in reason for reason in large["refusals"]))
         for plan in plans.values():
             self.assertEqual(plan["total_calls"], plan["call_plan"]["extract"] + sum(plan["synthesis_levels"])
-                             + plan["call_plan"]["verify"] + 1)
+                             + plan["call_plan"]["verify"] + 1 + plan["call_plan"]["retry"]["total"])
+            self.assertEqual(plan["total_calls"], plan["call_plan"]["max_model_calls"])
             for level in plan["stages"]:
                 if level["stage"] in ("synthesis", "merge") and level["ok"]:
                     self.assertLessEqual(level["worst_bytes"], CAP)
@@ -464,24 +489,29 @@ class PeriodCorpusPlanTests(unittest.TestCase):
 
     def test_s1_the_eslint_bundle_passes_within_forty_calls(self):
         run, plan = self.plan("eslint", ("eslint", "markdown", "css"), 0)
-        self.check_passes(plan, 28, 4, [7, 3, 1], 35)
+        self.check_passes(plan, 28, 4, [7, 3, 1], 40)
         code, summary, stderr = stage("extract-inputs", "--run-dir", run, "--out", str(self.root / "x"))
         self.assertEqual(0, code, stderr)
         self.assertEqual(plan["call_plan"], summary["call_plan"])
 
     def test_s4_the_typescript_eslint_bundle_passes(self):
         _, plan = self.plan("tseslint", ("tseslint",), 0)
-        self.check_passes(plan, 21, 3, [5, 2, 1], 27)
+        self.check_passes(plan, 21, 3, [5, 2, 1], 32)
+        # the split gate run's corpus (#280): 27 planned calls and a retry share of 5, within the cap 40
+        self.assertEqual({"per_call": 1, "per_stage": 3, "stages": {"extract": 3, "synthesis": 3, "verify": 3, "final": 1},
+                          "total": 5}, plan["call_plan"]["retry"])
+        self.assertEqual((27, 5), (plan["planned_calls"], plan["retry_calls"]))
 
     def test_s4_the_whole_period_collection_is_refused_and_split_by_owner(self):
         run, plan = self.plan("all", ("eslint", "tseslint", "markdown", "css"), 2)
         self.assertFalse(plan["ok"])
-        self.assertEqual((49, 6, 64), (plan["records"], plan["call_plan"]["shards"], plan["total_calls"]))
+        self.assertEqual((49, 6, 69), (plan["records"], plan["call_plan"]["shards"], plan["total_calls"]))
         self.assertEqual([15, 8, 4, 2, 1], plan["synthesis_levels"])
         self.assertEqual(["final: 75854 bytes at the limits (> 65536)",
-                          "calls: 64 model calls at the limits, over the absolute cap 40"], plan["refusals"])
-        self.assertEqual([(["eslint/css", "eslint/eslint", "eslint/markdown"], 28, [7, 3, 1], 35, True),
-                          (["typescript-eslint/typescript-eslint"], 21, [5, 2, 1], 27, True)],
+                          "calls: 69 model calls at the limits (64 planned + 5 retry share), over the absolute cap 40"],
+                         plan["refusals"])
+        self.assertEqual([(["eslint/css", "eslint/eslint", "eslint/markdown"], 28, [7, 3, 1], 40, True),
+                          (["typescript-eslint/typescript-eslint"], 21, [5, 2, 1], 32, True)],
                          [(b["repositories"], b["records"], b["synthesis_levels"], b["total_calls"], b["ok"])
                           for b in plan["split"]])
         code, _, stderr = stage("extract-inputs", "--run-dir", run, "--out", str(self.root / "x"))

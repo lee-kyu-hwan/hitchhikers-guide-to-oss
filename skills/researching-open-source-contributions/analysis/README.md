@@ -10,10 +10,12 @@
 | `verify_e2e_result.py` | 모델 답 strict 검사와 채택(`--answer-kind extract|synthesis|verify|final|assess`) |
 | `assess_contract.py` | 판정 필드 타입 표(verifier record 검사와 동기화) |
 | `prompts/` | 종합·합침·최종·판정 지시문(상한은 `{{키}}`로 `run_limits.json`에서 채운다) |
-| `run_limits.json` | strict 상한과 worker 선택값 |
+| `run_limits.json` | strict 상한, worker 선택값, 추출 답 크기 목표치, 한정 재시도 정책(`model_retry`) |
+| `retry_policy.py` | 한정 재시도 정책 하나(#280): call_plan의 재시도 몫, 재시도할 strict 판정 분류, 하네스의 재시도 허용(`admit`) |
 | `request.template.json` | workflow 요청 틀 |
 | `prepare_input.sh` | 수집 산출물 → blind 추출 입력 1개 |
-| `harness/analysis_call.sh` | 호스트에서 격리 모델 호출 1회와 원장(호출 상한·call_plan 결속·이어받기 체인) |
+| `harness/analysis_call.sh` | 호스트에서 격리 모델 호출 1회와 원장(호출 상한·call_plan 결속·이어받기 체인·재시도 몫, `--retry-of`) |
+| `harness/call_with_retry.py` | 계획된 호출 1개: 하네스 호출 → 원장 줄 확인 → strict 검사·채택, 답 내용 위반이면 같은 prompt로 한정 재시도(#280) |
 | `test_*.py`, `selftest_*.py` | 시험(모델·VM·네트워크 없음, 일부는 이 머신의 증거가 있을 때만 돈다) |
 
 ## 실행
@@ -25,6 +27,48 @@
 for f in dot_agents/skills/researching-open-source-contributions/analysis/test_*.py; do /opt/homebrew/bin/python3 -B -m unittest "$f"; done
 for f in dot_agents/skills/researching-open-source-contributions/analysis/selftest_*.py; do /opt/homebrew/bin/python3 -B "$f"; done
 ```
+
+## 한정 재시도와 답 크기 목표 (#280)
+
+2026-10-06 분리 판정 실행(`docs/research/2026-10-06-split-gate-run/`)은 코드 결함 없이 모델 호출 12회 중 2회가 모델 규칙 위반(인용 길이 Q1, 답 크기 R3)으로 strict에서 거부돼 사람 승인 없이는 끝까지 갈 수 없었다. 검증은 그대로 두고, 그런 위반만 정해진 횟수 안에서 흡수한다.
+
+### 재시도 몫 (`run_limits.json` `model_retry`, `retry_policy.retry_share`)
+
+- 정책: 호출당 1회(`per_call`), 단계(extract·synthesis·verify·final)별 최대 3회(`per_stage`, 그 단계 호출 수 × `per_call`를 넘지 않음), 계획 전체 최대 5회(`total`). 원천은 `run_limits.json` 하나다.
+- 모든 분석 call_plan(`extract-inputs`·`dry-plan`의 최악 계획, digest-in-final 계획, `continue-plan`)이 `retry` 블록을 갖고, `max_model_calls`(= 원장 한도)는 계획 호출 + 재시도 몫이다. 최악 계획은 이 합으로 절대 상한 40을 검사해, 계획 호출만으로는 들어가도 재시도 몫까지 넣어 넘으면 모델 호출 전에 거부한다(40은 올리지 않고 몫도 깎지 않는다). 판정(assess) 계획은 재시도 몫이 없다.
+- `total` 5를 고른 근거: 관측 위반율 2/12(17%)를 21건 계획 27회에 적용하면 약 4.5회다. 그리고 예전에 돌 수 있던 가장 큰 묶음(eslint 28건, 계획 35회)이 몫을 더해도 40 안에 남는 가장 큰 값이다. `per_stage` 3은 추출 한 단계가 몫을 다 써서 뒤 단계가 재시도를 못 하는 일을 막는다.
+- 하네스는 몫을 재시도에만 쓰게 한다: `--retry-of` 없는 호출은 원장에 계획 호출 수(한도 − 몫)만큼 쌓이면 거부한다(exit 3).
+
+### 무엇을 재시도하나 (`retry_policy.classify`, `admit`)
+
+- 재시도한다: extract·synthesis·verify·final 답의 strict 판정이 답 내용 항목에서만 FAIL일 때(`R2` JSON 아님, `R3` 모양·크기·개수, `R5` 입력 범위, `R6` 검색 단서, `Q1` 인용). 그 실패에 막힌 BLOCKED 항목은 괜찮다.
+- 재시도하지 않는다: 하네스 exit(staging·transport·로그 미확인·원장 한도·call_plan 결속), 깨끗하지 않은 원장 줄(측정 launch, pickup·judge, 관측 모델·권한 모드), 다른 항목 FAIL(C·P·S·M·R0·R1·A), assess 답, legacy 판정, ok인데 채택 실패, gate(비용) 거부.
+- 재시도는 같은 prompt 바이트로만 한다(앞 호출의 원장 `input_sha256`·`prompt_sha256_recorded`, 판정 P3가 이 prompt sha와 같아야 함). 재시도 답도 같은 strict 검사를 거친다. prompt·답·상한을 고치지 않는다.
+- 이름: 첫 호출 `NAME`, 재시도 `NAME-r2`(호출당 1회이므로 r2까지). `analysis_call.sh --retry-of NAME ... NAME-r2 ...`가 `retry_policy.py admit`으로 허용을 묻고, 원장 줄에 `attempt`, `retry_of`(첫 호출), `previous`, `retry_stage`, `failure_sha256`(앞 호출 `verdict.json`의 sha256), `failed_items`를 더 적는다. 일반 호출 줄은 예전 그대로다.
+- `harness/call_with_retry.py`가 이 순서를 한 호출 단위로 돈다: `--gate`(예: 비용 확인) → 하네스 → 원장 줄 확인(run_limits worker의 모델·권한 모드) → `verify_e2e_result.py`(strict, `--out <호출>/verdict.json --adopt-to`) → 재시도할 수 있으면 같은 prompt로 다시. exit 0 채택, 10 깨끗하지 않은 호출, 11 재시도 안 하는 판정이거나 몫 소진, 12 gate 거부.
+
+### 이어받기와의 맞물림 (#82·#258·#262)
+
+- 재시도로 채택된 답은 그 시도(`<호출>-r2`)의 기록으로 결속된다(`adopted_extract_answer`·`adopted_reduce_answer`가 첫 호출부터 시도 순서로 찾는다). 분리 판정 실행에서 조정자 승인으로 손으로 다시 부른 `extract-structure-01-r2`도 같은 규칙으로 결속된다.
+- 추출 도중 멈춘 실행(부분 이어받기): `continue-plan`에 채택된 추출 답 일부만 주면, 남은 추출 prompt(추출 stage가 기록한 바이트·sha, `pending`)와 뒤 단계 전부(최악 계획의 단계 수)와 그 재시도 몫으로 계획을 만든다. 하네스는 `call_plan.extract + completed.extract = shards × lenses`를 확인한다. 이 continue stage를 다시 이어받을 때는 남겼던 추출 답을 부모 원장(그 호출을 한 원장)의 기록으로 결속한다.
+- 하네스의 체인 상한(조상 + 부모 호출 + 이 한도 ≤ 40)은 그대로다. 부모의 재시도 호출도 부모 호출 수에 들어간다.
+
+### 답 크기 목표 (`extract_answer_target_bytes` 6,500)
+
+- strict 검사 값은 바꾸지 않는다: `extract_answer_max_bytes` 7,680, 측정은 답을 들여쓰기 1칸으로 다시 쓴 크기 그대로다.
+- 고른 방법: 지시문에 여유를 둔 목표치를 더한다(분석기 `build_prompts.py extract --answer-target-bytes`, 크기 상한 문장 바로 뒤 한 줄). 측정 기준을 "모델이 낸 바이트"로 바꾸는 안은 검사 방법을 바꾸는 것이라 고르지 않았다. 모델은 자기가 낸 바이트도 정확히 세지 못하므로 같은 기준으로 여유를 주는 쪽이 검사와 지시문이 같은 수를 말하는 규칙(#248)을 지킨다.
+- 6,500의 근거: 분리 판정 실행의 위반 답은 공백 없이 7,300 B였고 들여쓰기 1칸으로 다시 쓰면 8,342 B(+14%)였다. 7,680 / 1.15 ≈ 6,680이므로 그보다 조금 낮게 잡았다. 지시문은 "공백 없이 내도 다시 써서 재므로 15% 안팎 커진다"고 함께 알린다.
+- 목표치는 `run_limits.json` 한 곳에서 오고, 크기 상한이 없거나 목표가 상한 이상이면(옛 상한·시험용 작은 상한) 문장을 넣지 않는다. 추출 stage.json이 `extract_answer_target_bytes`를 기록하고, `continue-plan`은 기록된 값(없으면 목표 문장 없이)으로 prompt를 다시 써서 바이트를 비교한다. 그래서 #280 이전 추출 stage(분리 판정 실행)도 바이트 그대로 이어받는다. 인용 길이처럼 지시문에 이미 있는데도 어긴 규칙은 바꾸지 않고 재시도로 흡수한다.
+
+### 기록값 (오프라인, 모델·VM·GitHub 0)
+
+| 항목 | 값 |
+|---|---|
+| 21건 corpus(분리 판정 실행과 같은 수집 6개) dry plan | 추출 15 + 종합·합침 8(5 + 2 + 1) + 검증 3 + 최종 1 = 계획 27, 재시도 몫 5(extract 3·synthesis 3·verify 3·final 1, 전체 5) → **최악 32 ≤ 40**. 추출 최악 prompt 58,943 B(목표 문장 247 B 증가, 실행 당시 58,696 B) |
+| 분리 판정 실행 이어받기(`continue-plan`, 채택 답 10개 바이트 그대로, `--records` = 그 원장) | 남은 추출 5(`extract-blind-03`, `extract-{correctness,maintenance,review,structure}-03`, 기록된 prompt 바이트) + 종합·합침 8 + 검증 3 + 최종 1 = 17, 재시도 몫 5 → **한도 22**. 부모 원장 12회 + 22 = 34 ≤ 40. `extract-structure-01`은 `extract-structure-01-r2`의 기록으로 결속. 하네스 사본(가짜 VM)이 이 계획과 부모 원장 사본을 받아 한도 22·부모 12회를 기록함 |
+| 남은 위험 | 남은 추출 5개는 기록된 prompt 바이트(목표 문장 없음)로 불러야 바이트 그대로 이어받으므로, `extract-blind-03`의 답 크기 위반은 목표 문장이 아니라 재시도 1회로만 흡수된다. 새 실행은 목표 문장이 든 prompt를 쓴다 |
+
+시험: `test_model_retry.py`(S1~S3: 재시도 후 채택·원장 2줄, 호출당·단계·계획 몫 소진 뒤 멈춤, transport·로그·결속·관측 모델·gate는 재시도 없음, 허용 거부 사례, 분리 판정 실행의 실제 판정 분류), `test_dry_plan.py`(S4: 21건 32회, 몫 때문에 넘는 계획 거부), `test_continue_plan.py`(부분 이어받기, 재시도 시도 결속, 분리 판정 실행 증거), `tests/test_oss_research_worker_linux.py`(원장: 몫 포함 한도, 몫 형식 거부, 부분 이어받기 계획 수용), 분석기 `tests/test_extraction.py`(목표 문장).
 
 ## 옛 경로 대응(#261)
 

@@ -3399,6 +3399,79 @@ exit 0
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertEqual(15, json.loads((self.root / "child" / "ledger-limit.json").read_text())["limit"])
 
+    RETRY_SHARE = {"per_call": 1, "per_stage": 3, "stages": {"extract": 3, "synthesis": 2, "verify": 3, "final": 1},
+                   "total": 5}
+
+    def retry_stage(self, name="retry.json", retry=None, **changes):
+        """A stage.json whose call plan holds the #280 retry share: max_model_calls is the planned calls (11) and the
+        share's total (5)."""
+        plan = {"mode": "extraction-only", "shards": 1, "lenses": 5, "extract": 5, "synthesis": 2, "verify": 3,
+                "final": 1, "retry": self.RETRY_SHARE if retry is None else retry, "max_model_calls": 16,
+                "formula": "..."}
+        plan.update(changes)
+        path = self.root / name
+        path.write_text(json.dumps({"stage": "extract", "max_model_calls": plan["max_model_calls"], "call_plan": plan}))
+        return path
+
+    def test_a_retry_share_is_in_the_ledger_limit_and_only_for_retries(self):
+        plan = self.retry_stage()
+        for _ in range(11):
+            self.assertEqual(self.call(plan).returncode, 0)
+        refused = self.call(plan)
+        self.assertEqual(refused.returncode, 3, refused.stderr)
+        self.assertEqual("refused: the ledger already holds 11 planned model calls; the other 5 are the retry share, "
+                         "for a retry (--retry-of) only\n", refused.stderr)
+        self.assertEqual({"limit": 16, "call_plan_sha256": hashlib.sha256(plan.read_bytes()).hexdigest()},
+                         json.loads((self.ledger_dir / "ledger-limit.json").read_text()))
+        self.assertEqual(self.token_lines(), 11)
+        self.assertEqual(self.call(plan, kind="sentinel").returncode, 0)         # sentinels are not counted
+
+    def test_a_malformed_retry_share_is_refused_before_anything_starts(self):
+        share, stages = self.RETRY_SHARE, self.RETRY_SHARE["stages"]
+        cases = {
+            "the share not in max_model_calls": self.retry_stage("a.json", max_model_calls=11),
+            "a total over its stages": self.retry_stage("b.json", retry=dict(share, total=10), max_model_calls=21),
+            "a string total": self.retry_stage("c.json", retry=dict(share, total="5")),
+            "a bool total": self.retry_stage("d.json", retry=dict(share, total=True), max_model_calls=12),
+            "a negative stage": self.retry_stage("e.json", retry=dict(share, stages=dict(stages, extract=-1))),
+            "an unknown stage": self.retry_stage("f.json", retry=dict(share, stages=dict(stages, assess=1))),
+            "a share and no retry per call": self.retry_stage("g.json", retry=dict(share, per_call=0)),
+            "not an object": self.retry_stage("h.json", retry=5, max_model_calls=16),
+            "no stages": self.retry_stage("i.json", retry={"per_call": 1, "total": 5}),
+        }
+        for label, plan in cases.items():
+            with self.subTest(label):
+                refused = self.call(plan)
+                self.assertEqual(refused.returncode, 2, refused.stderr)
+                self.assertIn("call plan malformed", refused.stderr)
+        self.assertFalse(self.ledger_dir.exists())
+        self.assertEqual(self.limactl_calls(), 0)
+
+    def test_a_retry_share_over_forty_is_refused_before_anything_starts(self):
+        refused = self.call(self.retry_stage(shards=6, extract=30, max_model_calls=41))   # 36 planned + 5
+        self.assertEqual(refused.returncode, 2, refused.stderr)
+        self.assertIn("call plan of 41 calls is over the absolute cap 40", refused.stderr)
+        self.assertFalse(self.ledger_dir.exists())
+
+    def test_a_continuation_with_extract_calls_left_continues_its_parent(self):
+        """#280: continue-plan on a run stopped during its extract calls plans the extract calls left (15 of 20 done
+        here) and every later stage; the planned extract calls and the completed ones are the shards x lenses."""
+        parent_plan = self.parent(calls=5)
+        sha = hashlib.sha256(parent_plan.read_bytes()).hexdigest()
+        plan = self.continuation(parent_plan, remaining=12, name="part.json", extract=5, synthesis=1,
+                                 continues={"extract_stage_sha256": sha, "completed": {"extract": 15}})
+        done = self.call(plan, ledger=self.root / "child", parent=self.ledger_dir)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(12, json.loads((self.root / "child" / "ledger-limit.json").read_text())["limit"])
+        for label, extract, completed in (("one extract call too many", 6, 15), ("nothing completed", 20, 0)):
+            with self.subTest(label):
+                bad = self.continuation(parent_plan, remaining=7 + extract, name="bad-%d.json" % extract,
+                                        extract=extract, synthesis=1, continues={"extract_stage_sha256": sha,
+                                                                                 "completed": {"extract": completed}})
+                refused = self.call(bad, ledger=self.root / ("bad-%d" % extract), parent=self.ledger_dir)
+                self.assertEqual(refused.returncode, 2, refused.stderr)
+                self.assertIn("call plan malformed", refused.stderr)
+
     def test_a_call_plan_over_forty_is_refused_before_anything_starts(self):
         refused = self.call(self.stage(41))
         self.assertEqual(refused.returncode, 2, refused.stderr)

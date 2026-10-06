@@ -1,8 +1,8 @@
 #!/bin/bash
 # #78 analysis: one isolated model call from the host (macOS), with a ledger.
 #
-#   bash analysis_call.sh LEDGER_DIR NAME PROMPT_FILE COMMIT KIND [CREDENTIAL_FILE] [CALL_PLAN_FILE]
-#                         [PARENT_LEDGER_DIR]
+#   bash analysis_call.sh [--retry-of PREVIOUS] LEDGER_DIR NAME PROMPT_FILE COMMIT KIND [CREDENTIAL_FILE]
+#                         [CALL_PLAN_FILE] [PARENT_LEDGER_DIR]
 #
 # KIND token   : a real call. CREDENTIAL_FILE is the approved dedicated oauth-token; it reaches the
 #                guest only as non-PTY stdin of model_once.sh (run tmpfs + reaper), never argv or log.
@@ -39,6 +39,21 @@
 #                An assess plan (stage_inputs.py assess-inputs, #259: stage "assess", call_plan mode "assess" with
 #                assess = max_model_calls >= 1 and none of the analysis stage keys) binds a new ledger the same
 #                way; it continues no parent (exit 2 with PARENT_LEDGER_DIR).
+#                A continue-plan of a run stopped during its extract calls (#280: call_plan.extract > 0) plans the
+#                extract calls left: its extract calls and the completed ones must be the shards x lenses.
+#
+# Retry share (#280): a call plan may hold call_plan.retry {per_call, per_stage, stages, total} (retry_policy.py
+#                retry_share); max_model_calls, the ledger limit, is then the planned calls plus total. A call
+#                without --retry-of is refused (exit 3) once the ledger holds the planned calls (limit - total), so
+#                the share is spent only by retries. A plan without retry (from before #280) has a share of 0.
+# --retry-of PREVIOUS: this call is the next attempt of the call PREVIOUS of this ledger, whose strict verdict
+#                (LEDGER_DIR/PREVIOUS/verdict.json) failed only on the answer's content. retry_policy.py admit
+#                decides before anything starts: a plan without a share or a NAME other than <first>-r<attempt> is
+#                exit 2; a previous call that is not a clean token call of the same PROMPT_FILE bytes, a verdict
+#                missing, passed, of another prompt or failing anything else, a call already retried, or the
+#                per-call, stage or plan share spent is exit 3. The ledger line of a retry also records attempt,
+#                retry_of (the first call), previous, retry_stage, failure_sha256 (of that verdict.json) and
+#                failed_items. harness/call_with_retry.py drives it.
 #
 # Steps: refuse when LEDGER_DIR/ledger.jsonl already holds the limit of calls (started calls count,
 # failed ones too); stage PROMPT_FILE root-only in the guest (/var/lib/oss-research-staging/<NAME>/task.txt,
@@ -46,22 +61,39 @@
 # after grep -F finds no credential value (exit 1); pick up the result tar, check it with
 # verify_pickup.py (default contract) and judge-worker (analysis|dry); append one JSON line to the
 # ledger: name, times, input sha256, result tar sha256, report sha256, observed models, pickup and
-# judge exits, harness SUMMARY, unit. It never retries and never edits a prompt or an answer.
+# judge exits, harness SUMMARY, unit. It never retries by itself and never edits a prompt or an answer.
 set -u
+RETRY_OF=""
+if [ "${1:-}" = --retry-of ]; then
+  RETRY_OF="${2:-}"; shift 2 || { echo "--retry-of needs the previous call's name" >&2; exit 2; }
+  [[ "$RETRY_OF" =~ ^[a-z0-9][a-z0-9-]{0,40}$ ]] || { echo "--retry-of must name a call [a-z0-9-]" >&2; exit 2; }
+  [ $# -ge 7 ] || { echo "a retry needs the call plan (CALL_PLAN_FILE) that holds its retry share" >&2; exit 2; }
+fi
 LEDGER_DIR="$1"; NAME="$2"; PROMPT_FILE="$3"; C="$4"; KIND="$5"; CREDENTIAL="${6:-}"; CALL_PLAN="${7:-}"
 PARENT="${8:-}"
 case "$KIND" in token|sentinel) ;; *) echo "KIND must be token or sentinel" >&2; exit 2;; esac
+[ -z "$RETRY_OF" ] || [ "$KIND" = token ] || { echo "only a token call is retried" >&2; exit 2; }
 [[ "$NAME" =~ ^[a-z0-9][a-z0-9-]{0,40}$ ]] || { echo "NAME must be [a-z0-9-]" >&2; exit 2; }
 [ -f "$CREDENTIAL" ] && [ ! -L "$CREDENTIAL" ] || { echo "credential file missing" >&2; exit 2; }
 [ -f "$PROMPT_FILE" ] && [ ! -L "$PROMPT_FILE" ] || { echo "prompt file missing or a link" >&2; exit 2; }
-LIMIT=12; PLAN_SHA=null; CONTINUES=-; CHAIN=-; PARENT_SHA=-; PARENT_CALLS=-; ANCESTORS=-; PARENT_LIMIT_SHA=-
+LIMIT=12; PLAN_SHA=null; CONTINUES=-; CHAIN=-; PARENT_SHA=-; PARENT_CALLS=-; ANCESTORS=-; PARENT_LIMIT_SHA=-; RETRY_TOTAL=0
 if [ $# -ge 7 ]; then
   [ -f "$CALL_PLAN" ] && [ ! -L "$CALL_PLAN" ] || { echo "call plan file missing or a link" >&2; exit 2; }
-  read -r LIMIT PLAN_SHA CONTINUES CHAIN < <(PYTHONDONTWRITEBYTECODE=1 python3 -I -B - "$CALL_PLAN" <<'PY'
+  read -r LIMIT PLAN_SHA CONTINUES CHAIN RETRY_TOTAL < <(PYTHONDONTWRITEBYTECODE=1 python3 -I -B - "$CALL_PLAN" <<'PY'
 import hashlib, json, sys
 data = open(sys.argv[1], "rb").read()
 def whole(v):
     return type(v) is int
+def share_of(plan):
+    # the #280 retry share: none in a plan from before it; else the four stages, a total within them, per_call >= 1
+    if "retry" not in plan:
+        return 0
+    share = plan["retry"]
+    stages = share["stages"]
+    ok = isinstance(stages, dict) and set(stages) <= set(("extract", "synthesis", "verify", "final")) \
+        and all(whole(v) and v >= 0 for v in stages.values()) and whole(share["total"]) and whole(share["per_call"]) \
+        and 0 <= share["total"] <= sum(stages.values()) and share["per_call"] >= (1 if share["total"] else 0)
+    return share["total"] if ok else None
 try:
     stage = json.loads(data)
     plan = stage["call_plan"]
@@ -70,20 +102,21 @@ try:
         # an assess-inputs plan: one candidate assessment call per discovery, no analysis stage key.
         # A tuple, not a set literal: bash 3.2 brace-expands a comma list in braces inside this process substitution.
         analysis_keys = ("shards", "lenses", "extract", "synthesis", "verify", "final", "continues")
-        ok = plan.get("mode") == "assess" and set(plan).isdisjoint(analysis_keys) and whole(plan["assess"]) \
+        ok = plan.get("mode") == "assess" and set(plan).isdisjoint(analysis_keys + ("retry",)) and whole(plan["assess"]) \
             and whole(total) and plan["assess"] >= 1 and total == plan["assess"] \
             and whole(stage.get("max_model_calls")) and stage["max_model_calls"] == total
         if ok:
-            print(total, hashlib.sha256(data).hexdigest(), "-", "-")
+            print(total, hashlib.sha256(data).hexdigest(), "-", "-", 0)
         sys.exit(0)
     parts = [plan[k] for k in ("shards", "lenses", "extract", "synthesis", "verify", "final")]
     planned = plan["shards"] * plan["lenses"]
     continues, chain = "-", "-"
     if "continues" in plan:
-        # continue-plan: the extract calls were made under the parent ledger; only the later stages remain.
+        # continue-plan: the extract calls made under the parent ledger are done; the later stages remain, and the
+        # extract calls left when the parent stopped during them (#280)
         bound, done = plan["continues"]["extract_stage_sha256"], plan["continues"]["completed"]["extract"]
-        ok = plan["extract"] == 0 and whole(done) and done == planned >= 1 and type(bound) is str \
-            and len(bound) == 64 and all(c in "0123456789abcdef" for c in bound)
+        ok = whole(plan["extract"]) and whole(done) and done >= 1 and plan["extract"] + done == planned \
+            and type(bound) is str and len(bound) == 64 and all(c in "0123456789abcdef" for c in bound)
         continues = bound
         # a chain: the parent ledger was itself a continuation (its continue stage.json is "bound").
         stage_of_parent = plan["continues"].get("parent_stage")
@@ -91,13 +124,14 @@ try:
         ok = ok and chain != "?"
     else:
         ok = plan["extract"] == planned
-    ok = ok and all(whole(v) and v >= 0 for v in parts + [total]) and total >= 1 and plan["final"] == 1 \
-        and total == plan["extract"] + plan["synthesis"] + plan["verify"] + plan["final"] \
+    retry = share_of(plan)
+    ok = ok and retry is not None and all(whole(v) and v >= 0 for v in parts + [total]) and total >= 1 \
+        and plan["final"] == 1 and total == plan["extract"] + plan["synthesis"] + plan["verify"] + plan["final"] + retry \
         and stage.get("max_model_calls", total) == total and whole(stage.get("max_model_calls", total))
 except (ValueError, TypeError, KeyError, AttributeError):
     ok = False
 if ok:
-    print(total, hashlib.sha256(data).hexdigest(), continues, chain)
+    print(total, hashlib.sha256(data).hexdigest(), continues, chain, retry)
 PY
 )
   [ -n "$PLAN_SHA" ] && [ "$PLAN_SHA" != null ] || { echo "call plan malformed: $CALL_PLAN" >&2; exit 2; }
@@ -168,6 +202,7 @@ PY
   fi
 fi
 W=/Users/lee-kyu-hwan/.oss-research-vm
+HARNESS_DIR=$(cd "$(dirname "$0")" && pwd)
 L() { env -i HOME="$W/home" LIMA_HOME="$W/lima" TMPDIR="$W/tmp" PATH="$W/tool/bin:/usr/bin:/bin:/usr/sbin:/sbin" "$W/tool/bin/limactl" "$@"; }
 REPO=$(cd "$(dirname "$0")/../../../../.." && pwd)
 S=/opt/oss-research/src-$C
@@ -225,6 +260,18 @@ count=$(grep -c '"kind": "token"' "$LEDGER" 2>/dev/null); count=${count:-0}
 if [ "$KIND" = token ] && [ "$count" -ge "$LIMIT" ]; then
   echo "refused: the ledger already holds $LIMIT model calls" >&2; exit 3
 fi
+RETRY=""
+if [ -n "$RETRY_OF" ]; then
+  RETRY=$(PYTHONDONTWRITEBYTECODE=1 python3 -I -B "$HARNESS_DIR/../retry_policy.py" admit "$LEDGER_DIR" "$RETRY_OF" \
+    "$NAME" "$PROMPT_FILE" "$CALL_PLAN")
+  rc=$?; [ "$rc" = 0 ] || exit $(( rc == 2 ? 2 : 3 ))
+elif [ "$KIND" = token ] && [ "$RETRY_TOTAL" -gt 0 ]; then
+  planned=$(grep '"kind": "token"' "$LEDGER" 2>/dev/null | grep -vc '"attempt": ')
+  if [ "${planned:-0}" -ge $((LIMIT - RETRY_TOTAL)) ]; then
+    echo "refused: the ledger already holds $((LIMIT - RETRY_TOTAL)) planned model calls; the other $RETRY_TOTAL are" \
+      "the retry share, for a retry (--retry-of) only" >&2; exit 3
+  fi
+fi
 D="$LEDGER_DIR/$NAME"; mkdir -m 0700 "$D" || { echo "call directory exists: $D" >&2; exit 2; }
 input_sha=$(shasum -a 256 "$PROMPT_FILE" | cut -c1-64)
 STAGE=/var/lib/oss-research-staging/$NAME
@@ -243,8 +290,9 @@ L shell --workdir / oss-research-debian -- sudo rm -rf "$STAGE"
 grep -qF -f "$CREDENTIAL" "$D/harness.log"; leak=$?
 if [ "$leak" != 1 ] || [ ! -s "$D/harness.log" ]; then
   echo "log not proven clean (grep exit $leak): not shown, not picked up" >&2
-  printf '{"name": "%s", "kind": "%s", "started": "%s", "ended": "%s", "input_sha256": "%s", "log_clean": false}\n' \
-    "$NAME" "$KIND" "$began" "$ended" "$input_sha" >> "$LEDGER"
+  retried=""; [ -z "$RETRY" ] || retried=", ${RETRY:1:${#RETRY}-2}"
+  printf '{"name": "%s", "kind": "%s", "started": "%s", "ended": "%s", "input_sha256": "%s", "log_clean": false%s}\n' \
+    "$NAME" "$KIND" "$began" "$ended" "$input_sha" "$retried" >> "$LEDGER"
   exit 5
 fi
 unit=$(sed -n 's/^INFO R wrapper {"unit": "\(oss-research-[0-9a-f]*\)".*/\1/p' "$D/harness.log" | head -1)
@@ -271,17 +319,18 @@ if [ -n "$unit" ]; then
     judge-worker "$D/record.json" "$RESULT" "$D/task.txt" "$JKIND" > "$D/judge.txt"; judge_rc=$?
 fi
 PYTHONDONTWRITEBYTECODE=1 python3 -I -B - "$D" "$NAME" "$KIND" "$began" "$ended" "$input_sha" "$tar_sha" \
-  "${pickup_rc:-null}" "${judge_rc:-null}" "$harness_rc" "$summary" "$unit" >> "$LEDGER" <<'PY'
+  "${pickup_rc:-null}" "${judge_rc:-null}" "$harness_rc" "$summary" "$unit" "$RETRY" >> "$LEDGER" <<'PY'
 import hashlib, json, sys
 from pathlib import Path
-d, name, kind, began, ended, input_sha, tar_sha, pickup, judge, harness, summary, unit = sys.argv[1:13]
+d, name, kind, began, ended, input_sha, tar_sha, pickup, judge, harness, summary, unit, retry = sys.argv[1:14]
 manifest = {}
 try:
     manifest = json.loads((Path(d) / "result/manifest.json").read_text())
 except (OSError, ValueError):
     pass
 report = Path(d) / "result/report.md"
-print(json.dumps({
+# a retry's attempt, first call, previous call, stage, failure sha and failed items (retry_policy.py admit, #280)
+print(json.dumps(dict({
     "name": name, "kind": kind, "started": began, "ended": ended, "unit": unit or None,
     "input_sha256": input_sha, "prompt_sha256_recorded": manifest.get("prompt_sha256"),
     "result_tar_sha256": tar_sha or None,
@@ -289,7 +338,7 @@ print(json.dumps({
     "status": manifest.get("status"), "observed_models": manifest.get("observed_models"),
     "permission_mode": manifest.get("permission_mode"), "pickup_exit": None if pickup == "null" else int(pickup),
     "judge_exit": None if judge == "null" else int(judge), "harness_exit": int(harness),
-    "harness_summary": summary, "log_clean": True}))
+    "harness_summary": summary, "log_clean": True}, **(json.loads(retry) if retry else {}))))
 PY
 chmod -R go-rwx "$D" "$LEDGER" "$BOUND"
 tail -1 "$LEDGER"

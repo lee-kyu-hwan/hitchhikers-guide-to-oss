@@ -25,6 +25,7 @@ sys.path.insert(0, str(HERE))
 
 import test_reduce_inputs as reduce  # noqa: E402  (installs the offline guards first)
 import test_stage_inputs as base  # noqa: E402
+import retry_policy  # noqa: E402
 
 stage_inputs, stage, workflow, CAP = reduce.stage_inputs, reduce.stage, reduce.workflow, reduce.CAP
 
@@ -69,12 +70,15 @@ class ContinuePlanTests(reduce.ReducedCase):
         plan = summary["call_plan"]
         self.assertEqual({"extract_stage_sha256": sha256(self.extract_stage / "stage.json"), "completed": {"extract": 15}},
                          plan["continues"])
-        # verify at most synthesis_max_candidates 3 (7 calls under the earlier 5, #248)
-        self.assertEqual((0, 1, 1, 3, 1, 5), (plan["extract"], plan["synthesis"], plan["synthesis_groups"],
-                                              plan["verify"], plan["final"], plan["max_model_calls"]))
+        # verify at most synthesis_max_candidates 3 (7 calls under the earlier 5, #248), and the retry share of these
+        # 5 calls (#280): 1 + 3 + 1
+        self.assertEqual((0, 1, 1, 3, 1, 10), (plan["extract"], plan["synthesis"], plan["synthesis_groups"],
+                                               plan["verify"], plan["final"], plan["max_model_calls"]))
+        self.assertEqual(retry_policy.retry_share({"extract": 0, "synthesis": 1, "verify": 3, "final": 1}), plan["retry"])
         self.assertEqual([1], plan["synthesis_levels"])
         self.assertEqual(plan["shards"] * plan["lenses"], plan["continues"]["completed"]["extract"])
-        self.assertEqual(5, summary["max_model_calls"])
+        self.assertEqual(10, summary["max_model_calls"])
+        self.assertNotIn("pending", summary)
         self.assertEqual(summary, json.loads((self.root / "c" / "stage.json").read_text(encoding="utf-8")))
         self.assertEqual(sorted(self.context.extract_stems()), [answer["stem"] for answer in summary["answers"]])
 
@@ -96,7 +100,7 @@ class ContinuePlanTests(reduce.ReducedCase):
         levels = [7] + [level["calls"] for level in merges]
         self.assertGreater(len(levels), 2)
         self.assertEqual(1, levels[-1])
-        self.assertEqual((7, levels, sum(levels), sum(levels) + 2 + 1),
+        self.assertEqual((7, levels, sum(levels), sum(levels) + 2 + 1 + 5),
                          (plan["synthesis_groups"], plan["synthesis_levels"], plan["synthesis"], plan["max_model_calls"]))
         self.assertIn("7 group calls, then merge levels", plan["formula"])
         # a merge that cannot shrink at these limits is refused before the next model call
@@ -156,11 +160,60 @@ class ContinuePlanTests(reduce.ReducedCase):
                 self.assertIn("error: continue-plan:", stderr)
                 self.assertFalse((self.root / ("refused-%d" % number)).exists())
 
-    def test_the_answers_must_be_the_whole_extract_stage(self):
+    def test_a_part_of_the_extract_answers_plans_the_other_extract_calls_and_every_later_stage(self):
+        """#280: a run stopped during its extract calls (the split gate run: 10 of 15 adopted) is continued with the
+        adopted answers kept and the other extract prompts, bytes as the extract stage recorded them, still to call;
+        the later stages are the extract stage's worst-case plan, and the retry share is that of these calls."""
         paths = self.adopted()
-        _, stderr = self.continue_plan(paths[1:], out="short", code=2)
-        self.assertIn("extract result must be exactly", stderr)
-        self.assertFalse((self.root / "short").exists())
+        recorded = json.loads((self.extract_stage / "stage.json").read_text(encoding="utf-8"))
+        prompts = {call["input_dir"]: call["sha256"] for call in recorded["calls"]}
+        stems = [Path(path).name[: -len(".result.json")] for path in paths]
+        summary, _ = self.continue_plan(paths[:10])
+        plan, worst = summary["call_plan"], recorded["call_plan"]
+        self.assertEqual({"extract_stage_sha256": sha256(self.extract_stage / "stage.json"), "completed": {"extract": 10}},
+                         plan["continues"])
+        self.assertEqual((5, worst["synthesis"], worst["synthesis_levels"], 3, 1),
+                         (plan["extract"], plan["synthesis"], plan["synthesis_levels"], plan["verify"], plan["final"]))
+        calls = {stage: plan[stage] for stage in ("extract", "synthesis", "verify", "final")}
+        self.assertEqual(retry_policy.retry_share(calls), plan["retry"])
+        self.assertEqual(sum(calls.values()) + plan["retry"]["total"], plan["max_model_calls"])
+        self.assertEqual(sorted(stems[:10]), [answer["stem"] for answer in summary["answers"]])
+        self.assertEqual([{"stem": stem, "result_name": stem + ".result.json", "prompt_sha256": prompts[stem]}
+                          for stem in sorted(stems[10:])], summary["pending"])
+        self.assertIn("5 of 15 extract calls left", plan["formula"])
+        self.assertEqual(summary, json.loads((self.root / "c" / "stage.json").read_text(encoding="utf-8")))
+
+    def test_answers_that_are_not_a_part_of_the_extract_stage_are_refused(self):
+        paths = self.adopted()
+        other = self.root / "extract-blind-09.result.json"
+        other.write_text(Path(paths[0]).read_text(encoding="utf-8"), encoding="utf-8")
+        for label, given in {"a duplicate": paths[:3] + paths[:1], "another stem": paths[:3] + [str(other)]}.items():
+            with self.subTest(label):
+                _, stderr = self.continue_plan(given, out="refused", code=2)
+                self.assertIn("extract result", stderr)
+                self.assertFalse((self.root / "refused").exists())
+
+    def test_an_answer_adopted_by_a_retry_is_bound_through_the_retry_call(self):
+        """#280: a call retried by call_with_retry.py leaves the failed attempt under its name and the adopted one
+        under <name>-r2; the answer is bound by the attempt whose strict verdict adopted it."""
+        paths = self.adopted()
+        stem = Path(paths[0]).name[: -len(".result.json")]
+        prompt = json.loads((self.records / stem / "result/manifest.json").read_text())["prompt_sha256"]
+        shutil.move(str(self.records / stem), str(self.records / (stem + "-r2")))
+        (self.records / stem / "result").mkdir(parents=True)
+        (self.records / stem / "result/manifest.json").write_text(json.dumps(
+            {"status": "succeeded", "prompt_sha256": prompt, "report_sha256": "0" * 64}))
+        (self.records / stem / "verdict.json").write_text(json.dumps({
+            "ok": False, "result_class": "invalid", "answer_kind": "extract", "limits": "strict", "adopted_to": None,
+            "items": [{"id": "P3-prompt-sha256", "status": "INFO", "detail": prompt},
+                      {"id": "P4-prompt-binding", "status": "PASS"}, {"id": "Q1-quotes-verbatim", "status": "FAIL"}]}))
+        summary, _ = self.continue_plan(paths)
+        calls = {answer["stem"]: answer.get("call") for answer in summary["answers"]}
+        self.assertEqual(stem + "-r2", calls.pop(stem))
+        self.assertEqual({None}, set(calls.values()))
+        shutil.rmtree(self.records / (stem + "-r2"))
+        _, stderr = self.continue_plan(paths, out="c2", code=2)
+        self.assertIn("is not bound to its recorded prompt", stderr)
 
 
 class ContinueChainTests(reduce.ReducedCase):
@@ -227,17 +280,18 @@ class ContinueChainTests(reduce.ReducedCase):
         self.assertEqual({"extract_stage_sha256": sha256(self.continue_stage / "stage.json"),
                           "completed": {"extract": 15, "synthesis": 1, "verify": 1}, "parent_stage": "continue"},
                          plan["continues"])
-        self.assertEqual((0, 0, 0, 1, 1), (plan["extract"], plan["synthesis"], plan["verify"], plan["final"],
+        self.assertEqual((0, 0, 0, 1, 2), (plan["extract"], plan["synthesis"], plan["verify"], plan["final"],
                                            plan["max_model_calls"]))
-        self.assertEqual(plan["max_model_calls"], plan["extract"] + plan["synthesis"] + plan["verify"] + plan["final"])
-        self.assertEqual(1, summary["max_model_calls"])
+        self.assertEqual(plan["max_model_calls"], plan["extract"] + plan["synthesis"] + plan["verify"] + plan["final"]
+                         + plan["retry"]["total"])
+        self.assertEqual(2, summary["max_model_calls"])         # the final and its retry share (#280)
         self.assertEqual([("synthesis", "synthesis", "synthesis.result.json"), ("verify", "verify-c1", "verify-C1.result.json")],
                          [(a["kind"], a["call"], a["result_name"]) for a in summary["reduce_answers"]])
         self.assertEqual(summary, json.loads((self.root / "d" / "stage.json").read_text(encoding="utf-8")))
 
     def test_a_candidate_without_its_verify_answer_keeps_its_verify_call(self):
         plan = self.chain()[0]["call_plan"]
-        self.assertEqual((0, 1, 1, 2), (plan["synthesis"], plan["verify"], plan["final"], plan["max_model_calls"]))
+        self.assertEqual((0, 1, 1, 4), (plan["synthesis"], plan["verify"], plan["final"], plan["max_model_calls"]))
         self.assertEqual({"extract": 15, "synthesis": 1, "verify": 0}, plan["continues"]["completed"])
 
     def test_a_reduce_answer_not_bound_to_the_parent_ledger_is_refused(self):
@@ -278,6 +332,17 @@ class ContinueChainTests(reduce.ReducedCase):
                 finally:
                     for path, data in saved.items():
                         path.write_bytes(data)
+        with self.subTest("a continue stage with extract calls left"):
+            partial = self.root / "partial"
+            shutil.copytree(self.continue_stage, partial)
+            document = json.loads((partial / "stage.json").read_text(encoding="utf-8"))
+            document["pending"] = [{"stem": "extract-blind-01"}]
+            (partial / "stage.json").write_text(json.dumps(document), encoding="utf-8")
+            args = [item for path in self.paths for item in ("--extract-result", path)]
+            _, stderr = self.stage("continue-plan", "--run-dir", self.run, "--extract-stage", str(partial), *args,
+                                   "--synthesis-result", self.synthesis, "--records", str(self.ledger),
+                                   "--out", str(self.root / "from-partial"), code=2)
+            self.assertIn("extract calls left", stderr)
         with self.subTest("no synthesis answer"):
             _, stderr = self.chain(out="no-synthesis", code=2, synthesis=False)
             self.assertIn("synthesis answer", stderr)
@@ -287,6 +352,90 @@ class ContinueChainTests(reduce.ReducedCase):
                                    *args, "--synthesis-result", self.synthesis, "--records", str(self.records),
                                    "--out", str(self.root / "x-reduce"), code=2)
             self.assertIn("continue stage", stderr)
+
+
+class ContinueChainRetryTests(ContinueChainTests):
+    """#280: a reduce answer adopted by a retry (<call>-r2) is bound by that attempt's record and ledger line."""
+
+    def setUp(self):
+        super().setUp()
+        lines = (self.ledger / "ledger.jsonl").read_text().splitlines()
+        shutil.move(str(self.ledger / "synthesis"), str(self.ledger / "synthesis-r2"))
+        retried = dict(json.loads(lines[0]), name="synthesis-r2", attempt=2, retry_of="synthesis")
+        failed = {"name": "synthesis", "kind": "token", "input_sha256": "5" * 64, "prompt_sha256_recorded": "5" * 64,
+                  "report_sha256": "0" * 64, "status": "succeeded"}
+        (self.ledger / "synthesis" / "result").mkdir(parents=True)
+        (self.ledger / "synthesis/result/manifest.json").write_text(json.dumps(
+            {"status": "succeeded", "prompt_sha256": "5" * 64, "report_sha256": "0" * 64}))
+        (self.ledger / "synthesis/verdict.json").write_text(json.dumps({
+            "ok": False, "result_class": "invalid", "answer_kind": "synthesis", "limits": "strict", "adopted_to": None,
+            "items": [{"id": "P3-prompt-sha256", "status": "INFO", "detail": "5" * 64},
+                      {"id": "P4-prompt-binding", "status": "PASS"}, {"id": "R3-report-schema", "status": "FAIL"}]}))
+        (self.ledger / "ledger.jsonl").write_text("".join(json.dumps(line) + "\n" for line in
+                                                          (failed, retried, json.loads(lines[1]))))
+
+    def test_with_the_synthesis_and_every_verify_answer_adopted_only_the_final_remains(self):
+        summary, _ = self.chain("--verify-result", self.verify)
+        self.assertEqual(["synthesis-r2", "verify-c1"], [answer["call"] for answer in summary["reduce_answers"]])
+        self.assertEqual(2, summary["max_model_calls"])
+
+    test_a_candidate_without_its_verify_answer_keeps_its_verify_call = None
+    test_a_reduce_answer_not_bound_to_the_parent_ledger_is_refused = None
+
+
+class ContinuePartialChainTests(reduce.ReducedCase):
+    """#280: a continuation of a run stopped during its extract calls (a continue stage with ``pending`` extract
+    calls) is itself continued: the extract answers it adopted are compared by sha as before, the extract calls it
+    left must be bound to the parent ledger (the continuation that made them) under the prompts it recorded, and the
+    new continue stage lists all of them."""
+
+    adopted = ContinuePlanTests.adopted
+    record = ContinueChainTests.record
+
+    def setUp(self):
+        super().setUp()
+        self.extract_stage = self.root / "x"
+        self.stage("extract-inputs", "--run-dir", self.run, "--out", str(self.extract_stage))
+        self.records = self.root / "calls"
+        self.paths = self.adopted()
+        args = [item for path in self.paths[:10] for item in ("--extract-result", path)]
+        self.partial, _ = self.stage("continue-plan", "--run-dir", self.run, "--extract-stage", str(self.extract_stage),
+                                     *args, "--records", str(self.records), "--out", str(self.root / "c"))
+        self.ledger = self.root / "gen2"
+        self.ledger.mkdir()
+        (self.ledger / "ledger-limit.json").write_text(json.dumps({
+            "limit": self.partial["max_model_calls"], "call_plan_sha256": sha256(self.root / "c" / "stage.json"),
+            "parent": {"ledger_sha256": "a" * 64, "calls": 10}}) + "\n")
+        for item in self.partial["pending"]:                     # the extract calls gen2 made
+            shutil.copytree(self.records / item["stem"], self.ledger / item["stem"])
+        keys = list(self.context.keymap["sections"])[:2]
+        self.synthesis = self.synthesis_answer(keys)
+        self.record("synthesis", "synthesis", self.synthesis, "5" * 64)
+
+    def chain(self, paths, out="d", code=0):
+        args = [item for path in paths for item in ("--extract-result", path)]
+        return self.stage("continue-plan", "--run-dir", self.run, "--extract-stage", str(self.root / "c"), *args,
+                          "--synthesis-result", self.synthesis, "--records", str(self.ledger),
+                          "--out", str(self.root / out), code=code)
+
+    def test_the_extract_calls_left_are_bound_to_the_parent_ledger(self):
+        summary, _ = self.chain(self.paths)
+        plan = summary["call_plan"]
+        self.assertEqual({"extract": 15, "synthesis": self.partial["call_plan"]["synthesis"], "verify": 0},
+                         plan["continues"]["completed"])
+        self.assertEqual(sorted(self.context.extract_stems()), [answer["stem"] for answer in summary["answers"]])
+        pending = {item["stem"]: item["prompt_sha256"] for item in self.partial["pending"]}
+        self.assertEqual(pending, {answer["stem"]: answer["prompt_sha256"] for answer in summary["answers"]
+                                   if answer["stem"] in pending})
+        self.assertNotIn("pending", summary)
+
+    def test_an_extract_call_left_and_not_bound_to_the_parent_ledger_is_refused(self):
+        stem = self.partial["pending"][0]["stem"]
+        shutil.rmtree(self.ledger / stem)
+        _, stderr = self.chain(self.paths, out="unbound", code=2)
+        self.assertIn(stem, stderr)
+        _, stderr = self.chain(self.paths[:-1], out="short", code=2)
+        self.assertIn("extract result", stderr)
 
 
 class ContinueStraightChainTests(ContinueChainTests):
@@ -325,7 +474,7 @@ class ContinueStraightChainTests(ContinueChainTests):
         self.assertEqual({"extract_stage_sha256": sha256(self.root / "d" / "stage.json"),
                           "completed": {"extract": 15, "synthesis": 1, "verify": 1}, "parent_stage": "continue"},
                          plan["continues"])
-        self.assertEqual((0, 0, 0, 1, 1), (plan["extract"], plan["synthesis"], plan["verify"], plan["final"],
+        self.assertEqual((0, 0, 0, 1, 2), (plan["extract"], plan["synthesis"], plan["verify"], plan["final"],
                                            plan["max_model_calls"]))
         recorded = json.loads((self.root / "d" / "stage.json").read_text(encoding="utf-8"))["reduce_answers"]
         self.assertEqual([dict(answer, ancestor=1) for answer in recorded], summary["reduce_answers"])
@@ -340,7 +489,7 @@ class ContinueStraightChainTests(ContinueChainTests):
         summary, _ = self.chain("--verify-result", verify, stage="d2", records=gen3)
         self.assertEqual([("synthesis", 1), ("verify-c1", None)],
                          [(answer["call"], answer.get("ancestor")) for answer in summary["reduce_answers"]])
-        self.assertEqual((0, 1), (summary["call_plan"]["verify"], summary["max_model_calls"]))
+        self.assertEqual((0, 2), (summary["call_plan"]["verify"], summary["max_model_calls"]))
 
     def test_an_answer_of_the_chain_not_bound_through_the_recorded_links_is_refused(self):
         gen2_ledger, gen2_limit = self.ledger / "ledger.jsonl", self.ledger / "ledger-limit.json"
@@ -516,8 +665,8 @@ class RunR3ChainTests(RunR2Case):
         self.assertEqual(bound, plan["continues"]["extract_stage_sha256"])
         self.assertEqual({"extract": 20, "synthesis": 8, "verify": 5}, plan["continues"]["completed"])
         self.assertEqual("continue", plan["continues"]["parent_stage"])
-        self.assertEqual((0, 0, 0, 1, 1), (plan["extract"], plan["synthesis"], plan["verify"], plan["final"],
-                                           plan["max_model_calls"]))
+        self.assertEqual((0, 0, 0, 1, 2), (plan["extract"], plan["synthesis"], plan["verify"], plan["final"],
+                                           plan["max_model_calls"]))      # the final and its retry share (#280)
 
 
 @unittest.skipUnless((EVIDENCE_R3 / "in-continue/stage.json").is_file() and (EVIDENCE_R3 / "answers/verify-C5.result.json").is_file()
@@ -592,12 +741,88 @@ class RunR6ChainTests(RunR2Case):
         self.assertEqual(bound, plan["continues"]["extract_stage_sha256"])
         self.assertEqual({"extract": 20, "synthesis": 8, "verify": 5}, plan["continues"]["completed"])
         self.assertEqual("continue", plan["continues"]["parent_stage"])
-        self.assertEqual((0, 0, 0, 1, 1), (plan["extract"], plan["synthesis"], plan["verify"], plan["final"],
-                                           plan["max_model_calls"]))
+        self.assertEqual((0, 0, 0, 1, 2), (plan["extract"], plan["synthesis"], plan["verify"], plan["final"],
+                                           plan["max_model_calls"]))      # the final and its retry share (#280)
         recorded = json.loads((EVIDENCE_R6 / "in-continue/stage.json").read_text(encoding="utf-8"))["reduce_answers"]
         self.assertEqual([dict(answer, ancestor=1) for answer in recorded], summary["reduce_answers"])
         self.assertEqual({path: path.read_bytes() for path in kept}, kept)
         self.assertFalse((EVIDENCE_R6 / "continued-by.json").exists() or (EVIDENCE_R3 / "continued-by.json").exists())
+
+
+
+SPLIT_GATE = Path("/Users/lee-kyu-hwan/.oss-research-vm/logs/a78-split-gate-20261006T055754Z")
+# The ten extract answers the split gate run adopted (docs/research/2026-10-06-split-gate-run/README.md).
+SPLIT_GATE_ANSWERS = {
+    "extract-blind-01": "a10f20ff3842031dbdf1cb121cd4ed73c37688020ba66f6907ec546e70055a38",
+    "extract-blind-02": "db8cc1e3c4d3784ed79ff1595ca83ec15447cadc57ba036ef2cb88196854fc75",
+    "extract-correctness-01": "92f86f3456d30c147bb5a28f1d1b2c8050fdc95b6c19fba8563c5ad8772fd3a0",
+    "extract-correctness-02": "d0b2838215e346af622e3fbc3b0540d91c2f99c79949d8db44c38a88811c36b0",
+    "extract-maintenance-01": "b9a88a50ee7120cfb725911b894b75a868b212a3c0f04b1f8bcb92d92794d5c0",
+    "extract-maintenance-02": "6df595daa889a0755e2557e0bc843a0aecdbbfa077e7765e6b96073d08c5261f",
+    "extract-review-01": "7e630d7d25d953b705421737fa9f4d0a26c1fefb33a75b0cd4d186118f343dc0",
+    "extract-review-02": "1edd2eeea6c93f9e3b3fef227a83da0e3dd0b49eff07550687b6326924b6f09f",
+    "extract-structure-01": "5bab9981e10f8679603723acb6ee47b305a65cf80e1e25ffdc5c91379262575b",
+    "extract-structure-02": "55fa0546b1676358223598a528427ae2af088bff37e1e3121bab8557e262e988",
+}
+
+
+@unittest.skipUnless((SPLIT_GATE / "in-extract/stage.json").is_file() and (SPLIT_GATE / "ledger/ledger.jsonl").is_file(),
+                     "the 2026-10-06 split gate run is only on the machine that made it")
+class SplitGateContinuationTests(unittest.TestCase):
+    """#280: the split gate run (typescript-eslint, 21 PRs) stopped after 12 calls with 10 of 15 extract answers
+    adopted, one of them by a retry (extract-structure-01-r2). Its run is rebuilt from the same collections in a
+    temporary directory; the evidence is only read. continue-plan takes the ten answers byte for byte and plans the
+    five other extract prompts (as the extract stage recorded them, without the #280 target sentence) and every
+    later stage with its retry share: 17 + 5 = 22 calls, which with the parent ledger's 12 stay within 40."""
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
+        state = json.loads((SPLIT_GATE / "wf-run/state.json").read_text(encoding="utf-8"))
+        inputs = state["stages"]["collect"]["generations"][0]["inputs"]
+        adopt = []
+        for name in sorted(key for key in inputs if key.startswith("corpus-")):
+            unpacked = Path(inputs[name]["source_path"]).parent
+            adopt += ["--corpus", str(unpacked / "corpus.json"), "--manifest", str(unpacked / "collection-manifest.json"),
+                      "--inventory", str(unpacked / "inventory.md")]
+        self.run = str(self.root / "run")
+        for argv in (("init", "--request", str(SPLIT_GATE / "request.json")), ("adopt-collection", *adopt),
+                     ("digest", "--max-bytes", "54000")):
+            code, _, stderr = workflow(argv[0], "--run-dir", self.run, *argv[1:])
+            self.assertEqual(code, 0, stderr)
+
+    def test_the_ten_adopted_answers_continue_into_the_remaining_calls_with_their_retry_share(self):
+        kept = {path: path.read_bytes() for path in (SPLIT_GATE / "ledger").glob("ledger*")}
+        answers = sorted(SPLIT_GATE / "answers" / (stem + ".result.json") for stem in SPLIT_GATE_ANSWERS)
+        self.assertEqual(SPLIT_GATE_ANSWERS, {path.name[: -len(".result.json")]: sha256(path) for path in answers})
+        args = [item for path in answers for item in ("--extract-result", str(path))]
+        code, summary, stderr = stage("continue-plan", "--run-dir", self.run, "--extract-stage",
+                                      str(SPLIT_GATE / "in-extract"), *args, "--records", str(SPLIT_GATE / "ledger"),
+                                      "--out", str(self.root / "continue"))
+        self.assertEqual(0, code, stderr)
+        plan = summary["call_plan"]
+        self.assertEqual({"extract_stage_sha256": "c24749fcf0cfaad606f2400213db2885072c065c13ca21a07542fb3addf2bdbc",
+                          "completed": {"extract": 10}}, plan["continues"])
+        self.assertEqual((5, 8, [5, 2, 1], 3, 1), (plan["extract"], plan["synthesis"], plan["synthesis_levels"],
+                                                   plan["verify"], plan["final"]))
+        self.assertEqual({"per_call": 1, "per_stage": 3, "stages": {"extract": 3, "synthesis": 3, "verify": 3, "final": 1},
+                          "total": 5}, plan["retry"])
+        self.assertEqual(22, plan["max_model_calls"])
+        parent = [json.loads(line) for line in (SPLIT_GATE / "ledger/ledger.jsonl").read_text().splitlines()]
+        self.assertEqual(12, len(parent))
+        self.assertLessEqual(len(parent) + plan["max_model_calls"], stage_inputs.ABSOLUTE_MAX_CALLS)     # 34
+        recorded = json.loads((SPLIT_GATE / "in-extract/stage.json").read_text(encoding="utf-8"))
+        prompts = {call["input_dir"]: call["sha256"] for call in recorded["calls"]}
+        self.assertEqual([{"stem": stem, "result_name": stem + ".result.json", "prompt_sha256": prompts[stem]}
+                          for stem in ("extract-blind-03", "extract-correctness-03", "extract-maintenance-03",
+                                       "extract-review-03", "extract-structure-03")], summary["pending"])
+        for item in summary["pending"]:
+            self.assertEqual(item["prompt_sha256"], sha256(SPLIT_GATE / "in-extract" / item["stem"] / "task.txt"))
+        self.assertEqual({stem: (sha, "extract-structure-01-r2" if stem == "extract-structure-01" else None)
+                          for stem, sha in SPLIT_GATE_ANSWERS.items()},
+                         {answer["stem"]: (answer["answer_sha256"], answer.get("call")) for answer in summary["answers"]})
+        self.assertEqual({path: path.read_bytes() for path in kept}, kept)
+        self.assertFalse((SPLIT_GATE / "ledger/continued-by.json").exists())
 
 
 if __name__ == "__main__":

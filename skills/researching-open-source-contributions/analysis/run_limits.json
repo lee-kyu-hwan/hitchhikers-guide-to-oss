@@ -18,9 +18,15 @@
   "synthesis_max_candidates": 3,
   "candidate_max_bytes": 1024,
   "extract_answer_max_bytes": 7680,
+  "extract_answer_target_bytes": 6500,
   "candidate_statement_max_chars": 600,
   "verify_answer_max_bytes": 5120,
   "final_dynamic_reserve_bytes": 8192,
+  "model_retry": {
+    "per_call": 1,
+    "per_stage": 3,
+    "total": 5
+  },
   "worker": {
     "profile": "claude-profile2",
     "model": "claude-opus-5-5",

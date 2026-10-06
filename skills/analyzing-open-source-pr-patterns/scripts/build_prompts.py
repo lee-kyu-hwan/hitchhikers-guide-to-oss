@@ -4,7 +4,8 @@
   extract  one prompt per digest shard and lens: OUT/prompts/extract-<lens>[-NN].md
            (--max-patterns/--max-observations/--max-rejected, all three or none, state
            the answer's count limits in the rules, and --max-answer-bytes with them its
-           size limit; without them the bytes are as before)
+           size limit, and --answer-target-bytes below it the size to aim for; without
+           them the bytes are as before)
   verify   one prompt per merged candidate: OUT/prompts/verify-<id>.md
 
 A prompt file is the whole input of one call, so any executor can run it: agy
@@ -102,6 +103,12 @@ SIZE_RULE = (
     "- 답 크기 상한: 답 JSON 을 들여쓰기 1칸으로 다시 쓴 크기(UTF-8, 한글 한 글자는 3바이트)가 {answer_bytes} 바이트 "
     "이하여야 한다. 넘으면 답 전체가 거부된다. 넘칠 것 같으면 note·claim·description 을 짧게 쓰고 근거가 약한 "
     "항목부터 버려라. 인용(quote)은 원문 그대로 두고 자르지 마라.\n"
+)
+# The rule after the size rule when the caller also passes a target under that limit: the limit is measured on the
+# answer rewritten as indent-1 JSON, which a model cannot measure on the bytes it writes, so the prompt asks for less.
+TARGET_RULE = (
+    "- 답 크기 목표: 상한에 여유를 두고 들여쓰기 1칸으로 다시 쓴 크기 {target_bytes} 바이트 이하로 써라. "
+    "공백 없이 출력해도 들여쓰기 1칸으로 다시 써서 재므로, 출력한 바이트보다 15% 안팎 커진다.\n"
 )
 
 VERIFY_TAIL = """너는 반박 검증자다. 아래 후보 패턴 하나가 다이제스트로 뒷받침되는지 따진다. 후보를 만든 사람의 편을 들지 마라. 근거가 약하면 약하다고 말하는 것이 네 일이다.
@@ -201,12 +208,15 @@ def _write(prompts_dir, name, text):
 
 def extract_tail(limits=None):
     """EXTRACT_TAIL, with the count rule after the last criterion when limits {patterns, observations, rejected},
-    and the size rule after it when limits also holds answer_bytes."""
+    and the size rule after it when limits also holds answer_bytes, and the target rule after that when it holds
+    target_bytes (#280)."""
     if limits is None:
         return EXTRACT_TAIL
     rules = COUNT_RULE.format(**limits)
     if limits.get("answer_bytes") is not None:
         rules += SIZE_RULE.format(**limits)
+    if limits.get("target_bytes") is not None:
+        rules += TARGET_RULE.format(**limits)
     return EXTRACT_TAIL.replace(COUNT_RULE_ANCHOR, COUNT_RULE_ANCHOR + rules, 1)
 
 
@@ -342,6 +352,9 @@ def main(argv=None):
     extract_parser.add_argument(
         "--max-answer-bytes", type=_positive, help="size limit of the answer (indent-1 JSON, UTF-8); needs the count limits"
     )
+    extract_parser.add_argument(
+        "--answer-target-bytes", type=_positive, help="size to aim for, under --max-answer-bytes (the same measure)"
+    )
     verify_parser = commands.add_parser("verify", help="one adversarial prompt per candidate")
     verify_parser.add_argument("--digest-dir", required=True, help="build_digest.py --out directory")
     verify_parser.add_argument("--candidates", required=True, help='JSON array of {"id", "statement", "cited_prs"}')
@@ -355,6 +368,10 @@ def main(argv=None):
         if args.max_answer_bytes is not None and not all(given):
             extract_parser.error("--max-answer-bytes needs --max-patterns, --max-observations and --max-rejected")
         limits["answer_bytes"] = args.max_answer_bytes
+        if args.answer_target_bytes is not None and (args.max_answer_bytes is None
+                                                     or args.answer_target_bytes >= args.max_answer_bytes):
+            extract_parser.error("--answer-target-bytes needs --max-answer-bytes and must be below it")
+        limits["target_bytes"] = args.answer_target_bytes
     try:
         if args.command == "extract":
             written = extract(args.digest_dir, args.out, args.lens or list(LENSES), limits if all(given) else None)

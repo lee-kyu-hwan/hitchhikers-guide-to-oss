@@ -11,7 +11,8 @@ call, and assembles the final analysis envelope deterministically:
   continue-plan    RUN + adopted extract results + their extract stage → OUT/stage.json
                    (or + a continue stage and the adopted synthesis/verify answers of its ledger, or of the
                    ancestor ledgers of a straight chain: the rest)
-                   (no prompt: the call plan of the stages not yet run, #82)
+                   (no prompt: the call plan of the stages not yet run, #82; with a part of the extract
+                   results, the extract calls left too, #280)
   synthesis-input  RUN + extract results → OUT/task.txt        (1 call: candidates, or a call per group)
   synthesis-merge-input  RUN + a synthesis (or merge) stage + its group answers → OUT/<call>/task.txt
                    (1 last merge call, or the merge calls of another level, #248)
@@ -41,6 +42,9 @@ prompt states the limits its answer is checked against (render_limits, build_pro
 The model calls of one run are therefore at most
 ``shards x lenses + synthesis calls + synthesis_max_candidates (verify) + 1 (final)``: 10
 for a digest that fits one shard and whose final prompt can carry it (5 + 1 + 3 + 1).
+Every call plan also holds the retry share of those calls (#280, retry_policy.py: run_limits.json
+model_retry; 5 here), counted in max_model_calls, the ledger limit, and against ABSOLUTE_MAX_CALLS:
+only a call whose answer broke a model output rule is retried, with the same prompt bytes.
 The digest is sharded by ``oss_workflow.py digest --max-bytes`` so that each lens
 prompt stays under the worker's input limit; every lens runs on every shard, and a
 prompt over PROMPT_MAX_BYTES is refused before anything is written, never cut.
@@ -102,6 +106,8 @@ REPO = HERE.parents[3]
 WORKFLOW = REPO / "dot_agents/skills/researching-open-source-contributions/scripts/oss_workflow.py"
 PROMPTS = HERE / "prompts"
 LIMITS = json.loads((HERE / "run_limits.json").read_text(encoding="utf-8"))
+sys.path.insert(0, str(HERE))
+import retry_policy  # noqa: E402  (the retry share of a call plan, #280)
 # Stage output limits (#248): each is stated in the prompt of the stage that answers and checked, with the same
 # value, by verify_e2e_result.py and here; the worst-case plan (dry-plan) sizes the next stage's input from them.
 MAX_CANDIDATES = LIMITS["synthesis_max_candidates"]     # candidates of one synthesis, group or merge answer
@@ -109,6 +115,9 @@ MAX_FINAL_PATTERNS = LIMITS["max_patterns"]
 MAX_DROPPED = LIMITS["max_rejected"]
 CANDIDATE_MAX_BYTES = LIMITS["candidate_max_bytes"]     # one candidate as a prompt block holds it (answer_bytes)
 EXTRACT_ANSWER_MAX_BYTES = LIMITS["extract_answer_max_bytes"]   # one extract answer, the same measure
+# What the extract prompt asks for, under that limit (#280): the check stays extract_answer_max_bytes, measured on the
+# answer rewritten as indent-1 JSON, which a model cannot measure on the bytes it writes; the target leaves it a margin.
+EXTRACT_ANSWER_TARGET_BYTES = LIMITS["extract_answer_target_bytes"]
 EXTRACT_CAPS = {"patterns": LIMITS["max_patterns"], "observations": LIMITS["max_observations"],
                 "rejected": LIMITS["max_rejected"]}
 EXTRACT_CALLS = 5
@@ -119,12 +128,14 @@ CANDIDATE_ID = re.compile(r"C[1-9][0-9]?")
 
 def model_call_plan(shards: int, lenses: int, max_candidates: int) -> dict:
     """The model calls of a digest-in-final run: every lens reads the one shard, then one synthesis, at most one
-    verify per candidate, and one final. (An extraction-only run takes its plan from worst_case_plan.)"""
-    total = shards * lenses + 1 + max_candidates + 1
-    return {"shards": shards, "lenses": lenses, "extract": shards * lenses, "synthesis": 1, "verify": max_candidates,
-            "final": 1, "max_model_calls": total,
-            "formula": "%d shards x %d lenses + 1 (synthesis) + %d (verify, at most max_candidates) + 1 (final) = %d"
-                       % (shards, lenses, max_candidates, total)}
+    verify per candidate, and one final, and the retry share of those calls (#280). (An extraction-only run takes its
+    plan from worst_case_plan.)"""
+    calls = {"extract": shards * lenses, "synthesis": 1, "verify": max_candidates, "final": 1}
+    share = retry_policy.retry_share(calls)
+    total = sum(calls.values()) + share["total"]
+    return {"shards": shards, "lenses": lenses, **calls, "retry": share, "max_model_calls": total,
+            "formula": "%d shards x %d lenses + 1 (synthesis) + %d (verify, at most max_candidates) + 1 (final) + %d "
+                       "(retry share) = %d" % (shards, lenses, max_candidates, share["total"], total)}
 
 
 MAX_MODEL_CALLS = model_call_plan(1, EXTRACT_CALLS, MAX_CANDIDATES)["max_model_calls"]
@@ -177,6 +188,29 @@ def load_workflow():
     sys.modules["oss_workflow"] = module
     spec.loader.exec_module(module)
     return module
+
+
+IN_FORCE = object()
+
+
+def answer_target(target=IN_FORCE) -> int | None:
+    """The extract answer size target a prompt states (#280): the one in force, or one an extract stage recorded. A
+    target says nothing without a size limit or at or over it (an earlier or smaller limit), so it is then left out."""
+    target = EXTRACT_ANSWER_TARGET_BYTES if target is IN_FORCE else target
+    if target is None or EXTRACT_ANSWER_MAX_BYTES is None or target >= EXTRACT_ANSWER_MAX_BYTES:
+        return None
+    return target
+
+
+def extract_limit_args(target=IN_FORCE) -> list[str]:
+    """The analyzer's extract options for the limits in force: the count limits, the answer size limit (#248) and
+    its target (#280, answer_target)."""
+    limits = [item for kind, cap in EXTRACT_CAPS.items() for item in ("--max-" + kind, str(cap))]
+    if EXTRACT_ANSWER_MAX_BYTES is not None:
+        limits += ["--max-answer-bytes", str(EXTRACT_ANSWER_MAX_BYTES)]
+    if answer_target(target) is not None:
+        limits += ["--answer-target-bytes", str(answer_target(target))]
+    return limits
 
 
 class Context:
@@ -289,18 +323,16 @@ class Context:
                              % (", ".join(lenses), self.shards))
         return stems
 
-    def extract_prompt_texts(self) -> dict[str, str]:
+    def extract_prompt_texts(self, target=IN_FORCE) -> dict[str, str]:
         """The extract prompts of this digest, written again by the analyzer with the count limits the answers are
         checked against (EXTRACT_CAPS, from run_limits.json) and the answer size limit (extract_answer_max_bytes,
-        #248), so the prompt and the checks say the same numbers.
+        #248), so the prompt and the checks say the same numbers, and the answer size target under it (#280):
+        ``target`` as an extract stage recorded it (None: a stage from before the target), else the one in force.
         The digest's own prompts were written without them; only their names are taken from there."""
         stems = self.extract_stems()
         with tempfile.TemporaryDirectory(prefix="stage-extract-") as tmp:
-            limits = [item for kind, cap in EXTRACT_CAPS.items() for item in ("--max-" + kind, str(cap))]
-            if EXTRACT_ANSWER_MAX_BYTES is not None:
-                limits += ["--max-answer-bytes", str(EXTRACT_ANSWER_MAX_BYTES)]
             code, _, stderr = self.wf.run_main(self.siblings.build_prompts.main, [
-                "extract", "--digest-dir", str(self.digest_dir), "--out", tmp, *limits])
+                "extract", "--digest-dir", str(self.digest_dir), "--out", tmp, *extract_limit_args(target)])
             if code != 0:
                 raise StageError("build_prompts extract failed: " + stderr.strip())
             built = sorted(path.stem for path in (Path(tmp) / "prompts").glob("*.md"))
@@ -844,21 +876,27 @@ def worst_case_plan(inputs: PlanInputs) -> dict:
                                                             "not bounded (digest-in-final carries every quote)",
                                                             PROMPT_MAX_BYTES))
     extract = len(inputs.stems)
-    total = extract + synthesis + MAX_CANDIDATES + 1
+    planned = extract + synthesis + MAX_CANDIDATES + 1
+    # the retry share of these calls counts against the cap too (#280): a plan that fits only without it is refused
+    share = retry_policy.retry_share({"extract": extract, "synthesis": synthesis, "verify": MAX_CANDIDATES, "final": 1})
+    total = planned + share["total"]
     if total > ABSOLUTE_MAX_CALLS:
-        refusals.append("calls: %d model calls at the limits, over the absolute cap %d" % (total, ABSOLUTE_MAX_CALLS))
+        refusals.append("calls: %d model calls at the limits (%d planned + %d retry share), over the absolute cap %d"
+                        % (total, planned, share["total"], ABSOLUTE_MAX_CALLS))
     counts = [level["calls"] or 0 for level in levels]
     plan = {"mode": inputs.mode, "shards": inputs.shards, "lenses": lenses, "extract": extract, "synthesis": synthesis,
-            "synthesis_levels": counts, "verify": MAX_CANDIDATES, "final": 1, "max_model_calls": total,
+            "synthesis_levels": counts, "verify": MAX_CANDIDATES, "final": 1, "retry": share, "max_model_calls": total,
             "formula": "%d shards x %d lenses + %d (synthesis levels %s) + %d (verify, at most "
-                       "synthesis_max_candidates) + 1 (final) = %d, every answer at the stage output limits"
-                       % (inputs.shards, lenses, synthesis, " + ".join(map(str, counts)), MAX_CANDIDATES, total),
+                       "synthesis_max_candidates) + 1 (final) + %d (retry share: per call %d, per stage %d) = %d, "
+                       "every answer at the stage output limits"
+                       % (inputs.shards, lenses, synthesis, " + ".join(map(str, counts)), MAX_CANDIDATES,
+                          share["total"], share["per_call"], share["per_stage"], total),
             "inputs": {"max_candidates": MAX_CANDIDATES, "shards": inputs.shards, "lenses": lenses,
                        "limits": output_limits()}}
     return {"ok": not refusals, "mode": inputs.mode, "cap": PROMPT_MAX_BYTES, "max_calls": ABSOLUTE_MAX_CALLS,
             "records": len(inputs.rows), "repositories": inputs.repositories, "stages": stages,
-            "levels": len(levels), "synthesis_levels": counts, "total_calls": total, "call_plan": plan,
-            "refusals": refusals}
+            "levels": len(levels), "synthesis_levels": counts, "total_calls": total, "planned_calls": planned,
+            "retry_calls": share["total"], "call_plan": plan, "refusals": refusals}
 
 
 def quote_bounds(context: Context) -> dict:
@@ -952,11 +990,8 @@ def part_inputs(context: Context, repositories: list[str]) -> PlanInputs:
                 keymap["sections"][key] = dict(context.keymap["sections"][key], shard=name)
         keymap["sections"] = {key: keymap["sections"][key] for key in keys}
         (directory / "keymap.json").write_text(json.dumps(keymap), encoding="utf-8")
-        limits = [item for kind, cap in EXTRACT_CAPS.items() for item in ("--max-" + kind, str(cap))]
-        if EXTRACT_ANSWER_MAX_BYTES is not None:
-            limits += ["--max-answer-bytes", str(EXTRACT_ANSWER_MAX_BYTES)]
         code, _, stderr = context.wf.run_main(context.siblings.build_prompts.main, [
-            "extract", "--digest-dir", str(directory), "--out", str(Path(tmp) / "build"), *limits])
+            "extract", "--digest-dir", str(directory), "--out", str(Path(tmp) / "build"), *extract_limit_args()])
         if code != 0:
             raise StageError("build_prompts extract failed: " + stderr.strip())
         extract = max(path.stat().st_size for path in (Path(tmp) / "build" / "prompts").glob("*.md"))
@@ -1077,6 +1112,9 @@ def cmd_extract_inputs(context: Context, args) -> dict:
         written.append(entry)
     summary = {"stage": "extract", "mode": context.mode, "calls": written, "max_model_calls": plan["max_model_calls"],
                "call_plan": plan, "final_budget": final_budget}
+    if answer_target() is not None:
+        # the prompts state it (#280); continue-plan writes them again with this target to compare their bytes
+        summary["extract_answer_target_bytes"] = answer_target()
     if worst is not None:
         summary["worst_case"] = {"stages": worst["stages"], "levels": worst["levels"]}
     write_json(out / "stage.json", summary)
@@ -1360,11 +1398,8 @@ def cmd_synthesis_merge_input(context: Context, args) -> dict:
     return summary
 
 
-def checked_extract_answers(context: Context, paths: list[str], stage: str) -> tuple[list[str], dict, dict, int]:
-    """Every extract answer of the run, each its lens object within the caps, quotes checked, and the final
-    prompt's projection with those quotes within the budget."""
-    stems = context.extract_stems()
-    results = load_results(paths, stems, "extract result")
+def check_extract_results(results: dict) -> None:
+    """Each extract answer is its lens object within the caps and the answer size limit."""
     for stem, (_, document) in results.items():
         lens = EXTRACT_STEM.fullmatch(stem).group(1)
         if set(document) != {"lens", "patterns", "observations", "rejected"} or document["lens"] != lens:
@@ -1375,6 +1410,14 @@ def checked_extract_answers(context: Context, paths: list[str], stage: str) -> t
         if EXTRACT_ANSWER_MAX_BYTES is not None and answer_bytes(document) > EXTRACT_ANSWER_MAX_BYTES:
             raise StageError("extract result %s is %d bytes as a prompt holds it (> extract_answer_max_bytes %d); "
                              "refused, not cut" % (stem, answer_bytes(document), EXTRACT_ANSWER_MAX_BYTES))
+
+
+def checked_extract_answers(context: Context, paths: list[str], stage: str) -> tuple[list[str], dict, dict, int]:
+    """Every extract answer of the run, each its lens object within the caps, quotes checked, and the final
+    prompt's projection with those quotes within the budget."""
+    stems = context.extract_stems()
+    results = load_results(paths, stems, "extract result")
+    check_extract_results(results)
     report = check_quotes(context, [path for path, _ in results.values()])
     projected = len(final_prompt_text(context, [], {}, compact_report(report)).encode("utf-8"))
     # An extraction-only run under the stage output limits has its final prompt bounded by the worst-case plan
@@ -1444,12 +1487,31 @@ def recorded_call_problems(kind: str, path: str, call_dir: Path, prompt_sha: str
     return problems, answer_sha, prompt_sha
 
 
+def attempts(records: Path, call: str) -> list[str]:
+    """The call directories of a call and of its retries (<call>-r2, -r3, ..., #280: call_with_retry.py), in attempt
+    order; a retry made by hand under the same name (the split gate run's extract-structure-01-r2) is one too."""
+    names, number = [call], 2
+    while (records / ("%s-r%d" % (call, number))).is_dir():
+        names.append("%s-r%d" % (call, number))
+        number += 1
+    return names
+
+
 def adopted_extract_answer(context: Context, stem: str, path: str, prompt_sha: str, records: Path) -> dict:
-    """One adopted extract answer, bound to the prompt its extract stage recorded (recorded_call_problems)."""
-    problems, answer_sha, _ = recorded_call_problems("extract", path, records / stem, prompt_sha)
-    if problems:
-        raise StageError("the adopted answer %s is not bound to its recorded prompt: %s" % (stem, "; ".join(problems)))
-    return {"stem": stem, "result_name": Path(path).name, "answer_sha256": answer_sha, "prompt_sha256": prompt_sha}
+    """One adopted extract answer, bound to the prompt its extract stage recorded (recorded_call_problems) by the
+    attempt of its call that adopted it (#280: the first one, or a retry)."""
+    refusals = []
+    for call in attempts(records, stem):
+        if (records / call).is_symlink():
+            refusals.append("%s: a link" % call)
+            continue
+        problems, answer_sha, _ = recorded_call_problems("extract", path, records / call, prompt_sha)
+        if not problems:
+            answer = {"stem": stem, "result_name": Path(path).name, "answer_sha256": answer_sha,
+                      "prompt_sha256": prompt_sha}
+            return dict(answer, call=call) if call != stem else answer
+        refusals.append("%s%s" % ("%s: " % call if call != stem else "", "; ".join(problems)))
+    raise StageError("the adopted answer %s is not bound to its recorded prompt: %s" % (stem, " / ".join(refusals)))
 
 
 def ledger_lines(records: Path, label: str) -> list:
@@ -1501,23 +1563,29 @@ def adopted_reduce_answer(kind: str, path: str, ledgers: list, recorded: list) -
     refusals = []
     for depth, (records, ledger) in enumerate(ledgers):
         entries = set(os.listdir(records))
-        call = stem if stem in entries else stem.lower() if stem.lower() in entries else None
-        if call is None or (records / call).is_symlink() or not (records / call).is_dir():
+        first = stem if stem in entries else stem.lower() if stem.lower() in entries else None
+        if first is None or (records / first).is_symlink() or not (records / first).is_dir():
             continue
         where = "the parent ledger" if depth == 0 else "the ancestor ledger %s" % records
-        problems, answer_sha, prompt_sha = recorded_call_problems(kind, path, records / call, None)
-        lines = [line for line in ledger if line.get("name") == call and line.get("kind") == "token"]
-        if len(lines) != 1:
-            problems.append("%s holds %d token lines for the call %s" % (where, len(lines), call))
-        elif (lines[0].get("status") != "succeeded" or lines[0].get("input_sha256") != prompt_sha
-              or lines[0].get("prompt_sha256_recorded") != prompt_sha or lines[0].get("report_sha256") != answer_sha):
-            problems.append("%s line of %s records another input, prompt or report" % (where, call))
-        answer = {"kind": kind, "call": call, "result_name": name, "answer_sha256": answer_sha, "prompt_sha256": prompt_sha}
-        if depth and not problems and reduce_answer_key(answer) not in map(reduce_answer_key, recorded):
-            problems.append("bound to %s but not adopted by the continue stage" % where)
-        if not problems:
-            return dict(answer, ancestor=depth) if depth else answer
-        refusals.append("not bound to %s: %s" % (where, "; ".join(problems)))
+        # the attempt that adopted it: the call itself, or a retry of it (#280)
+        for call in attempts(records, first):
+            if (records / call).is_symlink():
+                continue
+            problems, answer_sha, prompt_sha = recorded_call_problems(kind, path, records / call, None)
+            lines = [line for line in ledger if line.get("name") == call and line.get("kind") == "token"]
+            if len(lines) != 1:
+                problems.append("%s holds %d token lines for the call %s" % (where, len(lines), call))
+            elif (lines[0].get("status") != "succeeded" or lines[0].get("input_sha256") != prompt_sha
+                  or lines[0].get("prompt_sha256_recorded") != prompt_sha or lines[0].get("report_sha256") != answer_sha):
+                problems.append("%s line of %s records another input, prompt or report" % (where, call))
+            answer = {"kind": kind, "call": call, "result_name": name, "answer_sha256": answer_sha,
+                      "prompt_sha256": prompt_sha}
+            if depth and not problems and reduce_answer_key(answer) not in map(reduce_answer_key, recorded):
+                problems.append("bound to %s but not adopted by the continue stage" % where)
+            if not problems:
+                return dict(answer, ancestor=depth) if depth else answer
+            refusals.append("not bound to %s%s: %s" % (where, " (%s)" % call if call != first else "",
+                                                        "; ".join(problems)))
     if not refusals:
         raise StageError("no call record for the adopted answer %s" % name)
     raise StageError("the adopted answer %s is %s" % (name, " / ".join(refusals)))
@@ -1535,23 +1603,32 @@ def continue_chain_plan(context: Context, args, data: bytes, recorded: dict) -> 
     if not args.synthesis_result:
         raise StageError("a continue stage needs its adopted synthesis answer (--synthesis-result)")
     before, listed = recorded.get("call_plan"), recorded.get("answers")
+    pending = recorded.get("pending", [])
     done = before.get("continues", {}).get("completed", {}) if isinstance(before, dict) else {}
     if (not isinstance(before, dict) or not isinstance(listed, list) or recorded.get("mode") != context.mode
             or before.get("shards") != context.shards or not isinstance(done.get("extract"), int)
-            or not isinstance(before.get("synthesis"), int)
-            or not all(isinstance(item, dict) and isinstance(item.get("stem"), str) for item in listed)):
+            or not isinstance(before.get("synthesis"), int) or not isinstance(pending, list)
+            or not all(isinstance(item, dict) and isinstance(item.get("stem"), str) for item in listed + pending)):
         raise StageError("the continue stage.json is not a continue plan of this run")
     stems, results, report, projected = checked_extract_answers(context, args.extract_result, "continue-plan")
     expected = {item["stem"]: item for item in listed}
-    if sorted(expected) != sorted(stems):
-        raise StageError("the extract answers are not the ones the continue stage recorded")
+    left = {item["stem"]: item for item in pending}
+    if sorted(list(expected) + list(left)) != sorted(stems):
+        raise StageError("the extract answers are not the ones the continue stage recorded%s"
+                         % (" and left (%d extract calls left)" % len(left) if left else ""))
+    records = Path(args.records)
+    answers = list(listed)
     for stem in stems:
         path = results[stem][0]
-        if (Path(path).name != expected[stem].get("result_name")
+        if stem in left:
+            # an extract call the continue stage left (#280): made under the parent ledger, bound to its prompt there
+            if not isinstance(left[stem].get("prompt_sha256"), str):
+                raise StageError("the continue stage records no prompt for the extract calls left")
+            answers.append(adopted_extract_answer(context, stem, path, left[stem]["prompt_sha256"], records))
+        elif (Path(path).name != expected[stem].get("result_name")
                 or hashlib.sha256(read_bounded(Path(path), ANSWER_MAX_BYTES, "extract result")).hexdigest()
                 != expected[stem].get("answer_sha256")):
             raise StageError("the extract answer %s is not the one the continue stage recorded" % stem)
-    records = Path(args.records)
     bound = read_json(records / "ledger-limit.json", ANSWER_MAX_BYTES, "parent ledger limit")
     if not isinstance(bound, dict) or bound.get("call_plan_sha256") != hashlib.sha256(data).hexdigest():
         raise StageError("the records are not the ledger bound to this continue stage")
@@ -1570,22 +1647,72 @@ def continue_chain_plan(context: Context, args, data: bytes, recorded: dict) -> 
         verified.append(answer_id)
         reduce_answers.append(adopted_reduce_answer("verify", path, ledgers, adopted))
     verify = len(ids) - len(verified)
-    total = verify + 1
+    share = retry_policy.retry_share({"extract": 0, "synthesis": 0, "verify": verify, "final": 1})
+    total = verify + 1 + share["total"]
     plan = {"mode": context.mode,
             "continues": {"extract_stage_sha256": hashlib.sha256(data).hexdigest(),
-                          "completed": {"extract": done["extract"],
+                          "completed": {"extract": done["extract"] + len(left),
                                         "synthesis": done.get("synthesis", 0) + before["synthesis"],
                                         "verify": len(verified)},
                           "parent_stage": "continue"},
             "shards": context.shards, "lenses": len(context.siblings.build_prompts.LENSES), "extract": 0,
-            "synthesis": 0, "verify": verify, "final": 1, "max_model_calls": total,
+            "synthesis": 0, "verify": verify, "final": 1, "retry": share, "max_model_calls": total,
             "formula": "%d extract and %d synthesis calls done, %d of %d verify answers adopted; %d (verify) + 1 "
-                       "(final) = %d" % (done["extract"], done.get("synthesis", 0) + before["synthesis"],
-                                         len(verified), len(ids), verify, total),
+                       "(final) + %d (retry share) = %d"
+                       % (done["extract"] + len(left), done.get("synthesis", 0) + before["synthesis"], len(verified),
+                          len(ids), verify, share["total"], total),
             "inputs": {"max_candidates": MAX_CANDIDATES, "candidates": len(ids)}}
     out = new_directory(args.out)
-    summary = {"stage": "continue", "mode": context.mode, "answers": listed, "reduce_answers": reduce_answers,
+    summary = {"stage": "continue", "mode": context.mode, "answers": sorted(answers, key=lambda item: item["stem"]),
+               "reduce_answers": reduce_answers,
                "max_model_calls": total, "call_plan": plan, "final_projection_bytes": projected}
+    write_json(out / "stage.json", summary)
+    return summary
+
+
+def partial_continue_plan(context: Context, args, data: bytes, prompts: dict, given: list[str]) -> dict:
+    """continue-plan of a run stopped during its extract calls (#280: the split gate run adopted 10 of its 15): the
+    adopted answers are kept (each bound to its recorded prompt by the attempt that adopted it), the other extract
+    prompts are left to call as the extract stage recorded them (``pending``: stem and prompt sha), and every later
+    stage is planned at the stage output limits (the worst-case plan's levels, since the groups are not known before
+    every answer is), with the retry share of these calls."""
+    results = load_results(args.extract_result, given, "extract result")
+    check_extract_results(results)
+    try:
+        answers = [adopted_extract_answer(context, stem, results[stem][0], prompts[stem], Path(args.records))
+                   for stem in given]
+        if context.reduced:
+            worst = worst_case_plan(plan_inputs(context))
+            failed = ["%s: %s bytes" % (stage["stage"], stage["worst_bytes"]) for stage in worst["stages"]
+                      if not stage["ok"]]
+            if failed:
+                raise StageError("the later stages do not pass the worst-case plan: %s" % "; ".join(failed))
+            levels = worst["synthesis_levels"]
+        else:
+            levels = [1]
+    except StageError as error:
+        raise StageError("continue-plan: %s" % error) from error
+    left = sorted(set(prompts) - set(given))
+    calls = {"extract": len(left), "synthesis": sum(levels), "verify": MAX_CANDIDATES, "final": 1}
+    share = retry_policy.retry_share(calls)
+    total = sum(calls.values()) + share["total"]
+    if total > ABSOLUTE_MAX_CALLS:
+        raise StageError("continue-plan: %d model calls remain at the limits (%d planned + %d retry share), over the "
+                         "absolute cap %d" % (total, total - share["total"], share["total"], ABSOLUTE_MAX_CALLS))
+    plan = {"mode": context.mode,
+            "continues": {"extract_stage_sha256": hashlib.sha256(data).hexdigest(), "completed": {"extract": len(given)}},
+            "shards": context.shards, "lenses": len(context.siblings.build_prompts.LENSES), **calls,
+            "synthesis_levels": levels, "retry": share, "max_model_calls": total,
+            "formula": "%d of %d extract calls done, %d of %d extract calls left; %d (synthesis levels %s at the limits) "
+                       "+ %d (verify, at most synthesis_max_candidates) + 1 (final) + %d (retry share) = %d"
+                       % (len(given), len(prompts), len(left), len(prompts), sum(levels), " + ".join(map(str, levels)),
+                          MAX_CANDIDATES, share["total"], total),
+            "inputs": {"max_candidates": MAX_CANDIDATES, "limits": output_limits()}}
+    out = new_directory(args.out)
+    summary = {"stage": "continue", "mode": context.mode, "answers": answers,
+               "pending": [{"stem": stem, "result_name": stem + ".result.json", "prompt_sha256": prompts[stem]}
+                           for stem in left],
+               "max_model_calls": total, "call_plan": plan}
     write_json(out / "stage.json", summary)
     return summary
 
@@ -1613,14 +1740,22 @@ def cmd_continue_plan(context: Context, args) -> dict:
         prompts = {call["input_dir"]: call["sha256"] for call in calls}
         if sorted(prompts) != context.extract_stems() or len(prompts) != len(calls):
             raise StageError("the extract stage.json calls are not this run's extract prompts")
+        # written again with the answer size target the stage recorded (#280; none before it), not the one in force
+        target = recorded.get("extract_answer_target_bytes")
+        if target is not None and (type(target) is not int or target < 1):
+            raise StageError("the extract stage.json records an answer size target that is not a positive integer")
         written = {stem: hashlib.sha256(text.encode("utf-8")).hexdigest()
-                   for stem, text in context.extract_prompt_texts().items()}
+                   for stem, text in context.extract_prompt_texts(target).items()}
         changed = [stem for stem in sorted(prompts) if prompts[stem] != written[stem]]
         if changed:
             raise StageError("the extract stage.json records other prompts than this run's analyzer writes: %s"
                              % ", ".join(changed))
     except StageError as error:
         raise StageError("continue-plan: %s" % error) from error
+    given = [Path(path).name[: -len(".result.json")] for path in args.extract_result]
+    if (all(Path(path).name.endswith(".result.json") for path in args.extract_result)
+            and len(set(given)) == len(given) and set(given) < set(prompts)):
+        return partial_continue_plan(context, args, data, prompts, sorted(given))
     stems, results, report, projected = checked_extract_answers(context, args.extract_result, "continue-plan")
     try:
         answers = [adopted_extract_answer(context, stem, results[stem][0], prompts[stem], Path(args.records))
@@ -1635,17 +1770,20 @@ def cmd_continue_plan(context: Context, args) -> dict:
         raise StageError("continue-plan: %s" % error) from error
     levels = [groups] + [level["calls"] for level in merges]
     synthesis = sum(levels)
-    total = synthesis + MAX_CANDIDATES + 1
+    share = retry_policy.retry_share({"extract": 0, "synthesis": synthesis, "verify": MAX_CANDIDATES, "final": 1})
+    total = synthesis + MAX_CANDIDATES + 1 + share["total"]
     lenses = len(context.siblings.build_prompts.LENSES)
     plan = {"mode": context.mode,
             "continues": {"extract_stage_sha256": hashlib.sha256(data).hexdigest(), "completed": {"extract": len(stems)}},
             "shards": context.shards, "lenses": lenses, "extract": 0, "synthesis": synthesis,
             "synthesis_groups": groups, "synthesis_levels": levels, "verify": MAX_CANDIDATES, "final": 1,
-            "max_model_calls": total,
-            "formula": "%d extract calls done; %s + %d (verify, at most synthesis_max_candidates) + 1 (final) = %d"
+            "retry": share, "max_model_calls": total,
+            "formula": "%d extract calls done; %s + %d (verify, at most synthesis_max_candidates) + 1 (final) + %d "
+                       "(retry share) = %d"
                        % (len(stems), "1 (synthesis)" if groups == 1 else
                           "%d (synthesis: %d group calls, then merge levels %s at the limits)"
-                          % (synthesis, groups, " + ".join(map(str, levels[1:]))), MAX_CANDIDATES, total),
+                          % (synthesis, groups, " + ".join(map(str, levels[1:]))), MAX_CANDIDATES, share["total"],
+                          total),
             "inputs": {"max_candidates": MAX_CANDIDATES, "limits": output_limits()}}
     if total > ABSOLUTE_MAX_CALLS:
         raise StageError("continue-plan: %d model calls remain at the limits, over the absolute cap %d"

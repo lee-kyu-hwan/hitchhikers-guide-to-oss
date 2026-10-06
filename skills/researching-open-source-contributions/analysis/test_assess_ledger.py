@@ -82,6 +82,7 @@ class AssessLedgerTests(unittest.TestCase):
             "total disagrees": self.assess_stage(2, name="total.json", max_model_calls=3),
             "an analysis key": self.assess_stage(1, name="mixed.json", final=1),
             "a continuation": self.assess_stage(1, name="continues.json", continues={"completed": {}}),
+            "a retry share": self.assess_stage(1, name="retry.json", retry={"per_call": 1, "total": 0, "stages": {}}),
             "string count": self.assess_stage(1, name="string.json", assess="1"),
             "bool count": self.assess_stage(1, name="bool.json", assess=True, max_model_calls=True),
             "other mode": self.assess_stage(1, name="mode.json", mode="extraction-only"),

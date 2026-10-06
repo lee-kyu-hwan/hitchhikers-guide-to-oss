@@ -159,8 +159,8 @@ class ModeTests(ReducedCase):
 
 class PlanTests(ReducedCase):
     def test_a_digest_in_final_run_counts_one_synthesis_call(self):
-        self.assertEqual(12, stage_inputs.model_call_plan(1, 5, 5)["max_model_calls"])
-        self.assertEqual(10, stage_inputs.model_call_plan(1, 5, 3)["max_model_calls"])
+        self.assertEqual(17, stage_inputs.model_call_plan(1, 5, 5)["max_model_calls"])     # with the retry share 5
+        self.assertEqual(15, stage_inputs.model_call_plan(1, 5, 3)["max_model_calls"])
         self.assertEqual(1, stage_inputs.model_call_plan(1, 5, 3)["synthesis"])
 
     def test_extract_inputs_needs_no_overflow_flag_and_records_the_worst_case_plan(self):
@@ -171,10 +171,13 @@ class PlanTests(ReducedCase):
         plan = summary["call_plan"]
         # 15 answers of 7,680 bytes: 3 per group (5 groups), whose candidates fit one merge (#248)
         self.assertEqual({"mode": "extraction-only", "shards": 3, "lenses": 5, "extract": 15, "synthesis": 6,
-                          "synthesis_levels": [5, 1], "verify": 3, "final": 1, "max_model_calls": 25},
+                          "synthesis_levels": [5, 1], "verify": 3, "final": 1, "max_model_calls": 30,
+                          "retry": {"per_call": 1, "per_stage": 3, "stages": {"extract": 3, "synthesis": 3, "verify": 3,
+                                                                               "final": 1}, "total": 5}},
                          {k: v for k, v in plan.items() if k not in ("formula", "inputs")})
         self.assertEqual(plan["max_model_calls"], summary["max_model_calls"])
         self.assertIn("synthesis levels 5 + 1", plan["formula"])
+        self.assertIn("+ 5 (retry share: per call 1, per stage 3) = 30", plan["formula"])
         self.assertNotIn("status", summary["final_budget"])
         self.assertEqual([stage["stage"] for stage in summary["worst_case"]["stages"]],
                          ["extract", "synthesis", "merge", "verify", "final"])

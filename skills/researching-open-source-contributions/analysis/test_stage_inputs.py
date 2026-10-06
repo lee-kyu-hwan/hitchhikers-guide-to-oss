@@ -223,11 +223,12 @@ class StagePipelineTests(unittest.TestCase):
         self.assertEqual([call["input_dir"] for call in extract["calls"]], ["extract-" + lens for lens in LENSES])
         build_prompts = self.context.siblings.build_prompts
         rule = build_prompts.COUNT_RULE.format(patterns=5, observations=20, rejected=20) \
-            + build_prompts.SIZE_RULE.format(answer_bytes=7680)
+            + build_prompts.SIZE_RULE.format(answer_bytes=7680) + build_prompts.TARGET_RULE.format(target_bytes=6500)
         for call in extract["calls"]:
             task = (self.root / "in-extract" / call["input_dir"] / "task.txt").read_text(encoding="utf-8")
             plain = (self.context.extract_prompts / (call["input_dir"] + ".md")).read_text(encoding="utf-8")
-            # The digest's prompt (written without limits) plus the count and size rules of run_limits.json, nothing else.
+            # The digest's prompt (written without limits) plus the count and size rules of run_limits.json and the
+            # size target (#280), nothing else.
             self.assertEqual(task, plain.replace(build_prompts.COUNT_RULE_ANCHOR, build_prompts.COUNT_RULE_ANCHOR + rule))
             self.assertEqual(task.count(rule), 1)
         self.assertEqual(synthesis_stage["quotes"], {"verified": 3, "total": 3})
@@ -355,7 +356,8 @@ class StagePipelineTests(unittest.TestCase):
 
     def test_counts_are_capped_and_refused_not_truncated(self):
         limits = json.loads((HERE / "run_limits.json").read_text(encoding="utf-8"))
-        self.assertEqual(stage_inputs.MAX_MODEL_CALLS, 10)      # 5 + 1 + synthesis_max_candidates 3 + 1 (#248)
+        # 5 + 1 + synthesis_max_candidates 3 + 1 (#248) + the retry share 5 (#280)
+        self.assertEqual(stage_inputs.MAX_MODEL_CALLS, 15)
         keys = [self.key[self.pr[101]], self.key[self.pr[102]]]
         many = [{"id": "C%d" % n, "statement": "x", "cited_prs": keys}
                 for n in range(1, limits["synthesis_max_candidates"] + 2)]
@@ -724,22 +726,25 @@ class ShardedRunTests(unittest.TestCase):
     def sharded(self):
         return make_run(self, self.root, ("--max-bytes", "1200"))
 
-    def test_the_call_limit_is_shards_times_lenses_plus_synthesis_verify_and_final(self):
-        self.assertEqual(10, stage_inputs.MAX_MODEL_CALLS)      # 5 + 1 + synthesis_max_candidates 3 + 1 (#248)
+    def test_the_call_limit_is_shards_times_lenses_plus_synthesis_verify_final_and_the_retry_share(self):
+        # 5 + 1 + synthesis_max_candidates 3 + 1 (#248), and the retry share 5 (#280)
+        self.assertEqual(15, stage_inputs.MAX_MODEL_CALLS)
         self.assertEqual({"shards": 1, "lenses": 5, "extract": 5, "synthesis": 1, "verify": 5, "final": 1,
-                          "max_model_calls": 12}, {k: v for k, v in stage_inputs.model_call_plan(1, 5, 5).items()
+                          "retry": {"per_call": 1, "per_stage": 3, "stages": {"extract": 3, "synthesis": 1, "verify": 3,
+                                                                               "final": 1}, "total": 5},
+                          "max_model_calls": 17}, {k: v for k, v in stage_inputs.model_call_plan(1, 5, 5).items()
                                                    if k != "formula"})
-        self.assertEqual(17, stage_inputs.model_call_plan(2, 5, 5)["max_model_calls"])
-        self.assertEqual(15, stage_inputs.model_call_plan(2, 5, 3)["max_model_calls"])
+        self.assertEqual(22, stage_inputs.model_call_plan(2, 5, 5)["max_model_calls"])
+        self.assertEqual(20, stage_inputs.model_call_plan(2, 5, 3)["max_model_calls"])
         plan = stage_inputs.model_call_plan(2, 5, 3)
-        self.assertEqual("2 shards x 5 lenses + 1 (synthesis) + 3 (verify, at most max_candidates) + 1 (final) = 15",
-                         plan["formula"])
+        self.assertEqual("2 shards x 5 lenses + 1 (synthesis) + 3 (verify, at most max_candidates) + 1 (final) + 5 "
+                         "(retry share) = 20", plan["formula"])
 
     def test_a_single_shard_run_records_the_ten_call_plan(self):
         run = make_run(self, self.root)
         code, summary, stderr = stage("extract-inputs", "--run-dir", run, "--out", str(self.root / "x"))
         self.assertEqual(code, 0, stderr)
-        self.assertEqual(10, summary["max_model_calls"])        # 12 under the earlier 5 candidates (#248)
+        self.assertEqual(15, summary["max_model_calls"])        # 10 and the retry share 5 (#280); 12 under 5 candidates
         self.assertEqual(5, len(summary["calls"]))
         self.assertEqual(1, summary["call_plan"]["shards"])
         self.assertEqual(summary, json.loads((self.root / "x" / "stage.json").read_text(encoding="utf-8")))
@@ -753,12 +758,15 @@ class ShardedRunTests(unittest.TestCase):
         # groups of at most 3 (the fixture's PR index is small), and their candidates fit one merge.
         plan = summary["call_plan"]
         self.assertEqual({"mode": "extraction-only", "shards": 2, "lenses": 5, "extract": 10, "synthesis": 5,
-                          "synthesis_levels": [4, 1], "verify": 3, "final": 1, "max_model_calls": 19},
+                          "synthesis_levels": [4, 1], "verify": 3, "final": 1, "max_model_calls": 24,
+                          "retry": {"per_call": 1, "per_stage": 3, "stages": {"extract": 3, "synthesis": 3, "verify": 3,
+                                                                               "final": 1}, "total": 5}},
                          {k: v for k, v in plan.items() if k not in ("formula", "inputs")})
-        self.assertEqual(plan["max_model_calls"], plan["extract"] + plan["synthesis"] + plan["verify"] + plan["final"])
+        self.assertEqual(plan["max_model_calls"], plan["extract"] + plan["synthesis"] + plan["verify"] + plan["final"]
+                         + plan["retry"]["total"])
         self.assertEqual({"max_candidates": 3, "shards": 2, "lenses": 5, "limits": stage_inputs.output_limits()},
                          plan["inputs"])
-        self.assertEqual(19, summary["max_model_calls"])
+        self.assertEqual(24, summary["max_model_calls"])
         self.assertEqual(plan, stage("dry-plan", "--run-dir", str(self.root / "run"))[1]["call_plan"])
         for call in summary["calls"]:
             self.assertLessEqual(call["bytes"], stage_inputs.PROMPT_MAX_BYTES)
@@ -907,7 +915,7 @@ class Run928InputTests(unittest.TestCase):
         extract = [item for lens in LENSES for item in ("--extract-result", str(answers / ("extract-%s.result.json" % lens)))]
         code, summary, stderr = stage("extract-inputs", "--run-dir", self.run, "--out", str(self.root / "extract"))
         self.assertEqual(code, 0, stderr)
-        self.assertEqual(12, summary["max_model_calls"])
+        self.assertEqual(17, summary["max_model_calls"])        # 12 and the retry share 5 (#280)
         digest_prompts = stage_inputs.Context(self.run).extract_prompts
         for lens in LENSES:
             kept = self.analysis / "in-extract-2" / ("extract-" + lens) / "task.txt"
@@ -956,10 +964,16 @@ class Run928InputTests(unittest.TestCase):
         extract = [item for lens in LENSES for item in ("--extract-result", str(answers / ("extract-%s.result.json" % lens)))]
         code, summary, stderr = stage("extract-inputs", "--run-dir", self.run, "--out", str(self.root / "extract"))
         self.assertEqual(code, 0, stderr)
-        self.assertEqual(10, summary["max_model_calls"])
-        size_rule = stage_inputs.Context(self.run).siblings.build_prompts.SIZE_RULE.format(answer_bytes=7680)
+        self.assertEqual(15, summary["max_model_calls"])        # 10 and the retry share 5 (#280)
+        prompts = stage_inputs.Context(self.run).siblings.build_prompts
+        size_rule = prompts.SIZE_RULE.format(answer_bytes=7680)
+        # #280: the size rule is followed by its target (6,500 of the 7,680 checked); without it the pins are unchanged
+        target_rule = prompts.TARGET_RULE.format(target_bytes=6500).encode("utf-8")
+        self.assertEqual(6500, summary["extract_answer_target_bytes"])
         for lens in LENSES:
             built = (self.root / "extract" / ("extract-" + lens) / "task.txt").read_bytes()
+            self.assertIn(size_rule.encode("utf-8") + target_rule, built, lens)
+            built = built.replace(target_rule, b"", 1)
             self.assertEqual(self.SIZED_EXTRACT_SHA256[lens], hashlib.sha256(built).hexdigest(), lens)
             self.assertEqual(self.EXTRACT_SHA256[lens],
                              hashlib.sha256(built.replace(size_rule.encode("utf-8"), b"", 1)).hexdigest(), lens)

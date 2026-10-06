@@ -393,6 +393,37 @@ class BuildPromptsTests(ExtractionTestCase):
                 self.assertIn(self.LIMIT_SENTENCE + self.SIZE_SENTENCE + "\n\n출력:", decoded)
                 self.assertEqual(decoded.replace(self.SIZE_SENTENCE + "\n", ""), limited[name].decode("utf-8"))
 
+    TARGET_SENTENCE = ("- 답 크기 목표: 상한에 여유를 두고 들여쓰기 1칸으로 다시 쓴 크기 6500 바이트 이하로 써라. "
+                       "공백 없이 출력해도 들여쓰기 1칸으로 다시 써서 재므로, 출력한 바이트보다 15% 안팎 커진다.")
+
+    def test_extract_with_an_answer_size_target_states_it_after_the_size_rule_and_changes_nothing_else(self):
+        """#280: the size limit is checked on the answer rewritten as indent-1 JSON, which a model cannot measure on
+        what it writes; the prompt asks for a smaller target while the check keeps its limit."""
+        self.assertEqual(self.build_digest().returncode, 0)
+        counts = ("--max-patterns", "5", "--max-observations", "20", "--max-rejected", "20")
+        sized = self.extract_prompts(*counts, "--max-answer-bytes", "7680")
+        targeted = self.extract_prompts(*counts, "--max-answer-bytes", "7680", "--answer-target-bytes", "6500")
+        self.assertEqual(sorted(targeted), sorted(sized))
+        for name, text in targeted.items():
+            with self.subTest(name):
+                decoded = text.decode("utf-8")
+                self.assertEqual(decoded.count(self.TARGET_SENTENCE), 1)
+                self.assertIn(self.SIZE_SENTENCE + "\n" + self.TARGET_SENTENCE + "\n\n출력:", decoded)
+                self.assertEqual(decoded.replace(self.TARGET_SENTENCE + "\n", ""), sized[name].decode("utf-8"))
+
+    def test_extract_refuses_a_size_target_without_the_size_limit_or_not_under_it(self):
+        self.assertEqual(self.build_digest().returncode, 0)
+        counts = ("--max-patterns", "5", "--max-observations", "20", "--max-rejected", "20")
+        for case in [counts + ("--answer-target-bytes", "6500"),
+                     counts + ("--max-answer-bytes", "7680", "--answer-target-bytes", "7680"),
+                     counts + ("--max-answer-bytes", "7680", "--answer-target-bytes", "0")]:
+            with self.subTest(case):
+                run = self.directory / "refused"
+                result = run_script("build_prompts.py", "extract", "--digest-dir", self.digest_dir, "--out", run, *case)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertNotIn("Traceback", result.stderr)
+                self.assertFalse((run / "prompts").exists())
+
     def test_extract_refuses_an_answer_size_limit_without_count_limits_or_not_positive(self):
         self.assertEqual(self.build_digest().returncode, 0)
         counts = ("--max-patterns", "5", "--max-observations", "20", "--max-rejected", "20")
