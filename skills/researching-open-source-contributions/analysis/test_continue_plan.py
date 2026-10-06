@@ -6,7 +6,7 @@ must be bound to the prompt its extract stage recorded, through the strict verdi
 worker manifest. Every answer and record below is a hand-written stand-in; nothing here starts a
 model, opens the network or reads a credential.
 
-  /opt/homebrew/bin/python3 -B -m unittest docs/research/oss-e2e-2026-09-28/test_continue_plan.py
+  /opt/homebrew/bin/python3 -B -m unittest dot_agents/skills/researching-open-source-contributions/analysis/test_continue_plan.py
 """
 
 from __future__ import annotations

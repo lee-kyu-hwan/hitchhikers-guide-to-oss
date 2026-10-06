@@ -503,7 +503,7 @@ def judge_auto(record_text: str, stream_text: str, kind: str, canaries: dict,
     return rows
 
 
-# The bundle's report_max_bytes (docs/research/oss-e2e-2026-09-28/run_limits.json).
+# The bundle's report_max_bytes (dot_agents/skills/researching-open-source-contributions/analysis/run_limits.json).
 MAX_ANALYSIS_REPORT_BYTES = 262144
 
 

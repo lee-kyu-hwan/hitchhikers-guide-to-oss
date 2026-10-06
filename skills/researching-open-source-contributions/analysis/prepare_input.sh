@@ -11,7 +11,7 @@
 set -euo pipefail
 CORPUS="$1"; MANIFEST="$2"; REQUEST="$3"; RUN="$4"; INPUT="$5"
 HERE="$(cd "$(dirname "$0")" && pwd)"
-REPO="$(cd "$HERE/../../.." && pwd)"
+REPO="$(cd "$HERE/../../../.." && pwd)"
 PY=/opt/homebrew/bin/python3
 WF="$REPO/dot_agents/skills/researching-open-source-contributions/scripts/oss_workflow.py"
 [ ! -e "$RUN" ] && [ ! -e "$INPUT" ] || { echo "run and input dirs must not exist" >&2; exit 2; }

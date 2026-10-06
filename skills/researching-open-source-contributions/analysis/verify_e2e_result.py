@@ -96,7 +96,7 @@ import tempfile
 
 sys.dont_write_bytecode = True
 HERE = Path(__file__).resolve().parent
-REPO = HERE.parents[2]
+REPO = HERE.parents[3]
 ANALYZER = REPO / "dot_codex/skills/analyzing-open-source-pr-patterns/scripts"
 CHECK = ANALYZER / "check_extraction.py"
 CREDENTIAL_VARIABLE = "CLAUDE_CODE_OAUTH_TOKEN"

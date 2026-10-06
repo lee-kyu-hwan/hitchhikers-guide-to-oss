@@ -22,10 +22,12 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 VERIFY = HERE / "verify_e2e_result.py"
-CORPUS = next(p for p in (HERE / "fixtures/corpus-min.json",
-                          HERE.parent / "oss-functional-validation-2026-09-28/raw/corpus.json") if p.exists())
+# The 2026-09-28 run record beside this bundle's history: its fixtures and legacy limits stay there (#261).
+RECORD = HERE.parents[3] / "docs/research/oss-e2e-2026-09-28"
+CORPUS = next(p for p in (RECORD / "fixtures/corpus-min.json",
+                          RECORD.parent / "oss-functional-validation-2026-09-28/raw/corpus.json") if p.exists())
 KEY, QUOTE = "npm-eslint-markdown#677", "Updates `editorconfig-checker` from 6.1.1 to 6.2.0"
-sys.path.insert(0, str(HERE.parents[2] / "dot_codex/skills/analyzing-open-source-pr-patterns/scripts"))
+sys.path.insert(0, str(HERE.parents[3] / "dot_codex/skills/analyzing-open-source-pr-patterns/scripts"))
 sys.dont_write_bytecode = True
 from build_digest import records_by_key  # noqa: E402
 
@@ -170,7 +172,7 @@ def main():
             ok = good and again and rc3 == 1 and not refused.exists()
             fails += not ok; count += 1
             print("%s %s/adopt only verified bytes, never overwrite, never a failed run" % ("PASS" if ok else "FAIL", kind))
-    legacy = HERE / "run_limits.legacy-fixture.json"
+    legacy = RECORD / "run_limits.legacy-fixture.json"
     for kind in GOOD:
         with tempfile.TemporaryDirectory(prefix="e2e-kinds-") as t:
             tmp = Path(t)

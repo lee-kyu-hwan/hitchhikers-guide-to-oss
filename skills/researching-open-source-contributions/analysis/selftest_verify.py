@@ -16,7 +16,9 @@ import hashlib, json, shutil, subprocess, sys, tempfile
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-CORPUS = HERE / "fixtures/corpus-min.json"
+# The 2026-09-28 run record beside this bundle's history: its fixtures and legacy limits stay there (#261).
+RECORD = HERE.parents[3] / "docs/research/oss-e2e-2026-09-28"
+CORPUS = RECORD / "fixtures/corpus-min.json"
 if sys.argv[1:2] == ["--corpus"] and len(sys.argv) == 3:
     CORPUS = Path(sys.argv[2]).resolve()
 elif len(sys.argv) != 1:
@@ -45,7 +47,7 @@ def make(tmp, answer=GOOD_ANSWER, manifest_edit=None, prompt="mock blind prompt\
 def verdict(tmp, run, corpus=CORPUS):
     p = subprocess.run([sys.executable, "-B", str(VERIFY), "--run-dir", str(run), "--corpus", str(corpus),
                         "--prompt", str(tmp / "task.txt"),
-                        "--limits", str(HERE / "run_limits.legacy-fixture.json")], capture_output=True, text=True)
+                        "--limits", str(RECORD / "run_limits.legacy-fixture.json")], capture_output=True, text=True)
     doc = json.loads(p.stdout)
     items = {i["id"].split("-")[0]: i["status"] for i in doc["items"]}
     items["class"] = doc["result_class"]

@@ -3238,7 +3238,7 @@ class AnalysisCallLedgerTests(unittest.TestCase):
     model or token is used; the fake answers the staging sha and a clean SUMMARY log and writes no
     unit, so each accepted call appends one token line to the ledger and nothing is picked up."""
 
-    HARNESS = REPO / "tests/fixtures/oss_research_worker/linux/analysis_call.sh"
+    HARNESS = REPO / "dot_agents/skills/researching-open-source-contributions/analysis/harness/analysis_call.sh"
     VM_ROOT = "W=/Users/lee-kyu-hwan/.oss-research-vm\n"
     FAKE_LIMACTL = """#!/bin/bash
 echo "$*" >> "$(dirname "$0")/../../calls.log"
@@ -3260,7 +3260,7 @@ exit 0
         limactl.write_text(self.FAKE_LIMACTL)
         limactl.chmod(0o755)
         self.calls_log = vm / "calls.log"
-        self.harness = self.root / "repo/tests/fixtures/oss_research_worker/linux/analysis_call.sh"
+        self.harness = self.root / "repo/dot_agents/skills/researching-open-source-contributions/analysis/harness/analysis_call.sh"
         self.harness.parent.mkdir(parents=True)
         self.harness.write_text(text.replace(self.VM_ROOT, "W=%s\n" % vm))
         self.ledger_dir = self.root / "ledger"

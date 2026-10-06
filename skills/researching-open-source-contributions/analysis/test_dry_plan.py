@@ -8,7 +8,7 @@ cap 40, with repository bundles that would pass. The merge itself is split into 
 answers do not fit one prompt; there is no fixed group limit. Every answer below is a hand-written stand-in;
 nothing here starts a model, opens the network or reads a credential.
 
-  /opt/homebrew/bin/python3 -B -m unittest docs/research/oss-e2e-2026-09-28/test_dry_plan.py
+  /opt/homebrew/bin/python3 -B -m unittest dot_agents/skills/researching-open-source-contributions/analysis/test_dry_plan.py
 """
 
 from __future__ import annotations
@@ -407,7 +407,7 @@ class PackingTests(reduce.ReducedCase):
 
 
 E = Path("/Users/lee-kyu-hwan/.oss-research-vm/logs/a78-period-20261004T055447Z")
-PERIOD_REQUEST = HERE.parent / "2026-10-04-period-research/analysis-eslint-request.json"
+PERIOD_REQUEST = HERE.parents[3] / "docs/research/2026-10-04-period-research/analysis-eslint-request.json"
 OWNERS = {"eslint": "eslint/eslint", "tseslint": "typescript-eslint/typescript-eslint", "markdown": "eslint/markdown",
           "css": "eslint/css"}
 

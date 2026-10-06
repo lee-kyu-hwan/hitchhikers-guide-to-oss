@@ -169,7 +169,7 @@ PY
 fi
 W=/Users/lee-kyu-hwan/.oss-research-vm
 L() { env -i HOME="$W/home" LIMA_HOME="$W/lima" TMPDIR="$W/tmp" PATH="$W/tool/bin:/usr/bin:/bin:/usr/sbin:/sbin" "$W/tool/bin/limactl" "$@"; }
-REPO=$(cd "$(dirname "$0")/../../../.." && pwd)
+REPO=$(cd "$(dirname "$0")/../../../../.." && pwd)
 S=/opt/oss-research/src-$C
 mkdir -p -m 0700 "$LEDGER_DIR"
 LEDGER="$LEDGER_DIR/ledger.jsonl"

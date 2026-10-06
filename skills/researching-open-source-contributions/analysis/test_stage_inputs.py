@@ -4,7 +4,7 @@ Every answer below is a hand-written stand-in for a model call. Nothing here
 starts a model, opens the network, or reads a real corpus or credential: the
 fixture blocks sockets and process spawning on import.
 
-  /opt/homebrew/bin/python3 -B -m unittest docs/research/oss-e2e-2026-09-28/test_stage_inputs.py
+  /opt/homebrew/bin/python3 -B -m unittest dot_agents/skills/researching-open-source-contributions/analysis/test_stage_inputs.py
 """
 
 from __future__ import annotations
@@ -25,7 +25,7 @@ from unittest import mock
 _REAL_EXECUTE_CHILD = subprocess.Popen._execute_child
 
 HERE = Path(__file__).resolve().parent
-REPO = HERE.parents[2]
+REPO = HERE.parents[3]
 sys.path.insert(0, str(REPO / "dot_agents/skills/researching-open-source-contributions/tests"))
 sys.path.insert(0, str(HERE))
 
