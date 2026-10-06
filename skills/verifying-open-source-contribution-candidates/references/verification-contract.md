@@ -116,6 +116,8 @@ Each value is `{result, evidence_links, note}`. Result is `confirmed`, `not-conf
 
 An assessment contains `schema_version`, `discovery_sha256`, and `assessments`. Each assessment names the pattern, repository, locus, status, reason, sensitivity, summary, impact, all readiness checks, `duplicate_verdict`, policy result, disclosure requirement, private reference, evidence links, execution evidence, reproduction, policy checks, blocking gaps, and supersession.
 
+`sensitivity` is exactly `normal` or `security-sensitive`. `record` refuses any other value before writing (exit 2) and `validate` refuses it on a candidate and on every snapshot, because an unknown value would otherwise slip past the `security-sensitive` gates that keep a candidate out of `issue-ready` and `pr-ready` and route it to `private-report-ready`.
+
 `duplicate_verdict` is `{matched_items, judgment}` and is preserved in every snapshot. When `readiness_checks.open_and_closed_searched.result` is `confirmed`, `duplicate_verdict.judgment` must be non-empty. Discovery combinations that were skipped, failed, or absent cannot be assessed.
 
 ## Policy gate

@@ -216,6 +216,7 @@ class SkillContractTests(unittest.TestCase):
             "the script never infers semantic absence",
             "It does not prove that the policy is absent",
             "numbers such as `0` or `1` are rejected",
+            "`sensitivity` is exactly `normal` or `security-sensitive`",
         ):
             self.assertIn(phrase, contract)
 

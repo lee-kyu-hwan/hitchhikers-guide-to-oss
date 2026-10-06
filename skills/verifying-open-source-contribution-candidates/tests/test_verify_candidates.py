@@ -6632,6 +6632,51 @@ class VerifyCandidatesTests(unittest.TestCase):
 
 
 
+
+class SensitivityValueTests(unittest.TestCase):
+    """sensitivity is exactly normal or security-sensitive (#191 recheck): any other value would skip the
+    security-sensitive gate that keeps a candidate out of issue-ready and pr-ready."""
+
+    run_main = VerifyCandidatesTests.run_main
+    run_record = VerifyCandidatesTests.run_record
+    write_record_inputs = VerifyCandidatesTests.write_record_inputs
+
+    def test_record_refuses_a_sensitivity_outside_the_contract_before_writing(self):
+        for value in ("whatever", "", "Security-Sensitive", "normal ", "security sensitive"):
+            record = discovery_record()
+            with self.subTest(value=value), tempfile.TemporaryDirectory() as temporary:
+                result, _, _, output, _ = self.run_record(
+                    Path(temporary), [record], [assessment_for(record, sensitivity=value)]
+                )
+                self.assertEqual(2, result[0], result[2])
+                self.assertIn(".sensitivity: expected normal or security-sensitive", result[2])
+                self.assertFalse(output.exists())
+        record = discovery_record()
+        with tempfile.TemporaryDirectory() as temporary:
+            result, _, _, _, _ = self.run_record(Path(temporary), [record], [assessment_for(record, sensitivity="normal")])
+            self.assertEqual(0, result[0], result[2])
+
+    def test_validate_refuses_a_stored_sensitivity_outside_the_contract(self):
+        record = discovery_record()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            result, _, _, output, _ = self.run_record(root / "valid", [record])
+            self.assertEqual(0, result[0], result[2])
+            valid = json.loads(output.read_text(encoding="utf-8"))
+            on_record = copy.deepcopy(valid)
+            on_record["records"][0]["sensitivity"] = "whatever"
+            on_snapshot = copy.deepcopy(valid)
+            on_snapshot["records"][0]["verification_history"][-1]["sensitivity"] = "whatever"
+            for name, value in (("record", on_record), ("snapshot", on_snapshot)):
+                with self.subTest(name):
+                    path = root / ("invalid-%s.json" % name)
+                    path.write_text(json.dumps(value), encoding="utf-8")
+                    code, _, stderr, _ = self.run_main(["validate", "--candidates", str(path)])
+                    self.assertEqual(1, code, stderr)
+                    self.assertIn("sensitivity", stderr)
+            self.assertEqual(0, self.run_main(["validate", "--candidates", str(output)])[0])
+
+
 REST_REPOSITORY = "example-org/rules-repo"
 REST_HEAD = "0123456789abcdef0123456789abcdef01234567"
 REST_API = "https://api.github.com"

@@ -303,6 +303,8 @@ INHERITED_EVIDENCE_FIELDS = (
 )
 
 READY_STATUSES = ("issue-ready", "pr-ready", "private-report-ready")
+# The only sensitivity values: any other string would skip the security-sensitive gates.
+SENSITIVITY_VALUES = ("normal", "security-sensitive")
 ACTIONABLE_STATUSES = (
     "reproduced", "issue-ready", "pr-ready", "private-report-ready",
 )
@@ -3302,6 +3304,8 @@ def _assessment_shape_violations(assessment: object, location: str) -> List[str]
     for name in ("pattern_id", "repository", "locus", "status", "status_reason", "sensitivity", "summary", "impact", "ai_policy_status"):
         if name in assessment and not isinstance(assessment.get(name), str):
             violations.append(location + "." + name + ": expected string")
+    if isinstance(assessment.get("sensitivity"), str) and assessment["sensitivity"] not in SENSITIVITY_VALUES:
+        violations.append(location + ".sensitivity: expected normal or security-sensitive")
     if not _is_string_list(assessment.get("evidence_links")):
         violations.append(location + ".evidence_links: expected string array")
     if not _is_string_list(assessment.get("blocking_gaps")):
@@ -3831,6 +3835,8 @@ def validate_candidates_document(
                 violations.append(location + "." + name)
         if record.get("ai_policy_status") not in ("allowed", "allowed-with-disclosure", "prohibited", "unknown"):
             violations.append(location + ".ai_policy_status")
+        if record.get("sensitivity") not in SENSITIVITY_VALUES:
+            violations.append(location + ".sensitivity")
         if record.get("disclosure_required") not in (True, False, None):
             violations.append(location + ".disclosure_required")
         if not _is_string_list(record.get("evidence_links")):
@@ -3876,6 +3882,8 @@ def validate_candidates_document(
                 or re.fullmatch(r"[0-9a-f]{40}", snapshot_sha) is None
             ):
                 violations.append(snapshot_location + ".verified_base_sha")
+            if snapshot.get("sensitivity") not in SENSITIVITY_VALUES:
+                violations.append(snapshot_location + ".sensitivity")
             snapshot_status = snapshot.get("status")
             if snapshot_status not in STATUS_REASON_TABLE or snapshot.get("status_reason") not in STATUS_REASON_TABLE.get(snapshot_status, ()):
                 violations.append(snapshot_location + ".status_reason")
