@@ -54,7 +54,11 @@ at the observed head commit through the relay's existing contents route. At most
 STATIC_MAX_DIRS directories, each at most STATIC_MAX_DEPTH plain segments of the
 relay's content path rule, and a request budget that covers the verifier's static
 reserve (REPOSITORY_FACT_REQUESTS + README.md + one listing per directory +
-STATIC_MAX_FILES). The relay's routes, methods and hosts are unchanged.
+STATIC_MAX_FILES). The relay's routes, methods and hosts are unchanged. The reserve
+covers the static reads only: the searches need 5 more requests per clue and pattern,
+so near the floor they can run out. The verifier then keeps the finished reads in the
+discovery's static_reads section (one entry per repository, #266) while the patterns
+go to failed_scopes.
 
 Status is the verifier's, never raised: its exit 0 is "succeeded" (exit 0), its
 exit 3 is "partial" (exit EXIT_PARTIAL: a budget stop, an unavailable anonymous

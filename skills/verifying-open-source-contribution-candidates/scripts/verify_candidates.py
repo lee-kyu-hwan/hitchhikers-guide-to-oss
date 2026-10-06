@@ -3150,6 +3150,27 @@ def run_discover(
         "method_limitations": method_limitations,
         "status": status,
     }
+    if arguments.static_reads == "rest":
+        # One entry per repository, apart from the records: reads that finished stay
+        # in the output even when the budget ends before a combination's searches (#266).
+        static_reads = []
+        for state in repository_states:
+            static = state.get("rest_static")
+            if static is None:
+                static = _empty_rest_static(None, arguments.static_dir)
+                static["error"] = (
+                    "repository-unavailable"
+                    if state["outcome"] in ACCESS_FAILURE_OUTCOMES
+                    else "budget-exhausted"
+                )
+            static_reads.append(
+                {
+                    "repository": state["repository"],
+                    "head_sha": state["head_sha"],
+                    "static_search": copy.deepcopy(static),
+                }
+            )
+        discovery["static_reads"] = static_reads
     completed_at = _utc_observation(clock)
     manifest_path = Path(arguments.manifest)
     manifest = _manifest_document(manifest_path, generated_by)

@@ -525,6 +525,66 @@ class StaticReadsTests(Harness):
         transport = _load_json(str(relayed_out) + "-transport.json")
         self.assertTrue(all(entry["outcome"] in ("relayed", "upstream-error") for entry in transport["requests"]))
 
+    def test_the_repository_static_section_repeats_the_records_static_reads(self):
+        code, out = self.relayed(static=STATIC)
+        self.assertEqual(code, 3)
+        discovery = _load_json(str(out) + "-discovery.json")
+        self.assertEqual([(item["repository"], item["head_sha"]) for item in discovery["static_reads"]],
+                         [(TARGET, HEAD)])
+        self.assertEqual(discovery["static_reads"][0]["static_search"], discovery["records"][0]["static_search"])
+
+    def test_the_default_mode_has_no_static_section(self):
+        code, out = self.relayed()
+        self.assertEqual(code, 3)
+        discovery = _load_json(str(out) + "-discovery.json")
+        self.assertNotIn("static_reads", discovery)
+        self.assertFalse({"static_reads", "static_dirs"} & set(discovery["inputs"]))
+
+    def test_static_reads_survive_a_budget_that_ends_in_the_searches(self):
+        """#266 S3: the static reads finish, the searches run out; the reads stay in the output."""
+        docs = {"r%02d.md" % index: b"# r\n\n## Rule Details\n" for index in range(verifier.STATIC_MAX_FILES)}
+        add_static_routes(self.upstream.routes, docs=docs)
+        floor = verifier.static_request_reserve(1)
+        direct_code, direct_out = self.direct(static=STATIC, budget=floor)
+        self.upstream.requests.clear()
+        relayed_code, relayed_out = self.relayed(static=STATIC, budget=floor)
+        self.assertEqual((direct_code, relayed_code), (3, 3))
+        direct, relayed = (_load_json(str(out) + "-discovery.json") for out in (direct_out, relayed_out))
+        self.assertEqual(_differences(direct, relayed), [])
+        # The budget ran out in the searches, after every static read.
+        self.assertTrue([r for r in self.upstream.requests if r["path"].startswith("/search/")])
+        self.assertEqual((relayed["records"], relayed["failed_scopes"]),
+                         ([], [{"repository": TARGET, "pattern_id": "PAT-001", "reason": "budget-exhausted"}]))
+        self.assertEqual(relayed["status"], "partial")
+        [item] = relayed["static_reads"]
+        self.assertEqual((item["repository"], item["head_sha"]), (TARGET, HEAD))
+        static = item["static_search"]
+        self.assertEqual((static["mode"], static["ref"], static["complete"], len(static["files"])),
+                         ("rest-contents", HEAD, True, 1 + verifier.STATIC_MAX_FILES))
+        self.assertEqual(sorted(hit["path"] for hit in static["hits"] if hit["rule"] == "options-heading-missing"),
+                         ["docs/rules/" + name for name in sorted(docs)])
+        manifest = _load_json(str(relayed_out) + "-manifest.json")
+        self.assertEqual(manifest["runs"][-1]["budget"]["requests_consumed"], floor)
+
+    def test_a_repository_without_static_reads_still_has_its_entry(self):
+        def entry(discovery):
+            [item] = discovery["static_reads"]
+            static = item["static_search"]
+            return (item["repository"], item["head_sha"], static["mode"], static["ref"], static["available"],
+                    static["files"], static["hits"], static["error"])
+
+        # Below the floor (only reachable with the floor lowered) the budget ends in the repository facts.
+        with mock.patch.object(verifier, "static_request_reserve", lambda directories: 1):
+            code, out = self.direct(static=STATIC, budget=3)
+        self.assertEqual(code, 3)
+        self.assertEqual(entry(_load_json(str(out) + "-discovery.json")),
+                         (TARGET, HEAD, "rest-contents", None, False, [], [], "budget-exhausted"))
+        del self.upstream.routes[("/repos/" + TARGET, ())]
+        code, out = self.direct(static=STATIC)
+        self.assertEqual(code, 4)
+        self.assertEqual(entry(_load_json(str(out) + "-discovery.json")),
+                         (TARGET, None, "rest-contents", None, False, [], [], "repository-unavailable"))
+
     def test_the_verifier_argv_is_unchanged_without_rest(self):
         relay_collect = adapter.load_relay_collect()
         common = ["discover", "--relay-url", "http://127.0.0.1:1", "--skills-dir", str(SKILLS),

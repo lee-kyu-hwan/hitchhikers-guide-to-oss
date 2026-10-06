@@ -10,6 +10,7 @@ adapter against a loopback mock, no srt) and edited one member at a time. No
 network, srt or VM is used here; the real run is on the Linux guest.
 """
 
+import copy
 import hashlib
 import importlib.machinery
 import importlib.util
@@ -1022,6 +1023,7 @@ class OfflineStaticDiscoverTests(PickupCase):
         both = lambda change: (lambda m: edited(edited(m, "read-envelope.json", change), "run-manifest.json", change))
         request = lambda key, value: (lambda d: d["request"].__setitem__(key, value))
         record = lambda change: (lambda m: edited(m, "discovery.json", lambda d: change(d["records"][0]["static_search"])))
+        section = lambda change: (lambda m: edited(m, "discovery.json", lambda d: change(d["static_reads"])))
         cases = {
             "a dot-dot directory requested": (both(request("static_dirs", ["docs/../x"])), "outside the entry's limits"),
             "four directories requested": (both(request("static_dirs", ["a", "b", "c", "d"])), "outside the entry's limits"),
@@ -1045,6 +1047,34 @@ class OfflineStaticDiscoverTests(PickupCase):
                                  "a record's static evidence holds more than a one-line excerpt"),
             "another ref": (record(lambda s: s.__setitem__("ref", "f" * 40)),
                             "a record's static reads are not the REST contents reads"),
+            "a static section for another repository": (
+                section(lambda items: items[0].__setitem__("repository", "octo/other")),
+                "output static section differs from the request"),
+            "no static section": (section(lambda items: items.clear()), "output static section differs from the request"),
+            "a static section that is not a list": (
+                lambda m: edited(m, "discovery.json", lambda d: d.__setitem__("static_reads", False)),
+                "output static section differs from the request"),
+            "two static section entries": (section(lambda items: items.append(copy.deepcopy(items[0]))),
+                                           "output static section differs from the request"),
+            "a static section at another ref": (
+                section(lambda items: items[0]["static_search"].__setitem__("ref", "f" * 40)),
+                "the static section's static reads are not the REST contents reads"),
+            "an unread static section entry with a file": (
+                section(lambda items: items[0]["static_search"].update(ref=None, error="budget-exhausted",
+                                                                       available=False)),
+                "the static section's static reads are not the REST contents reads"),
+            "a record claiming the section's unread reason": (
+                record(lambda s: s.update(ref=None, error="budget-exhausted", available=False, files=[], hits=[])),
+                "a record's static reads are not the REST contents reads"),
+            "a static section apart from the record's": (
+                section(lambda items: items[0]["static_search"]["hits"].pop()),
+                "output static section differs from the records' static reads"),
+            "a static section hit outside the directories": (
+                section(lambda items: items[0]["static_search"]["hits"][0].__setitem__("path", "src/x.md")),
+                "the static section's static reads name a path outside the fixed rule"),
+            "a static section file body kept": (
+                section(lambda items: items[0]["static_search"]["files"][0].__setitem__("content", "Zm9v")),
+                "the static section's static evidence holds more than a one-line excerpt"),
             "an extra contents request": (
                 lambda m: edited(m, "transport.json", lambda d: d["requests"].append(dict(
                     d["requests"][-1], logical_url="https://api.github.com/repos/%s/contents/src/secret.md?ref=%s"
@@ -1054,6 +1084,35 @@ class OfflineStaticDiscoverTests(PickupCase):
         for label, (change, text) in cases.items():
             with self.subTest(label):
                 self.expect("discover", change(good), text)
+        # An unread entry (no records then) is the section's other honest shape.
+        unread = edited(good, "discovery.json", lambda d: (d["records"].clear(), d["static_reads"][0]["static_search"].update(
+            ref=None, error="repository-unavailable", available=False, files=[], hits=[], listings=[], absent=[])))
+        code, seen = self.pickup("discover", unread)
+        self.assertEqual((code, seen["problems"]), (3, []), seen)
+
+    def test_static_reads_survive_a_budget_that_ends_in_the_searches(self):
+        """#266 S3 through the entry and the pickup: at the static floor the searches run out."""
+        relay_verify_tests.add_static_routes(self.upstream.routes, docs={
+            "r%02d.md" % index: b"# r\n\n## Rule Details\n" for index in range(30)})
+        reads, directory = self.discover_run(static_reads="rest", static_dirs=STATIC_DIRS, request_budget=58)
+        run_dir, kept, manifest = self.step("run", reads, directory, 3)
+        self.assertEqual((kept, manifest["status"], manifest["problems"]), (True, "partial", []))
+        members = self.members("discover", run_dir)
+        code, seen = self.pickup("discover", members)
+        self.assertEqual((code, seen["problems"], seen["step_status"], seen["records"]), (3, [], "partial", 0), seen)
+        discovery = json.loads(members["discovery.json"])
+        self.assertEqual(discovery["failed_scopes"],
+                         [{"repository": TARGET, "pattern_id": "PAT-001", "reason": "budget-exhausted"}])
+        [item] = discovery["static_reads"]
+        self.assertEqual((item["repository"], len(item["static_search"]["files"])), (TARGET, 31))
+        self.assertEqual(len([hit for hit in item["static_search"]["hits"]
+                              if hit["rule"] == "options-heading-missing"]), 30)
+
+    def test_a_default_run_with_a_static_section_fails(self):
+        run_dir, kept, _ = self.step("run", *self.discover_run(), 3)
+        members = edited(self.members("discover", run_dir), "discovery.json",
+                         lambda d: d.__setitem__("static_reads", []))
+        self.expect("discover", members, "output static section differs from the request")
 
     def test_a_legacy_request_with_static_output_fails(self):
         good = self.members("discover", self.static_run())

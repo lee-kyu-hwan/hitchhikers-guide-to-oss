@@ -645,7 +645,8 @@ def model_once(out: Path, credential_file: Path, model: str, effort: str, second
 
 
 CANDIDATE_CASES = ("normal", "anonymous-code-search", "locus-search", "drop-verifier-file", "drop-verifier", "drop-adapter-dependency",
-                   "repo-missing", "upstream-hang", "write-methods", "direct-regression", "static-rest")
+                   "repo-missing", "upstream-hang", "write-methods", "direct-regression", "static-rest",
+                   "static-budget")
 
 
 def load_candidate_entry():
@@ -687,6 +688,8 @@ def candidate_reads(out: Path, case: str = "normal", token_file: Path | None = N
     direct-regression: the adapter run without srt's proxy, which srt's network namespace
     must refuse. static-rest: discover with --static-reads rest over docs/rules (#256), README.md
     and the rule documents answered by the mock's contents route at the head commit (complete).
+    static-budget: the same with 30 rule documents and a budget of 58, the static floor (#266 S3):
+    the reads finish, the searches run out, and the output keeps the reads in static_reads (partial).
     """
     import threading
     import tests.test_oss_research_candidate_reads as reads_fixture
@@ -700,6 +703,8 @@ def candidate_reads(out: Path, case: str = "normal", token_file: Path | None = N
     reads_fixture.add_locus_routes(routes)
     if case == "static-rest":
         fixture.add_static_routes(routes)
+    if case == "static-budget":
+        fixture.add_static_routes(routes, docs={"r%02d.md" % index: b"# r\n\n## Rule Details\n" for index in range(30)})
     if case == "repo-missing":
         del routes[("/repos/" + fixture.TARGET, ())]
     upstream = fixture.MockUpstream(routes)
@@ -726,8 +731,9 @@ def candidate_reads(out: Path, case: str = "normal", token_file: Path | None = N
             "drop-adapter-dependency": tuple(str(entry.adapter_file(worker).with_name(name))
                                              for name in entry.ADAPTER_DEPENDENCIES)}.get(case, ())
     seconds = 40.0 if case == "upstream-hang" else 150.0
-    static = ("rest", ("docs/rules",)) if case == "static-rest" else ("none", ())
-    discover = entry.checked_reads(worker, "discover", fixture.TARGET, ["PAT-001"], [], 5, 5, 3, None, 60, *static)
+    static = ("rest", ("docs/rules",)) if case in ("static-rest", "static-budget") else ("none", ())
+    budget = 58 if case == "static-budget" else 60
+    discover = entry.checked_reads(worker, "discover", fixture.TARGET, ["PAT-001"], [], 5, 5, 3, None, budget, *static)
     analysis_dir = candidate_inputs(out / "in-discover", {"analysis.json": fixture.ANALYSIS})
 
     def summary_of(run_dir, mode, kept, reads):

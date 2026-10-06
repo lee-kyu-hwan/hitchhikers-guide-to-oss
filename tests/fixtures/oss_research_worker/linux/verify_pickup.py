@@ -157,8 +157,13 @@ must be one object, and all of:
   requested directory or a .md file directly inside one; excerpts are one line of
   at most 200 characters, files at most 256 KiB, link lists at most 200, and no
   "content" key is kept; every contents request in the transport is a policy
-  path, README.md, a requested directory or a .md file directly inside one. A
-  default request must have no static fields in the output inputs;
+  path, README.md, a requested directory or a .md file directly inside one; the
+  output's static_reads section (#266) is exactly one entry for the repository
+  whose static_search holds to the same rules, kept even when the budget ended
+  before any record (or, unread, ref null with error repository-unavailable or
+  budget-exhausted and no files or hits), and equal to every record's
+  static_search. A default request must have no static fields in the output
+  inputs and no static_reads section;
 - the wrapper record and the upstream as in --collect (inner mode candidate-reads,
   its stage and status the run's).
 A value of the wrong JSON type fails the pickup (no traceback). Exit 0 only for a
@@ -776,15 +781,21 @@ def _keys(value) -> set:
     return set()
 
 
-def cr_static_record_problems(record: dict, directories: list) -> list:
-    """One discover record's REST static reads: the fixed paths, the caps, no file body."""
+# Why a static section entry (#266) holds no reads: the repository was not readable, or the budget ended first.
+CR_STATIC_UNREAD = ("repository-unavailable", "budget-exhausted")
+
+
+def cr_static_record_problems(record: dict, directories: list, who: str = "a record") -> list:
+    """One discover record's (or static section entry's) REST static reads: the fixed paths, the caps, no file body."""
     problems = []
     static = _dict(record.get("static_search"))
     head = record.get("head_sha")
+    unread = (who != "a record" and static.get("ref") is None and static.get("error") in CR_STATIC_UNREAD
+              and static.get("available") is False and static.get("files") == [] and static.get("hits") == [])
     if not (static.get("mode") == "rest-contents" and static.get("clone_sha") is None
-            and (static.get("ref") == head if isinstance(head, str)
-                 else static.get("ref") is None and static.get("error") == "head-unavailable")):
-        return ["a record's static reads are not the REST contents reads"]
+            and (unread or (static.get("ref") == head if isinstance(head, str)
+                            else static.get("ref") is None and static.get("error") == "head-unavailable"))):
+        return [f"{who}'s static reads are not the REST contents reads"]
     files, hits = static.get("files"), static.get("hits")
     files, hits = (files if isinstance(files, list) else [None]), (hits if isinstance(hits, list) else [None])
     listings = static.get("listings") if isinstance(static.get("listings"), list) else [None]
@@ -793,7 +804,7 @@ def cr_static_record_problems(record: dict, directories: list) -> list:
             and all(cr_static_path(_dict(f).get("path"), directories) for f in files + hits)
             and all(_dict(item).get("path") in directories for item in listings)
             and all(item in directories or cr_static_path(item, directories) for item in absent)):
-        problems.append("a record's static reads name a path outside the fixed rule")
+        problems.append(f"{who}'s static reads name a path outside the fixed rule")
     excerpts = [_dict(h).get("excerpt") for h in hits]
     links = [static.get("external_links"), static.get("unverified_links")]
     if not (all(isinstance(e, dict) and isinstance(e.get("text"), str) and len(e["text"]) <= CR_STATIC_EXCERPT_CHARS
@@ -801,7 +812,7 @@ def cr_static_record_problems(record: dict, directories: list) -> list:
             and all(type(_dict(f).get("size")) is int and _dict(f)["size"] <= CR_STATIC_MAX_FILE_BYTES for f in files)
             and all(isinstance(item, list) and len(item) <= CR_STATIC_MAX_LINKS for item in links)
             and "content" not in _keys(static)):
-        problems.append("a record's static evidence holds more than a one-line excerpt")
+        problems.append(f"{who}'s static evidence holds more than a one-line excerpt")
     return problems
 
 
@@ -1023,6 +1034,14 @@ def candidate_bindings(dest: Path, docs: dict, result: dict, host: dict) -> list
               "output static reads differ from the request")
         if directories is not None and isinstance(requests, list):
             problems += cr_contents_problems(requests, repository, directories)
+        # #266: a rest run keeps one static section entry for the repository apart from the records.
+        section = document.get("static_reads")
+        if directories is None:
+            check("static_reads" not in document, "output static section differs from the request")
+        elif check(isinstance(section, list) and len(section) == 1
+                   and _dict(section[0]).get("repository") == repository,
+                   "output static section differs from the request"):
+            problems += cr_static_record_problems(_dict(section[0]), directories, "the static section")
         records = document.get("records")
         if check(isinstance(records, list), "output has no record list") and usable:
             for item in records:
@@ -1031,6 +1050,9 @@ def candidate_bindings(dest: Path, docs: dict, result: dict, host: dict) -> list
                       "an output record is for another repository or pattern")
                 if directories is not None:
                     problems += [p for p in cr_static_record_problems(item, directories) if p not in problems]
+                    check(isinstance(section, list) and bool(section)
+                          and _dict(section[0]).get("static_search") == item.get("static_search"),
+                          "output static section differs from the records' static reads")
             check(len(records) <= request["max_candidates_per_repo"]
                   and len(records) <= request["max_candidates_total"],
                   "the output has more candidates than the caps")
