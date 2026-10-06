@@ -40,7 +40,8 @@ GENERATED_AT = "2026-09-28T00:00:00Z"
 # candidate. Their evidence is reproduced byte for byte under these; under run_limits.json's own limits their larger
 # answers are refused (README 3.1g).
 EARLIER_LIMITS = {"MAX_CANDIDATES": 5, "VERIFY_ANSWER_MAX_BYTES": 6144, "EXTRACT_ANSWER_MAX_BYTES": None,
-                  "CANDIDATE_MAX_BYTES": None}
+                  "CANDIDATE_MAX_BYTES": None, "VERIFY_ANSWER_TARGET_BYTES": None}
+# (No verify answer target: those runs' verify prompts did not state the verify answer size, #286.)
 
 
 # Stage output limits small enough for the fixture's prompts under a cap patched down to a few kilobytes.
@@ -847,8 +848,12 @@ class Run928InputTests(unittest.TestCase):
 
     All of that under the stage output limits the run was made under (EARLIER_LIMITS, #248). Under run_limits.json's
     own limits the extract inputs also state the answer size limit (pinned below), and two of the run's extract
-    answers (blind 11,571 and review 8,740 bytes) are over it, so synthesis-input refuses them; its verify and final
-    inputs are the same bytes as under the earlier limits."""
+    answers (blind 11,571 and review 8,740 bytes) are over it, so synthesis-input refuses them.
+
+    #286: finalize.md states that the strings of a final answer are not empty and that a search clue holds no control
+    character (FINAL_EMPTY_VALUE_CHANGES, taken back with the rest), and under run_limits.json the verify inputs state
+    the verify rules (evidence_checks not empty, the answer size limit as written and its target): with those rules
+    taken out they are the run's verify inputs byte for byte."""
 
     # The analyzer's extract prompt: the search clue sentence, the output sentence and the schema placeholder.
     CLUE_TEXT_CHANGES = (
@@ -861,6 +866,12 @@ class Run928InputTests(unittest.TestCase):
     )
     # finalize.md: the output sentence (the search clue rule is its own line, taken out whole).
     FINAL_CLUE_CHANGES = (("인용은 원문 그대로, `search_clues` 는 위 규칙의 검색 문자열로 둔다.", "인용은 원문 그대로 둔다."),)
+    # finalize.md (#286): the strings strict refuses when empty.
+    FINAL_EMPTY_VALUE_CHANGES = (
+        ('"limitations": [문자열]}` 이다(배열의 항목은 비어 있지 않은 문자열이다). 부분', '"limitations": [문자열]}` 이다. 부분'),
+        ("`extraction_ledger` 는 비어 있지 않은 한 줄 문자열이다.", "`extraction_ledger` 는 한 줄 문자열이다."),
+        ("문자열 배열이다(항목은 비어 있지 않은 문자열이다).", "문자열 배열이다."),
+    )
 
     @staticmethod
     def taken_back(data: bytes, changes) -> bytes:
@@ -888,8 +899,12 @@ class Run928InputTests(unittest.TestCase):
         "structure": "26c3c9e62d97ee463663e32eb6acc3f2a01d8c4aca28b44901b0efac9dae07d5",
     }
 
-    # sha256 of the bundle's final input for this run, with finalize.md's quote rule and search clue rule.
-    FINAL_SHA256 = "27f62a9de3b6fb5bb5c4dfece264d0bc780a5233669a7682740c7fc20309e2dc"
+    # sha256 of the bundle's final input for this run, with finalize.md's quote rule and search clue rule, and (#286)
+    # its empty value rules; and the same before #286.
+    FINAL_SHA256 = "bf49a9ea151e9b0549c3ac76ca982362f4f767ec8712835b9ac14a0855fed7fe"
+    FINAL_BEFORE_286_SHA256 = "27f62a9de3b6fb5bb5c4dfece264d0bc780a5233669a7682740c7fc20309e2dc"
+    # sha256 of the bundle's verify inputs for this run under run_limits.json, with the verify rules (#286).
+    VERIFY_SHA256 = {"verify-C1": "f7df2d67686b9fd80a32f1544aec315ca6c4ef942c8a273c252328e0d0adf963", "verify-C2": "050f3fd0aa113ec3aff19612c16a8fb30b05ca9a8610591635ad55ede3cddfd4", "verify-C3": "6d2eb618efeb5c343b98a05b299b9ca9593dfbdc5ea4d8b6ad1cffcd176c1351"}
 
     def setUp(self):
         self.root = Path(tempfile.mkdtemp())
@@ -947,8 +962,11 @@ class Run928InputTests(unittest.TestCase):
         self.assertEqual((1, 1), (len(rule), len(clue_rule)))
         self.assertEqual((self.analysis / "in-final/final/task.txt").read_bytes(), self.taken_back(
             built.replace(rule[0].encode("utf-8"), b"", 1).replace(clue_rule[0].encode("utf-8"), b"", 1),
-            self.FINAL_CLUE_CHANGES))
+            self.FINAL_CLUE_CHANGES + self.FINAL_EMPTY_VALUE_CHANGES))
         self.assertEqual(self.FINAL_SHA256, hashlib.sha256(built).hexdigest())
+        self.assertEqual(self.FINAL_BEFORE_286_SHA256, hashlib.sha256(self.taken_back(
+            built.replace(clue_rule[0].encode("utf-8"), clue_rule[0].replace("줄바꿈·탭 같은 제어 문자·", "줄바꿈·")
+                          .encode("utf-8"), 1), self.FINAL_EMPTY_VALUE_CHANGES)).hexdigest())
 
     # sha256 of the bundle's extract inputs for this run under run_limits.json: the count and the size rule (#248).
     SIZED_EXTRACT_SHA256 = {
@@ -986,9 +1004,14 @@ class Run928InputTests(unittest.TestCase):
         code, summary, stderr = stage("verify-inputs", "--run-dir", self.run, "--synthesis", synthesis, *extract,
                                       "--out", str(self.root / "verify"))
         self.assertEqual(code, 0, stderr)
+        rules = (prompts.VERIFY_RULES.format(answer_bytes=5120)
+                 + prompts.VERIFY_TARGET_RULE.format(target_bytes=4300)).encode("utf-8")
         for call in summary["calls"]:
-            self.same(self.root / "verify" / call["input_dir"] / "task.txt",
-                      self.analysis / "in-verify" / call["input_dir"] / "task.txt")
+            built = (self.root / "verify" / call["input_dir"] / "task.txt").read_bytes()
+            self.assertEqual(1, built.count(rules), call["input_dir"])
+            self.assertEqual((self.analysis / "in-verify" / call["input_dir"] / "task.txt").read_bytes(),
+                             built.replace(rules, b"", 1), call["input_dir"])
+            self.assertEqual(self.VERIFY_SHA256[call["input_dir"]], hashlib.sha256(built).hexdigest(), call["input_dir"])
         verify = [item for path in sorted(answers.glob("verify-*.result.json")) for item in ("--verify-result", str(path))]
         code, _, stderr = stage("final-input", "--run-dir", self.run, "--synthesis", synthesis, *extract, *verify,
                                 "--out", str(self.root / "final"))

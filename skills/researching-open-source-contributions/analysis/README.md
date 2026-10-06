@@ -9,8 +9,9 @@
 | `stage_inputs.py` | 단계 입력 생성(`extract-inputs`, `dry-plan`, `synthesis-input`, `synthesis-merge-input`, `continue-plan`, `verify-inputs`, `final-input`, `assess-inputs`)과 결정적 조립(`assemble`) |
 | `verify_e2e_result.py` | 모델 답 strict 검사와 채택(`--answer-kind extract|synthesis|verify|final|assess`) |
 | `assess_contract.py` | 판정 필드 타입 표(verifier record 검사와 동기화) |
+| `prompt_contract.py` | 지시문↔strict 동기화 표(#286): kind마다 strict가 거부하는 조건과 그 kind 지시문이 말하는 문장 |
 | `prompts/` | 종합·합침·최종·판정 지시문(상한은 `{{키}}`로 `run_limits.json`에서 채운다) |
-| `run_limits.json` | strict 상한, worker 선택값, 추출 답 크기 목표치, 한정 재시도 정책(`model_retry`) |
+| `run_limits.json` | strict 상한, worker 선택값, 추출·검증 답 크기 목표치, 한정 재시도 정책(`model_retry`) |
 | `retry_policy.py` | 한정 재시도 정책 하나(#280): call_plan의 재시도 몫, 재시도할 strict 판정 분류, 하네스의 재시도 허용(`admit`) |
 | `request.template.json` | workflow 요청 틀 |
 | `prepare_input.sh` | 수집 산출물 → blind 추출 입력 1개 |
@@ -69,6 +70,15 @@ for f in dot_agents/skills/researching-open-source-contributions/analysis/selfte
 | 남은 위험 | 남은 추출 5개는 기록된 prompt 바이트(목표 문장 없음)로 불러야 바이트 그대로 이어받으므로, `extract-blind-03`의 답 크기 위반은 목표 문장이 아니라 재시도 1회로만 흡수된다. 새 실행은 목표 문장이 든 prompt를 쓴다 |
 
 시험: `test_model_retry.py`(S1~S3: 재시도 후 채택·원장 2줄, 호출당·단계·계획 몫 소진 뒤 멈춤, transport·로그·결속·관측 모델·gate는 재시도 없음, 허용 거부 사례, 분리 판정 실행의 실제 판정 분류), `test_dry_plan.py`(S4: 21건 32회, 몫 때문에 넘는 계획 거부), `test_continue_plan.py`(부분 이어받기, 재시도 시도 결속, 분리 판정 실행 증거), `tests/test_oss_research_worker_linux.py`(원장: 몫 포함 한도, 몫 형식 거부, 부분 이어받기 계획 수용), 분석기 `tests/test_extraction.py`(목표 문장).
+
+## 지시문↔strict 동기화 (#286)
+
+strict가 답을 거부하는 이유는 모두 그 답의 지시문이 말한 규칙이어야 한다. 분리 판정 새 실행은 검증 첫 호출에서 이 계약 결함 2개로 멈췄다(지시문을 따른 목록 전용 반례의 빈 `pr`이 R5에 걸림, 지시문에 없는 검증 답 크기 5,120 B). 결정과 기록값은 `docs/research/oss-e2e-2026-09-28/README.md` 3.1h에 있다.
+
+- 목록에만 있는 PR의 반례는 `quote` 키 없는 `{"pr": "<목록의 키>", "reason": "…"}`다. 검증 scope의 `listed`가 그 키를 적고, R5가 인용 없는 반례를 그 키로만 받는다. 범위 밖 키, 빈 키는 여전히 FAIL이다.
+- 검증 지시문은 크기 상한 5,120 B(출력한 바이트 그대로)와 목표 4,300 B(`verify_answer_target_bytes`), 빈 `evidence_checks` 금지를 말한다. 검사 값은 그대로다.
+- `prompt_contract.py`(표)와 `test_prompt_contract.py`(시험): 표의 모든 줄이 그 kind의 모든 지시문에 있는지(S3), 변형한 답에서 strict가 내는 거부 문구가 모두 표에 있는지, 지시문대로 쓴 경계 답이 strict를 통과하는지(S4) 본다. strict에 거부를 더하면 표와 지시문도 함께 고쳐야 시험이 통과한다.
+- 분리 판정 새 실행 이어받기: `continue-plan`에 추출 stage와 run의 종합 답(`--synthesis-result .../synthesis.result.json`)을 주면, 그 stage에 묶인 원장에서 추출 답 15개와 종합 답을 바이트 그대로 결속하고 검증부터 계획한다. 검증 3 + 최종 1 + 재시도 몫 4 = 한도 8, 부모 22 + 8 = 30 ≤ 40. 검증 prompt는 `verify-inputs`가 새 지시문으로 다시 쓴다.
 
 ## 옛 경로 대응(#261)
 

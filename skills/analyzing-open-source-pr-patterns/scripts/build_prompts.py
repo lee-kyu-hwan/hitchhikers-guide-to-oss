@@ -6,7 +6,9 @@
            the answer's count limits in the rules, and --max-answer-bytes with them its
            size limit, and --answer-target-bytes below it the size to aim for; without
            them the bytes are as before)
-  verify   one prompt per merged candidate: OUT/prompts/verify-<id>.md
+  verify   one prompt per merged candidate: OUT/prompts/verify-<id>.md (--max-answer-bytes states the
+           answer's size limit, measured on the bytes as written, with the rule that evidence_checks is not empty,
+           and --answer-target-bytes below it the size to aim for; without them the bytes are as before)
 
 A prompt file is the whole input of one call, so any executor can run it: agy
 through dispatching-agy-workers, a tool-less sub-agent, or the coordinator
@@ -136,6 +138,26 @@ VERIFY_TAIL = """너는 반박 검증자다. 아래 후보 패턴 하나가 다�
 
 후보:"""
 
+# The rules the verify tail gains before its output form when the caller passes the answer size limit its checker
+# enforces (#286). The checker measures the answer's own bytes, whitespace included, so the rule asks for one line.
+VERIFY_RULES_ANCHOR = "\n출력: 설명·코드펜스 없이 JSON 객체 하나만 출력한다.\n{"
+VERIFY_RULES = (
+    "\n규칙:\n"
+    "- `evidence_checks` 는 인용된 PR 마다 하나씩 쓰고 비어 있으면 안 된다. 비어 있으면 답 전체가 거부된다.\n"
+    "- 답 크기 상한: 출력한 답 그대로의 바이트 수(UTF-8, 한글 한 글자는 3바이트, 공백·줄바꿈 포함)가 {answer_bytes} 바이트 "
+    "이하여야 한다. 넘으면 답 전체가 거부된다. 들여쓰기·줄바꿈 없이 한 줄로 출력하고, 넘칠 것 같으면 reason·"
+    "actionable_reason·revised_statement 를 짧게 써라. 인용(quote)은 원문 그대로 두고 자르지 마라.\n"
+)
+VERIFY_TARGET_RULE = "- 답 크기 목표: 상한에 여유를 두고 같은 측정으로 {target_bytes} 바이트 이하로 써라.\n"
+# A prompt that carries only the cited sections lists the other PRs by title; such a PR has no text to quote, so a
+# counterexample naming it is the one item without a quote (the checker keeps it to the listed keys, #286).
+LISTED_SCOPE = (
+    "PR 이 많아 후보가 인용한 PR 섹션만 싣고 나머지는 제목 목록만 싣는다. "
+    "목록에만 있는 PR 은 본문이 없어 인용할 수 없다. 그런 PR 이 반례로 의심되면 counterexamples 에 PR 하나마다 "
+    '`quote` 키 없이 `{"pr": "<목록의 키>", "reason": "…"}` 로 적는다(`pr` 은 목록의 키 그대로 쓰고 비우지 않는다). '
+    "섹션이 실린 PR 의 반례에는 인용을 붙인다. 목록에도 섹션에도 없는 키는 쓰지 마라. 어기면 답 전체가 거부된다."
+)
+
 
 class PromptError(ValueError):
     pass
@@ -220,6 +242,17 @@ def extract_tail(limits=None):
     return EXTRACT_TAIL.replace(COUNT_RULE_ANCHOR, COUNT_RULE_ANCHOR + rules, 1)
 
 
+def verify_tail(limits=None):
+    """VERIFY_TAIL, with the rules before its output form when limits hold answer_bytes, and the target rule after
+    them when they also hold target_bytes (#286)."""
+    if limits is None or limits.get("answer_bytes") is None:
+        return VERIFY_TAIL
+    rules = VERIFY_RULES.format(**limits)
+    if limits.get("target_bytes") is not None:
+        rules += VERIFY_TARGET_RULE.format(**limits)
+    return VERIFY_TAIL.replace(VERIFY_RULES_ANCHOR, rules + VERIFY_RULES_ANCHOR, 1)
+
+
 def extract(digest_dir, out_dir, lenses, limits=None):
     keymap = _load_keymap(digest_dir)
     unknown = [lens for lens in lenses if lens not in LENSES]
@@ -288,8 +321,9 @@ def _load_candidates(path, keymap):
     return candidates
 
 
-def verify(digest_dir, candidates_path, out_dir):
+def verify(digest_dir, candidates_path, out_dir, limits=None):
     keymap = _load_keymap(digest_dir)
+    tail = verify_tail(limits)
     candidates = _load_candidates(candidates_path, keymap)
     prompts = _prepare(out_dir, "verify")
     shards = {name: _read_shard(digest_dir, name) for name in keymap["shards"]}
@@ -313,15 +347,12 @@ def verify(digest_dir, candidates_path, out_dir):
             material = "\n\n".join(sections[key].rstrip() for key in cited)
             if index:
                 material += "\n\n### 나머지 PR 목록 (본문 없음, 반례 후보를 가리킬 때만 쓴다)\n" + index
-            scope = (
-                "PR 이 많아 후보가 인용한 PR 섹션만 싣고 나머지는 제목 목록만 싣는다. "
-                "목록에만 있는 PR 은 인용할 수 없으니 반례로 의심되면 counterexamples 의 reason 에 키만 적어라."
-            )
+            scope = LISTED_SCOPE
         prompt = (
             _head(keymap, all_keys, scope)
             + material
             + "\n=== 다이제스트 끝 ===\n\n"
-            + VERIFY_TAIL
+            + tail
             + "\n"
             + json.dumps(candidate, ensure_ascii=False, indent=1)
             + "\n"
@@ -359,6 +390,12 @@ def main(argv=None):
     verify_parser.add_argument("--digest-dir", required=True, help="build_digest.py --out directory")
     verify_parser.add_argument("--candidates", required=True, help='JSON array of {"id", "statement", "cited_prs"}')
     verify_parser.add_argument("--out", required=True, help="run directory, not the extract one; prompts/ and results/ go under it")
+    verify_parser.add_argument(
+        "--max-answer-bytes", type=_positive, help="size limit of the answer, its bytes as written (UTF-8, whitespace included)"
+    )
+    verify_parser.add_argument(
+        "--answer-target-bytes", type=_positive, help="size to aim for, under --max-answer-bytes (the same measure)"
+    )
     args = parser.parse_args(argv)
     if args.command == "extract":
         limits = {kind: getattr(args, "max_" + kind) for kind in ("patterns", "observations", "rejected")}
@@ -372,11 +409,16 @@ def main(argv=None):
                                                      or args.answer_target_bytes >= args.max_answer_bytes):
             extract_parser.error("--answer-target-bytes needs --max-answer-bytes and must be below it")
         limits["target_bytes"] = args.answer_target_bytes
+    else:
+        if args.answer_target_bytes is not None and (args.max_answer_bytes is None
+                                                     or args.answer_target_bytes >= args.max_answer_bytes):
+            verify_parser.error("--answer-target-bytes needs --max-answer-bytes and must be below it")
+        limits = {"answer_bytes": args.max_answer_bytes, "target_bytes": args.answer_target_bytes}
     try:
         if args.command == "extract":
             written = extract(args.digest_dir, args.out, args.lens or list(LENSES), limits if all(given) else None)
         else:
-            written = verify(args.digest_dir, args.candidates, args.out)
+            written = verify(args.digest_dir, args.candidates, args.out, limits)
     except PromptError as error:
         print(str(error), file=sys.stderr)
         return 2

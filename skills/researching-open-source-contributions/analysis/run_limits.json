@@ -21,6 +21,7 @@
   "extract_answer_target_bytes": 6500,
   "candidate_statement_max_chars": 600,
   "verify_answer_max_bytes": 5120,
+  "verify_answer_target_bytes": 4300,
   "final_dynamic_reserve_bytes": 8192,
   "model_retry": {
     "per_call": 1,

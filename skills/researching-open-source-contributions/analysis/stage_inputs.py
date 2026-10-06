@@ -144,6 +144,8 @@ MAX_MODEL_CALLS = model_call_plan(1, EXTRACT_CALLS, MAX_CANDIDATES)["max_model_c
 # call; a prompt over PROMPT_MAX_BYTES is refused, never cut.
 STATEMENT_MAX_CHARS = LIMITS["candidate_statement_max_chars"]
 VERIFY_ANSWER_MAX_BYTES = LIMITS["verify_answer_max_bytes"]
+# What the verify prompt asks for, under that limit (#286): the check is the answer's own bytes as written.
+VERIFY_ANSWER_TARGET_BYTES = LIMITS["verify_answer_target_bytes"]
 FINAL_RESERVE_BYTES = LIMITS["final_dynamic_reserve_bytes"]
 # A verify answer adds its own block and, at most, its quotes again in the
 # report; the smallest block a verify answer can leave is about this size.
@@ -210,6 +212,19 @@ def extract_limit_args(target=IN_FORCE) -> list[str]:
         limits += ["--max-answer-bytes", str(EXTRACT_ANSWER_MAX_BYTES)]
     if answer_target(target) is not None:
         limits += ["--answer-target-bytes", str(answer_target(target))]
+    return limits
+
+
+def verify_limit_args() -> list[str]:
+    """The analyzer's verify options for the limits in force (#286): the answer size limit strict checks (the answer's
+    bytes as written), with the rule that evidence_checks is not empty, and the target under it. A cap set from before
+    them (no verify target: the tests' EARLIER_LIMITS) was asked without them, so its verify prompts stay the bytes
+    they were; a target at or over the limit is left out."""
+    if VERIFY_ANSWER_MAX_BYTES is None or VERIFY_ANSWER_TARGET_BYTES is None:
+        return []
+    limits = ["--max-answer-bytes", str(VERIFY_ANSWER_MAX_BYTES)]
+    if VERIFY_ANSWER_TARGET_BYTES < VERIFY_ANSWER_MAX_BYTES:
+        limits += ["--answer-target-bytes", str(VERIFY_ANSWER_TARGET_BYTES)]
     return limits
 
 
@@ -428,7 +443,7 @@ def output_limits() -> dict:
     """The stage output limits in force (module constants, read when used)."""
     return {"synthesis_max_candidates": MAX_CANDIDATES, "max_rejected": MAX_DROPPED, "max_patterns": MAX_FINAL_PATTERNS,
             "candidate_max_bytes": CANDIDATE_MAX_BYTES, "extract_answer_max_bytes": EXTRACT_ANSWER_MAX_BYTES,
-            "verify_answer_max_bytes": VERIFY_ANSWER_MAX_BYTES}
+            "verify_answer_max_bytes": VERIFY_ANSWER_MAX_BYTES, "candidate_statement_max_chars": STATEMENT_MAX_CHARS}
 
 
 def render_limits(text: str) -> str:
@@ -939,7 +954,7 @@ def worst_verify_bytes(context: Context, keymap: dict, digest_dir: Path, reduced
         (Path(tmp) / "candidates.json").write_text(json.dumps([candidate], ensure_ascii=False), encoding="utf-8")
         code, _, stderr = context.wf.run_main(context.siblings.build_prompts.main, [
             "verify", "--digest-dir", str(digest_dir), "--candidates", str(Path(tmp) / "candidates.json"),
-            "--out", str(Path(tmp) / "build")])
+            "--out", str(Path(tmp) / "build"), *verify_limit_args()])
         if code != 0:
             raise StageError("build_prompts verify failed: " + stderr.strip())
         return len((Path(tmp) / "build" / "prompts" / ("verify-" + WIDE_ID + ".md")).read_bytes())
@@ -1154,10 +1169,16 @@ def subset_report(report: dict, names: list[str]) -> dict:
     return {"totals": totals, "files": files, "verified_evidence": compact["verified_evidence"]}
 
 
-def write_scope(out: Path, name: str, keys: list[str], quotes: list[dict] | None = None) -> None:
+def write_scope(out: Path, name: str, keys: list[str], quotes: list[dict] | None = None,
+                listed: list[str] | None = None) -> None:
+    """The input-scope.json strict checks an answer against (R5): the keys whose text the input held, the quotes a
+    final may use, and the keys a verify prompt listed by title only (#286: a counterexample may name one of those
+    without a quote)."""
     document = {"keys": sorted(keys)}
     if quotes is not None:
         document["quotes"] = quotes
+    if listed is not None:
+        document["listed"] = sorted(listed)
     write_json(out / (name + ".scope.json"), document)
 
 
@@ -1638,14 +1659,9 @@ def continue_chain_plan(context: Context, args, data: bytes, recorded: dict) -> 
         raise StageError("the continue stage.json records no list of reduce answers")
     candidates = parse_synthesis(context, args.synthesis_result)
     reduce_answers = [adopted_reduce_answer("synthesis", args.synthesis_result, ledgers, adopted)]
-    ids, verified = [candidate["id"] for candidate in candidates], []
-    for path in args.verify_result:
-        document = read_json(Path(path), ANSWER_MAX_BYTES, "verify result")
-        answer_id = document.get("id") if isinstance(document, dict) else None
-        if answer_id not in ids or answer_id in verified or Path(path).name != "verify-%s.result.json" % answer_id:
-            raise StageError("%s is not the verify answer of one synthesis candidate" % Path(path).name)
-        verified.append(answer_id)
-        reduce_answers.append(adopted_reduce_answer("verify", path, ledgers, adopted))
+    ids = [candidate["id"] for candidate in candidates]
+    verified, bound_verify = verify_answers_of(args, candidates, ledgers, adopted)
+    reduce_answers += bound_verify
     verify = len(ids) - len(verified)
     share = retry_policy.retry_share({"extract": 0, "synthesis": 0, "verify": verify, "final": 1})
     total = verify + 1 + share["total"]
@@ -1665,6 +1681,72 @@ def continue_chain_plan(context: Context, args, data: bytes, recorded: dict) -> 
     out = new_directory(args.out)
     summary = {"stage": "continue", "mode": context.mode, "answers": sorted(answers, key=lambda item: item["stem"]),
                "reduce_answers": reduce_answers,
+               "max_model_calls": total, "call_plan": plan, "final_projection_bytes": projected}
+    write_json(out / "stage.json", summary)
+    return summary
+
+
+# A synthesis-stage call of a ledger: a group, a merge of a level, or the run's synthesis (first attempts; a retry is
+# <call>-r<n>).
+SYNTHESIS_CALL = re.compile(r"synthesis(?:-\d{2})?|merge-\d{2}-\d{2}")
+
+
+def verify_answers_of(args, candidates: list, ledgers: list, recorded: list) -> tuple[list, list]:
+    """The adopted verify answers given (--verify-result), each the answer of one synthesis candidate bound to a ledger
+    (adopted_reduce_answer). Returns (candidate ids answered, their reduce answers)."""
+    ids, verified, bound = [candidate["id"] for candidate in candidates], [], []
+    for path in args.verify_result:
+        document = read_json(Path(path), ANSWER_MAX_BYTES, "verify result")
+        answer_id = document.get("id") if isinstance(document, dict) else None
+        if answer_id not in ids or answer_id in verified or Path(path).name != "verify-%s.result.json" % answer_id:
+            raise StageError("%s is not the verify answer of one synthesis candidate" % Path(path).name)
+        verified.append(answer_id)
+        bound.append(adopted_reduce_answer("verify", path, ledgers, recorded))
+    return verified, bound
+
+
+def reduce_continue_plan(context: Context, args, data: bytes, prompts: dict) -> dict:
+    """continue-plan on an extract stage whose ledger went on past the extract calls (#286: the split gate fresh run
+    adopted its 15 extract answers, 3 group answers and the merge answer, then stopped at its first verify call). Every
+    extract answer is bound to the prompt the stage recorded (adopted_extract_answer), and the run's synthesis answer
+    (``synthesis.result.json``, the last merge) and any adopted verify answer to the parent ledger
+    (adopted_reduce_answer; that ledger is bound to this extract stage and continues none). The new plan holds the
+    verify calls of the candidates without an adopted answer and the final, with their retry share. Its verify prompts
+    are written again by verify-inputs, under the prompts in force (the ones the parent ledger called are not reused)."""
+    if Path(args.synthesis_result).name != "synthesis.result.json":
+        raise StageError("the synthesis answer to continue from is the run's own (synthesis.result.json), not %s"
+                         % Path(args.synthesis_result).name)
+    stems, results, report, projected = checked_extract_answers(context, args.extract_result, "continue-plan")
+    records = Path(args.records)
+    answers = [adopted_extract_answer(context, stem, results[stem][0], prompts[stem], records) for stem in stems]
+    bound = read_json(records / "ledger-limit.json", ANSWER_MAX_BYTES, "parent ledger limit")
+    if not isinstance(bound, dict) or bound.get("call_plan_sha256") != hashlib.sha256(data).hexdigest() \
+            or "parent" in bound:
+        raise StageError("the records are not a ledger bound to this extract stage")
+    ledgers = [(records, ledger_lines(records, "parent ledger"))]
+    candidates = parse_synthesis(context, args.synthesis_result)
+    reduce_answers = [adopted_reduce_answer("synthesis", args.synthesis_result, ledgers, [])]
+    verified, bound_verify = verify_answers_of(args, candidates, ledgers, [])
+    reduce_answers += bound_verify
+    synthesis_calls = sorted({line.get("name") for line in ledgers[0][1] if line.get("kind") == "token"
+                              and line.get("status") == "succeeded" and isinstance(line.get("name"), str)
+                              and SYNTHESIS_CALL.fullmatch(line["name"])})
+    verify = len(candidates) - len(verified)
+    share = retry_policy.retry_share({"extract": 0, "synthesis": 0, "verify": verify, "final": 1})
+    total = verify + 1 + share["total"]
+    plan = {"mode": context.mode,
+            "continues": {"extract_stage_sha256": hashlib.sha256(data).hexdigest(),
+                          "completed": {"extract": len(stems), "synthesis": len(synthesis_calls),
+                                        "verify": len(verified)}},
+            "shards": context.shards, "lenses": len(context.siblings.build_prompts.LENSES), "extract": 0,
+            "synthesis": 0, "verify": verify, "final": 1, "retry": share, "max_model_calls": total,
+            "formula": "%d extract and %d synthesis calls done, %d of %d verify answers adopted; %d (verify) + 1 "
+                       "(final) + %d (retry share) = %d"
+                       % (len(stems), len(synthesis_calls), len(verified), len(candidates), verify, share["total"],
+                          total),
+            "inputs": {"max_candidates": MAX_CANDIDATES, "candidates": len(candidates), "limits": output_limits()}}
+    out = new_directory(args.out)
+    summary = {"stage": "continue", "mode": context.mode, "answers": answers, "reduce_answers": reduce_answers,
                "max_model_calls": total, "call_plan": plan, "final_projection_bytes": projected}
     write_json(out / "stage.json", summary)
     return summary
@@ -1730,9 +1812,10 @@ def cmd_continue_plan(context: Context, args) -> dict:
             return continue_chain_plan(context, args, data, recorded)
         if not isinstance(recorded, dict) or recorded.get("stage") != "extract":
             raise StageError("that stage.json is not an extract stage (nor a continue stage)")
-        if args.synthesis_result or args.verify_result or args.ancestor_records:
-            raise StageError("adopted synthesis and verify answers (and ancestor records) are taken only with a "
-                             "continue stage")
+        if args.ancestor_records:
+            raise StageError("ancestor records are taken only with a continue stage")
+        if args.verify_result and not args.synthesis_result:
+            raise StageError("adopted verify answers are taken only with the synthesis answer they verify")
         calls = recorded.get("calls")
         if not isinstance(calls, list) or not all(isinstance(call, dict) and isinstance(call.get("input_dir"), str)
                                                   and isinstance(call.get("sha256"), str) for call in calls):
@@ -1753,6 +1836,12 @@ def cmd_continue_plan(context: Context, args) -> dict:
     except StageError as error:
         raise StageError("continue-plan: %s" % error) from error
     given = [Path(path).name[: -len(".result.json")] for path in args.extract_result]
+    if args.synthesis_result:
+        # the parent ledger adopted every extract answer and the synthesis too (#286)
+        try:
+            return reduce_continue_plan(context, args, data, prompts)
+        except StageError as error:
+            raise StageError("continue-plan: %s" % error) from error
     if (all(Path(path).name.endswith(".result.json") for path in args.extract_result)
             and len(set(given)) == len(given) and set(given) < set(prompts)):
         return partial_continue_plan(context, args, data, prompts, sorted(given))
@@ -1814,7 +1903,7 @@ def verify_prompt(context: Context, candidate: dict, keymap: dict | None = None,
         (Path(tmp) / "candidates.json").write_text(json.dumps([candidate], ensure_ascii=False), encoding="utf-8")
         code, _, stderr = context.wf.run_main(context.siblings.build_prompts.main, [
             "verify", "--digest-dir", str(directory), "--candidates", str(Path(tmp) / "candidates.json"),
-            "--out", str(Path(tmp) / "build")])
+            "--out", str(Path(tmp) / "build"), *verify_limit_args()])
         if code != 0:
             raise StageError("build_prompts verify failed: " + stderr.strip())
         return (Path(tmp) / "build" / "prompts" / ("verify-" + candidate["id"] + ".md")).read_text(encoding="utf-8")
@@ -1846,7 +1935,7 @@ def reduced_verify_inputs(context: Context, args, candidates: list, budget: dict
         total = len(set(candidate["cited_prs"]))
         entry.update(result_name=stem + ".result.json", cited_total=total, cited_included=len(included),
                      trimmed=len(included) < total)
-        write_scope(out, stem, included)
+        write_scope(out, stem, included, listed=[key for key in context.keymap["sections"] if key not in included])
         written.append(entry)
     summary = {"stage": "verify", "mode": context.mode, "candidates": len(candidates), "calls": written,
                "final_budget": budget,
@@ -1883,7 +1972,7 @@ def cmd_verify_inputs(context: Context, args) -> dict:
     if candidates:
         code, _, stderr = context.wf.run_main(context.siblings.build_prompts.main, [
             "verify", "--digest-dir", str(context.digest_dir), "--candidates", str(out / "candidates.json"),
-            "--out", str(out / "build")])
+            "--out", str(out / "build"), *verify_limit_args()])
         if code != 0:
             raise StageError("build_prompts verify failed: " + stderr.strip())
         for candidate in candidates:
@@ -2141,6 +2230,13 @@ def load_assess_contract():
     return module
 
 
+def assess_instructions(vc) -> str:
+    """The assess prompt before its input blocks: assess.md with every field's type from the one table the strict
+    check uses (assess_contract, #266)."""
+    text = read_bounded(PROMPTS / "assess.md", PROMPT_MAX_BYTES, "assess template").decode("utf-8")
+    return text.replace("{{assessment_field_types}}", load_assess_contract().prompt_lines(vc))
+
+
 def load_verifier(skills_root: str | None):
     """The candidate verifier, resolved like the workflow resolves its siblings (never from input data)."""
     wf = load_workflow()
@@ -2304,9 +2400,7 @@ def cmd_assess_inputs(args) -> dict:
             links.append(entry["source_url"])
     links = sorted(set(links))
 
-    text = read_bounded(PROMPTS / "assess.md", PROMPT_MAX_BYTES, "assess template").decode("utf-8")
-    # every field's type from the one table the strict check uses (assess_contract, #266)
-    text = text.replace("{{assessment_field_types}}", load_assess_contract().prompt_lines(vc))
+    text = assess_instructions(vc)
     text += block("판정 단위", {"discovery_sha256": discovery_sha, "combinations": combinations,
                               "max_assessments": ASSESS_MAX_ASSESSMENTS,
                               "not_assessable": [{"section": section, "pattern_id": item.get("pattern_id"),
@@ -2388,9 +2482,12 @@ def build_parser() -> argparse.ArgumentParser:
     resume.add_argument("--records", required=True,
                         help="directory with <stem>/verdict.json (strict) and <stem>/result/manifest.json per call "
                              "(for a continue stage: the parent ledger directory, with ledger.jsonl)")
-    resume.add_argument("--synthesis-result", help="continue stage only: the adopted synthesis (or merge) answer")
+    resume.add_argument("--synthesis-result",
+                        help="the adopted synthesis (or merge) answer: of a continue stage's ledger, or (#286) the "
+                             "run's synthesis.result.json the ledger of an extract stage adopted after every extract "
+                             "answer")
     resume.add_argument("--verify-result", action="append", default=[],
-                        help="continue stage only: the adopted verify answers (verify-<id>.result.json)")
+                        help="with --synthesis-result: the adopted verify answers (verify-<id>.result.json)")
     resume.add_argument("--ancestor-records", action="append", default=[],
                         help="continue stage only: the ancestor ledger directories of --records, nearest first "
                              "(each the parent its successor's ledger-limit.json records), where the adopted "

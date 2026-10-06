@@ -69,6 +69,8 @@ Read every result's patterns, observations, and rejected ideas together with the
 
 `build_prompts.py verify --digest-dir DIR --candidates candidates.json --out RUN/verify` writes one prompt per candidate into `RUN/verify/prompts/`. Run each as a new independent call into `RUN/verify/results/` and check those results again. The verifier looks for counterexamples in the uncited PRs, counts distinct PRs and repositories, judges whether the candidate points to a defect class that can find contributions elsewhere, and grades confidence.
 
+When the digest is sharded, a verify prompt carries only the cited PRs' sections and lists the other PRs by title. A listed PR has no text to quote, so a counterexample naming it is written without a quote, `{"pr": "<listed key>", "reason": "..."}`; a counterexample of a PR whose section the prompt holds carries a verbatim quote like every other item (#286). `check_extraction.py` checks only objects with both `pr` and `quote`, so such an item is not a quote and is not counted. When the answers are checked against a size limit, pass `--max-answer-bytes N` (and optionally `--answer-target-bytes T`, T < N): the prompt then states, before its output form, that `evidence_checks` is not empty, that the answer's own bytes as written (UTF-8, whitespace included) must be at most N, written on one line without indentation, and that it should aim for T in the same measure. Without the options the verify prompt bytes are what they always were.
+
 ## Acceptance
 
 A candidate becomes a `PAT-*` only when all of these hold:

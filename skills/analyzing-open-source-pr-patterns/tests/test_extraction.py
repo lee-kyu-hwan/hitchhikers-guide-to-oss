@@ -520,6 +520,50 @@ class BuildPromptsTests(ExtractionTestCase):
         self.assertIn("- plugin-a#11 — Change 11 (merged)", text)
         self.assertNotIn("Bump a dependency", text)
         self.assertIn('"id": "C1"', text)
+        # a listed PR has no text to quote: its counterexample is the one item without a quote (#286)
+        self.assertIn('`quote` 키 없이 `{"pr": "<목록의 키>", "reason": "…"}` 로 적는다', text)
+        self.assertNotIn("reason 에 키만 적어라", text)
+
+    def verify_prompts(self, *limits):
+        self.assertEqual(self.build_digest("--max-bytes", "1100").returncode, 0)
+        candidates = write_json(self.directory / "candidates.json",
+                                [{"id": "C1", "statement": "s", "cited_prs": ["plugin-a#10", "plugin-b#20"]}])
+        out = self.directory / ("verify-%d" % len(list(self.directory.glob("verify-*"))))
+        result = run_script("build_prompts.py", "verify", "--digest-dir", self.digest_dir, "--candidates", candidates,
+                            "--out", out, *limits)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return (out / "prompts" / "verify-C1.md").read_text(encoding="utf-8")
+
+    def test_verify_with_an_answer_size_limit_states_the_rules_before_the_output_form_and_changes_nothing_else(self):
+        plain = self.verify_prompts()
+        sized = self.verify_prompts("--max-answer-bytes", "5120")
+        targeted = self.verify_prompts("--max-answer-bytes", "5120", "--answer-target-bytes", "4300")
+        sys.dont_write_bytecode = True
+        sys.path.insert(0, str(SCRIPTS))
+        import build_prompts
+        rules = build_prompts.VERIFY_RULES.format(answer_bytes=5120)
+        target = build_prompts.VERIFY_TARGET_RULE.format(target_bytes=4300)
+        self.assertNotIn("답 크기", plain)
+        self.assertEqual(plain, sized.replace(rules, "", 1))
+        self.assertEqual(sized, targeted.replace(target, "", 1))
+        self.assertIn(rules + target + "\n출력: 설명·코드펜스 없이 JSON 객체 하나만 출력한다.\n{", targeted)
+        self.assertIn("출력한 답 그대로의 바이트 수(UTF-8, 한글 한 글자는 3바이트, 공백·줄바꿈 포함)가 5120 바이트 이하여야 한다",
+                      targeted)
+        self.assertIn("들여쓰기·줄바꿈 없이 한 줄로 출력하고", targeted)
+        self.assertIn("4300 바이트 이하로 써라", targeted)
+        self.assertIn("`evidence_checks` 는 인용된 PR 마다 하나씩 쓰고 비어 있으면 안 된다", targeted)
+
+    def test_verify_refuses_a_size_target_without_the_size_limit_or_not_under_it(self):
+        self.assertEqual(self.build_digest().returncode, 0)
+        for case in [("--answer-target-bytes", "4300"), ("--max-answer-bytes", "5120", "--answer-target-bytes", "5120"),
+                     ("--max-answer-bytes", "0")]:
+            with self.subTest(case=case):
+                run = self.directory / "refused"
+                result = run_script("build_prompts.py", "verify", "--digest-dir", self.digest_dir, "--candidates",
+                                    "c.json", "--out", run, *case)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertNotIn("Traceback", result.stderr)
+                self.assertFalse((run / "prompts").exists())
 
 
 class CheckExtractionTests(ExtractionTestCase):

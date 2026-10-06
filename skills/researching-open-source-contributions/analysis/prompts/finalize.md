@@ -10,7 +10,7 @@ PR 별 판단(`records`, 아래 PR 목록의 모든 `pr_id` 를 정확히 한 �
 - `test_evidence` 는 위와 같은 claim 객체의 배열이다. 작성자의 테스트 실행 보고는 보고일 뿐이므로 `basis` 는 `inference` 를 넘지 않는다. 없으면 빈 배열이다.
 - `pattern_ids` 는 이 PR 이 근거인 채택 패턴의 id 만 쓴다. 근거가 아니면 빈 배열이다.
 - `provenance_mode` 는 `independent-reimplementation` 이다.
-- `confidence` 는 `{"level": "high | medium | low", "evidence": [문자열], "limitations": [문자열]}` 이다. 부분 수집된 근거가 있으면 `high` 가 될 수 없다.
+- `confidence` 는 `{"level": "high | medium | low", "evidence": [문자열], "limitations": [문자열]}` 이다(배열의 항목은 비어 있지 않은 문자열이다). 부분 수집된 근거가 있으면 `high` 가 될 수 없다.
 
 패턴 채택(`patterns`). 후보는 아래 조건을 **모두** 만족할 때만 패턴이 된다:
 - 반박 검증의 `verdict` 가 `supported` 또는 `weak` 이고 `actionable` 이 true 다. `weak` 는 confidence `low` 이고 그 한계를 `confidence.limitations` 에 적는다.
@@ -24,14 +24,14 @@ PR 별 판단(`records`, 아래 PR 목록의 모든 `pr_id` 를 정확히 한 �
 - `confidence.evidence` 에는 근거 PR 마다 `PR-001 "<확인된 인용 그대로>"` 형태의 항목을 하나 이상 넣는다. 인용은 `verified_evidence` 에서 글자 그대로 복사한다. 근거 PR 이 아닌 PR 은 인용하지 마라.
 - 인용 안의 큰따옴표 `"` 와 백슬래시 `\` 는 원문 글자 그대로다(다이제스트에 보이는 글자). 인용 확인 보고서·후보·반박 검증 같은 JSON 블록에 보이는 `\"`·`\\` 는 JSON 표기일 뿐 원문 글자가 아니므로 인용에 옮기지 마라. 출력도 JSON 이므로 JSON 문자열 규칙대로 한 번만 이스케이프한다. 예: 원문이 `set the "strict" option` 이면 출력 JSON 에는 `"PR-001 \"set the \"strict\" option\""` 로 쓴다(디코드하면 `PR-001 "set the "strict" option"`). `\\\"strict\\\"` 처럼 백슬래시를 인용 글자로 남기면 그 인용은 원문과 달라 답 전체가 거부된다.
 - `applicability`, `counterconditions`, `search_clues`, `expected_tests`, `maintainer_judgment_required` 는 문자열 배열이다.
-- `search_clues` 는 대상 저장소에서 GitHub 검색(`repo:<저장소> "<단서>"` 꼴의 이슈·PR·코드 검색)에 그대로 넣을 짧은 문자열이다: 파일 경로 조각, 헤딩·코드 토큰, 도메인, 정확한 영어 문구(예: `## Options`, `further_reading`, `npm install eslint`, `kangax.github.io`). 설명 문장·한국어를 쓰지 않는다. 한 항목은 1~200자이고 큰따옴표·백슬래시·줄바꿈·앞뒤 공백이 없다. 앞의 5개만 검색에 쓰인다. 어기면 답 전체가 거부된다.
+- `search_clues` 는 대상 저장소에서 GitHub 검색(`repo:<저장소> "<단서>"` 꼴의 이슈·PR·코드 검색)에 그대로 넣을 짧은 문자열이다: 파일 경로 조각, 헤딩·코드 토큰, 도메인, 정확한 영어 문구(예: `## Options`, `further_reading`, `npm install eslint`, `kangax.github.io`). 설명 문장·한국어를 쓰지 않는다. 한 항목은 1~200자이고 큰따옴표·백슬래시·줄바꿈·탭 같은 제어 문자·앞뒤 공백이 없다. 앞의 5개만 검색에 쓰인다. 어기면 답 전체가 거부된다.
 - `provenance_mode` 는 `independent-reimplementation` 이다.
 - **채택할 후보가 없으면 `patterns` 는 빈 배열이다. 이것은 정상 결과다.**
-- `patterns` 는 최대 5개다. 넘으면 답 전체가 거부된다.
+- `patterns` 는 최대 {{max_patterns}}개다. 넘으면 답 전체가 거부된다.
 
-`extraction_ledger` 는 한 줄 문자열이다. `pattern-extraction: ` 접두어는 쓰지 마라(호스트가 붙인다). 다이제스트 크기와 조각 수, 관점, 실행자, 인용 확인 수(추출·검증), 후보, 채택(`C1→PAT-001`), 채택하지 않은 후보와 이유를 적는다.
+`extraction_ledger` 는 비어 있지 않은 한 줄 문자열이다. `pattern-extraction: ` 접두어는 쓰지 마라(호스트가 붙인다). 다이제스트 크기와 조각 수, 관점, 실행자, 인용 확인 수(추출·검증), 후보, 채택(`C1→PAT-001`), 채택하지 않은 후보와 이유를 적는다.
 
-`limitations` 는 이번 분석의 한계를 적은 문자열 배열이다. `pattern-extraction: ` 로 시작하는 항목은 넣지 마라.
+`limitations` 는 이번 분석의 한계를 적은 문자열 배열이다(항목은 비어 있지 않은 문자열이다). `pattern-extraction: ` 로 시작하는 항목은 넣지 마라.
 
 출력: 설명·코드펜스 없이 아래 형태의 JSON 객체 하나만 출력한다. 문자열 값은 한국어로 쓰되 인용은 원문 그대로, `search_clues` 는 위 규칙의 검색 문자열로 둔다.
 {

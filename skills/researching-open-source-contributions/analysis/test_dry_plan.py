@@ -507,7 +507,8 @@ class PeriodCorpusPlanTests(unittest.TestCase):
         self.assertFalse(plan["ok"])
         self.assertEqual((49, 6, 69), (plan["records"], plan["call_plan"]["shards"], plan["total_calls"]))
         self.assertEqual([15, 8, 4, 2, 1], plan["synthesis_levels"])
-        self.assertEqual(["final: 75854 bytes at the limits (> 65536)",
+        # 75,854 before #286 (finalize-reduced.md's empty value rules and the clue's control characters: +153 bytes)
+        self.assertEqual(["final: 76007 bytes at the limits (> 65536)",
                           "calls: 69 model calls at the limits (64 planned + 5 retry share), over the absolute cap 40"],
                          plan["refusals"])
         self.assertEqual([(["eslint/css", "eslint/eslint", "eslint/markdown"], 28, [7, 3, 1], 40, True),

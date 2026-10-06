@@ -24,10 +24,13 @@ for every kind. What differs is R3 (the kind's answer shape) and Q1 (quotes):
 --input-scope FILE binds a synthesis, verify or final answer to what its input
 held, for a stage built from extraction answers instead of the whole digest
 (stage_inputs.py writes input-scope.json next to such a prompt): {"keys": [digest
-keys the input held], "quotes": [{"pr": key, "quote": text}] (final only)}. A
-synthesis answer may cite only those keys, a verify answer may only name those PRs,
-and every pattern quote of a final answer must be one of the listed pairs, exactly.
-This only adds a check (item R5); the corpus checks stay. Without it nothing changes.
+keys the input held], "quotes": [{"pr": key, "quote": text}] (final only), "listed":
+[keys a verify prompt listed by title only] (verify only)}. A synthesis answer may
+cite only those keys, a verify answer may only quote those PRs (and name a listed PR
+only as a counterexample without a quote, #286), and every pattern quote of a final
+answer must be one of the listed pairs, exactly. This only adds a check (item R5);
+the corpus checks stay. Without it nothing changes, and a verify answer then has no
+list: every counterexample carries a quote.
 
 An assess answer (#259) is the candidate verifier's assessment document for the combinations of one discovery
 (stage_inputs.py assess-inputs). It has no corpus and no quote: C1 reads --discovery (its sha256 must be the scope's),
@@ -220,7 +223,8 @@ def schema_problems(answer: object, limits: dict, lens: str) -> list:
             continue
         for e_index, item in enumerate(evidence):
             if not (isinstance(item, dict) and isinstance(item.get("pr"), str) and isinstance(item.get("quote"), str)
-                    and item.get("role") in ROLES and isinstance(item.get("claim"), str)):
+                    and isinstance(item.get("role"), str) and item["role"] in ROLES  # a list role is a FAIL, not a crash
+                    and isinstance(item.get("claim"), str)):
                 problems.append("%s.evidence[%d] needs pr, quote, claim (strings) and role in %s"
                                 % (where, e_index, sorted(ROLES)))
     for index, item in enumerate(answer["observations"]):
@@ -257,7 +261,8 @@ def synthesis_problems(answer: object, limits: dict, keys: dict) -> list:
             continue
         if not isinstance(item["id"], str) or re.fullmatch(r"C[1-9][0-9]?", item["id"]) is None or item["id"] in seen:
             problems.append(where + ".id must be a unique C1 … C99")
-        seen.add(item.get("id"))
+        if isinstance(item["id"], str):     # a list id is a FAIL above, not a crash here
+            seen.add(item["id"])
         if answer_bytes(item) > limits["candidate_max_bytes"]:
             problems.append(where + " is %d bytes as a prompt holds it (> candidate_max_bytes %d)"
                             % (answer_bytes(item), limits["candidate_max_bytes"]))
@@ -265,6 +270,9 @@ def synthesis_problems(answer: object, limits: dict, keys: dict) -> list:
                 or len(item["statement"]) > limits["candidate_statement_max_chars"]:
             problems.append(where + ".statement must be a nonempty string of at most %d characters"
                             % limits["candidate_statement_max_chars"])
+        # stage_inputs.parse_synthesis refuses it next; strict refuses it first, while the call can still be retried
+        if "found_by" in item and not isinstance(item["found_by"], str):
+            problems.append(where + ".found_by must be a string")
         cited = item["cited_prs"]
         if not isinstance(cited, list) or len(set(k for k in cited if isinstance(k, str))) < 2 \
                 or not all(isinstance(k, str) and k in keys for k in cited):
@@ -275,7 +283,10 @@ def synthesis_problems(answer: object, limits: dict, keys: dict) -> list:
     return problems
 
 
-def verify_problems(answer: object, expect_id) -> list:
+def verify_problems(answer: object, expect_id, listed=()) -> list:
+    """R3 of a verify answer. A counterexample is {pr, quote, reason}; when its prompt listed PRs by title only
+    (``listed``, the input scope's list, #286) it may instead be {pr, reason} without a quote, for one of those
+    (R5 keeps it to them). Without a list a counterexample always carries a quote."""
     if not isinstance(answer, dict) or set(answer) != VERIFY_KEYS:
         return ["keys must be exactly " + ", ".join(sorted(VERIFY_KEYS))]
     problems = []
@@ -306,11 +317,18 @@ def verify_problems(answer: object, expect_id) -> list:
     if not isinstance(counter, list):
         problems.append("counterexamples must be a list")
     else:
+        shapes = [{"pr", "quote", "reason"}] + ([{"pr", "reason"}] if listed else [])
         for index, item in enumerate(counter):
-            if not (isinstance(item, dict) and set(item) == {"pr", "quote", "reason"}
-                    and all(isinstance(item[k], str) for k in ("pr", "quote", "reason"))):
-                problems.append("counterexamples[%d] needs pr, quote, reason (strings) only" % index)
+            if not (isinstance(item, dict) and set(item) in shapes and all(isinstance(v, str) for v in item.values())):
+                problems.append("counterexamples[%d] needs pr, quote, reason (strings) only%s"
+                                % (index, ", or pr, reason (strings) only for a PR its prompt only listed"
+                                   if listed else ""))
     return problems
+
+
+def quoted(items: list) -> list:
+    """The items of a verify answer that carry a quote (a list-only counterexample has none, #286)."""
+    return [item for item in items if "quote" in item]
 
 
 def final_problems(answer: object, limits: dict, keys: dict) -> tuple:
@@ -389,9 +407,17 @@ def scope_problems(kind: str, answer: dict, quote_doc: dict, scope: dict) -> lis
         outside = sorted({key for item in answer["candidates"] for key in item["cited_prs"]} - keys)
         return ["cites digest keys its input did not hold: " + ", ".join(outside)] if outside else []
     if kind == "verify":
-        named = {item["pr"] for item in answer["evidence_checks"] + answer["counterexamples"]}
-        outside = sorted(named - keys)
-        return ["names PRs whose section was not in its prompt: " + ", ".join(outside)] if outside else []
+        # a quoted item names a PR whose section the prompt held; an unquoted counterexample one the prompt listed
+        shown = lambda found: ", ".join(key or '""' for key in found)  # noqa: E731  (the 2026-10-06 "" was invisible)
+        problems = []
+        outside = sorted({item["pr"] for item in quoted(answer["evidence_checks"] + answer["counterexamples"])} - keys)
+        if outside:
+            problems.append("names PRs whose section was not in its prompt: " + shown(outside))
+        unquoted = {item["pr"] for item in answer["counterexamples"] if "quote" not in item}
+        unlisted = sorted(unquoted - set(scope.get("listed", [])))
+        if unlisted:
+            problems.append("names as unquoted counterexamples PRs its prompt did not list: " + shown(unlisted))
+        return problems
     allowed = {(item["pr"], item["quote"]) for item in scope.get("quotes", [])}
     outside = [item for item in quote_doc["quotes"] if (item["pr"], item["quote"]) not in allowed]
     if not outside:
@@ -406,6 +432,40 @@ def scope_problems(kind: str, answer: dict, quote_doc: dict, scope: dict) -> lis
         problems.append("%d of them carry a JSON escape (\\\" or \\\\) the source text does not have (first: %s %r)"
                         % (len(escaped), escaped[0]["pr"], escaped[0]["quote"][:60]))
     return problems
+
+
+def content_problems(kind: str, answer: dict, report_bytes: bytes, limits: dict, keys: dict, lens=None,
+                     expect_id=None, scope=None) -> tuple:
+    """The answer-content problems of an extract, synthesis, verify or final answer, by verdict item, as verify()
+    judges them: R3 (shape, sizes, counts) always; R6 (final search clues) and R5 (with an input scope) only when R3
+    passes. Q1 (quotes against the corpus) is verify()'s. test_prompt_contract.py runs this over mutated answers to
+    keep every refusal a rule its prompt states (#286). Returns (problems by item, the object check_extraction reads,
+    its number of quotes, the search clues seen)."""
+    quote_doc, quotes, clues = answer, 0, 0
+    if kind == "extract":
+        problems = schema_problems(answer, limits, lens)
+        quotes = 0 if problems else count_quotes(answer)
+    elif kind == "synthesis":
+        problems = synthesis_problems(answer, limits, keys)
+    elif kind == "verify":
+        problems = verify_problems(answer, expect_id, scope.get("listed", []) if scope is not None else [])
+        # the answer's own bytes, as written: the prompt states this measure (#286)
+        if len(report_bytes) > limits["verify_answer_max_bytes"]:
+            problems.append("verify answer is %d bytes (> verify_answer_max_bytes %d)"
+                            % (len(report_bytes), limits["verify_answer_max_bytes"]))
+        if not problems:
+            quotes = len(quoted(answer["evidence_checks"] + answer["counterexamples"]))
+    else:
+        problems, found = final_problems(answer, limits, keys)
+        quote_doc, quotes = {"quotes": found}, len(found)
+    found = {"R3": problems}
+    if problems:
+        return found, quote_doc, quotes, clues
+    if kind == "final":
+        found["R6"], clues = search_clue_problems(answer)
+    if scope is not None:
+        found["R5"] = scope_problems(kind, answer, quote_doc, scope)
+    return found, quote_doc, quotes, clues
 
 
 def load_verifier():
@@ -785,36 +845,21 @@ def verify(run_dir: Path, corpus: Path, prompt: Path, limits: dict, kind: str = 
         result_class, verified = verify_assess(v, answer, report_bytes, scope, assess)
         return v, result_class, verified
     keys = corpus_keys(corpus_doc)
-    quote_doc, quotes, empty = answer, 0, False
-    if kind == "extract":
-        problems = schema_problems(answer, limits, lens)
-        if not problems:
-            quotes = count_quotes(answer)
-            empty = quotes == 0
-    elif kind == "synthesis":
-        problems = synthesis_problems(answer, limits, keys)
-        empty = not problems and not answer["candidates"]
-    elif kind == "verify":
-        problems = verify_problems(answer, expect_id)
-        if len(report_bytes) > limits["verify_answer_max_bytes"]:
-            problems.append("verify answer is %d bytes (> verify_answer_max_bytes %d)"
-                            % (len(report_bytes), limits["verify_answer_max_bytes"]))
-        if not problems:
-            quotes = len(answer["evidence_checks"]) + len(answer["counterexamples"])
-    else:
-        problems, found = final_problems(answer, limits, keys)
-        quote_doc, quotes = {"quotes": found}, len(found)
-        empty = not problems and not answer["patterns"]
+    content, quote_doc, quotes, clues = content_problems(kind, answer, report_bytes, limits, keys, lens, expect_id,
+                                                         scope)
+    problems = content["R3"]
     if not v.add("R3-report-schema", "FAIL" if problems else "PASS", "; ".join(problems)):
         v.block(["Q1"] + (["R5"] if scope is not None else []), "schema failed")
         return v, "invalid", None
+    empty = {"extract": quotes == 0, "synthesis": not answer.get("candidates"), "verify": False,
+             "final": not answer.get("patterns")}[kind]
     if kind == "final":
-        clue_problems, clues = search_clue_problems(answer)
+        clue_problems = content["R6"]
         v.add("R6-search-clues", "FAIL" if clue_problems else "PASS", "; ".join(clue_problems)
               or ("%d search clue(s), each a GitHub search string" % clues if clues
                   else "no search_clues in the patterns (the assemble schema requires them)"))
     if scope is not None:
-        found = scope_problems(kind, answer, quote_doc, scope)
+        found = content["R5"]
         if not v.add("R5-input-scope", "FAIL" if found else "PASS", "; ".join(found) or "within what the input held"):
             v.block(["Q1"], "the answer went beyond its input")
             return v, "invalid", None
@@ -914,8 +959,12 @@ def main(argv=None) -> int:
         elif (not isinstance(scope, dict) or not isinstance(scope.get("keys"), list)
                 or not all(isinstance(key, str) for key in scope["keys"]) or not isinstance(quotes, list)
                 or not all(isinstance(item, dict) and isinstance(item.get("pr"), str) and isinstance(item.get("quote"), str)
-                           for item in quotes)):
-            ap.error("--input-scope must be {\"keys\": [strings], \"quotes\": [{pr, quote}]}")
+                           for item in quotes)
+                or not isinstance(scope.get("listed", []), list)
+                or not all(isinstance(key, str) for key in scope.get("listed", []))
+                or set(scope.get("listed", [])) & set(scope["keys"])):
+            ap.error("--input-scope must be {\"keys\": [strings], \"quotes\": [{pr, quote}], \"listed\": [strings not "
+                     "in keys]}")
     verdict, result_class, report_bytes = verify(
         a.run_dir, a.corpus, a.prompt, limits, a.answer_kind, a.lens, a.expect_id, scope,
         {"discovery": a.discovery, "policy_evidence": a.policy_evidence, "locus_search": a.locus_search} if assess else None)
