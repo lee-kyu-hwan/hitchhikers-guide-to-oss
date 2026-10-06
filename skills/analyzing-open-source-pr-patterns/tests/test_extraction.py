@@ -376,6 +376,35 @@ class BuildPromptsTests(ExtractionTestCase):
         self.assertIn("patterns 는 최대 3개, observations 는 최대 7개, rejected 는 최대 9개다.",
                       other["extract-blind.md"].decode("utf-8"))
 
+    SIZE_SENTENCE = ("- 답 크기 상한: 답 JSON 을 들여쓰기 1칸으로 다시 쓴 크기(UTF-8, 한글 한 글자는 3바이트)가 7680 바이트 "
+                     "이하여야 한다. 넘으면 답 전체가 거부된다. 넘칠 것 같으면 note·claim·description 을 짧게 쓰고 근거가 약한 "
+                     "항목부터 버려라. 인용(quote)은 원문 그대로 두고 자르지 마라.")
+
+    def test_extract_with_an_answer_size_limit_states_it_after_the_count_rule_and_changes_nothing_else(self):
+        self.assertEqual(self.build_digest().returncode, 0)
+        counts = ("--max-patterns", "5", "--max-observations", "20", "--max-rejected", "20")
+        limited = self.extract_prompts(*counts)
+        sized = self.extract_prompts(*counts, "--max-answer-bytes", "7680")
+        self.assertEqual(sorted(sized), sorted(limited))
+        for name, text in sized.items():
+            with self.subTest(name):
+                decoded = text.decode("utf-8")
+                self.assertEqual(decoded.count(self.SIZE_SENTENCE), 1)
+                self.assertIn(self.LIMIT_SENTENCE + self.SIZE_SENTENCE + "\n\n출력:", decoded)
+                self.assertEqual(decoded.replace(self.SIZE_SENTENCE + "\n", ""), limited[name].decode("utf-8"))
+
+    def test_extract_refuses_an_answer_size_limit_without_count_limits_or_not_positive(self):
+        self.assertEqual(self.build_digest().returncode, 0)
+        counts = ("--max-patterns", "5", "--max-observations", "20", "--max-rejected", "20")
+        for case in [("--max-answer-bytes", "7680"), counts + ("--max-answer-bytes", "0"),
+                     counts + ("--max-answer-bytes", "7.5k")]:
+            with self.subTest(case):
+                run = self.directory / "refused"
+                result = run_script("build_prompts.py", "extract", "--digest-dir", self.digest_dir, "--out", run, *case)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertNotIn("Traceback", result.stderr)
+                self.assertFalse((run / "prompts").exists())
+
     def test_extract_refuses_partial_or_non_positive_count_limits(self):
         self.assertEqual(self.build_digest().returncode, 0)
         cases = [("--max-patterns", "5"), ("--max-patterns", "5", "--max-observations", "20"),

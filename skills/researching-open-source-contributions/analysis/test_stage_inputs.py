@@ -35,6 +35,26 @@ import stage_inputs  # noqa: E402
 LENSES = ("blind", "correctness", "maintenance", "review", "structure")
 GENERATED_AT = "2026-09-28T00:00:00Z"
 
+# The stage output limits the runs before #248 were made and adopted under (2026-09-28, the 13 PR run, eslint r2-r6):
+# candidates up to max_patterns 5, verify answers up to 6,144 bytes, and no size limit on an extract answer or a
+# candidate. Their evidence is reproduced byte for byte under these; under run_limits.json's own limits their larger
+# answers are refused (README 3.1g).
+EARLIER_LIMITS = {"MAX_CANDIDATES": 5, "VERIFY_ANSWER_MAX_BYTES": 6144, "EXTRACT_ANSWER_MAX_BYTES": None,
+                  "CANDIDATE_MAX_BYTES": None}
+
+
+# Stage output limits small enough for the fixture's prompts under a cap patched down to a few kilobytes.
+SMALL_LIMITS = {"EXTRACT_ANSWER_MAX_BYTES": 1024, "CANDIDATE_MAX_BYTES": 256, "VERIFY_ANSWER_MAX_BYTES": 1024,
+                "MAX_CANDIDATES": 1}
+
+
+def use_limits(test, limits: dict) -> None:
+    """Put other stage output limits in force for the rest of the test."""
+    for name, value in limits.items():
+        patcher = mock.patch.object(stage_inputs, name, value)
+        patcher.start()
+        test.addCleanup(patcher.stop)
+
 
 def collect(directory: Path) -> dict:
     """The production collector over the fixture world, with the real request's cap and budget."""
@@ -202,11 +222,12 @@ class StagePipelineTests(unittest.TestCase):
         extract, synthesis_stage, verify_stage, final_stage = stages
         self.assertEqual([call["input_dir"] for call in extract["calls"]], ["extract-" + lens for lens in LENSES])
         build_prompts = self.context.siblings.build_prompts
-        rule = build_prompts.COUNT_RULE.format(patterns=5, observations=20, rejected=20)
+        rule = build_prompts.COUNT_RULE.format(patterns=5, observations=20, rejected=20) \
+            + build_prompts.SIZE_RULE.format(answer_bytes=7680)
         for call in extract["calls"]:
             task = (self.root / "in-extract" / call["input_dir"] / "task.txt").read_text(encoding="utf-8")
             plain = (self.context.extract_prompts / (call["input_dir"] + ".md")).read_text(encoding="utf-8")
-            # The digest's prompt (written without limits) plus the count rule of run_limits.json, nothing else.
+            # The digest's prompt (written without limits) plus the count and size rules of run_limits.json, nothing else.
             self.assertEqual(task, plain.replace(build_prompts.COUNT_RULE_ANCHOR, build_prompts.COUNT_RULE_ANCHOR + rule))
             self.assertEqual(task.count(rule), 1)
         self.assertEqual(synthesis_stage["quotes"], {"verified": 3, "total": 3})
@@ -334,9 +355,10 @@ class StagePipelineTests(unittest.TestCase):
 
     def test_counts_are_capped_and_refused_not_truncated(self):
         limits = json.loads((HERE / "run_limits.json").read_text(encoding="utf-8"))
-        self.assertEqual(stage_inputs.MAX_MODEL_CALLS, 12)
+        self.assertEqual(stage_inputs.MAX_MODEL_CALLS, 10)      # 5 + 1 + synthesis_max_candidates 3 + 1 (#248)
         keys = [self.key[self.pr[101]], self.key[self.pr[102]]]
-        many = [{"id": "C%d" % n, "statement": "x", "cited_prs": keys} for n in range(1, limits["max_patterns"] + 2)]
+        many = [{"id": "C%d" % n, "statement": "x", "cited_prs": keys}
+                for n in range(1, limits["synthesis_max_candidates"] + 2)]
         dropped = [{"idea": "x", "reason": "y"}] * (limits["max_rejected"] + 1)
         for label, answer in (("candidates", {"candidates": many, "dropped": []}),
                               ("dropped", {"candidates": [], "dropped": dropped})):
@@ -350,7 +372,7 @@ class StagePipelineTests(unittest.TestCase):
         at_cap = self.write("synthesis-cap.json", {"candidates": many[:-1], "dropped": dropped[:-1]})
         code, summary, stderr = stage("verify-inputs", "--run-dir", self.run, "--synthesis", at_cap, *self.extract_args(), "--out", str(self.root / "v-cap"))
         self.assertEqual(code, 0, stderr)
-        self.assertEqual(len(summary["calls"]), limits["max_patterns"])
+        self.assertEqual(len(summary["calls"]), limits["synthesis_max_candidates"])
         self.run_stages()
         answer = self.final_answer()
         extra = [dict(answer["patterns"][0], pattern_id="PAT-%03d" % n) for n in range(2, limits["max_patterns"] + 2)]
@@ -395,7 +417,9 @@ class StagePipelineTests(unittest.TestCase):
         fixed = len(stage_inputs.final_prompt_text(self.context, [], {}, stage_inputs.EMPTY_REPORT).encode("utf-8"))
         self.assertFalse(self.context.reduced)
         # One byte short: the final prompt can no longer carry the digest, so the run reduces from extraction
-        # answers instead of refusing (its own, much smaller, fixed part is what is then budgeted).
+        # answers instead of refusing (its own, much smaller, fixed part is what is then budgeted). Its worst-case
+        # plan (#248) must pass too, so the stage output limits are scaled down with the prompt cap.
+        use_limits(self, SMALL_LIMITS)
         with mock.patch.object(stage_inputs, "PROMPT_MAX_BYTES", fixed + stage_inputs.FINAL_RESERVE_BYTES - 1):
             code, summary, stderr = stage("extract-inputs", "--run-dir", self.run, "--out", str(self.root / "over"))
         self.assertEqual(code, 0, stderr)
@@ -423,27 +447,38 @@ class StagePipelineTests(unittest.TestCase):
                          [(self.pr[101], fx.PULLS[101]["quote"]), (self.pr[102], fx.PULLS[102]["quote"])])
         self.assertEqual(compact, stage_inputs.compact_report(stage_inputs.check_quotes(self.context, paths)))
 
-    def test_five_long_candidates_hit_the_budget_at_verify_inputs(self):
+    def test_three_long_candidates_hit_the_budget_at_verify_inputs(self):
         keys = [self.key[self.pr[101]], self.key[self.pr[102]]]
         limit = stage_inputs.STATEMENT_MAX_CHARS
-        candidates = [{"id": "C%d" % n, "statement": "가" * limit, "cited_prs": keys} for n in range(1, 6)]
-        path = self.write("five.json", {"candidates": candidates, "dropped": []})
+        count = stage_inputs.MAX_CANDIDATES
+        # as long as candidate_max_bytes allows (a statement of 600 Hangul characters no longer fits one, #248)
+        room = (stage_inputs.CANDIDATE_MAX_BYTES
+                - stage_inputs.answer_bytes({"id": "C1", "statement": "", "cited_prs": keys})) // 3
+        candidates = [{"id": "C%d" % n, "statement": "가" * room, "cited_prs": keys} for n in range(1, count + 1)]
+        path = self.write("three.json", {"candidates": candidates, "dropped": []})
         compact = stage_inputs.compact_report(stage_inputs.check_quotes(self.context, self.extract_results()))
         base = len(stage_inputs.final_prompt_text(self.context, candidates, {}, compact).encode("utf-8"))
-        floor = base + 5 * stage_inputs.VERIFY_FLOOR_BYTES
-        with mock.patch.object(stage_inputs, "PROMPT_MAX_BYTES", floor - 1):
+        floor = base + count * stage_inputs.VERIFY_FLOOR_BYTES
+        with mock.patch.object(stage_inputs, "PROMPT_MAX_BYTES", floor - 1), \
+                mock.patch.object(stage_inputs, "FINAL_RESERVE_BYTES", 0):   # keep the run on the digest path
             code, _, stderr = stage("verify-inputs", "--run-dir", self.run, "--synthesis", path, *self.extract_args(),
                                     "--out", str(self.root / "v-over"))
         self.assertEqual(code, 2)
-        self.assertIn("5 candidates", stderr)
+        self.assertIn("%d candidates" % count, stderr)
         self.assertFalse((self.root / "v-over").exists())
         code, summary, stderr = stage("verify-inputs", "--run-dir", self.run, "--synthesis", path, *self.extract_args(),
                                       "--out", str(self.root / "v-ok"))
         self.assertEqual(code, 0, stderr)
-        self.assertEqual(len(summary["calls"]), 5)
+        self.assertEqual(len(summary["calls"]), count)
         self.assertEqual(summary["final_budget"]["floor_bytes"], floor)
         self.assertEqual(summary["final_budget"]["guaranteed"],
-                         base + 5 * 2 * stage_inputs.VERIFY_ANSWER_MAX_BYTES <= stage_inputs.PROMPT_MAX_BYTES)
+                         base + count * 2 * stage_inputs.VERIFY_ANSWER_MAX_BYTES <= stage_inputs.PROMPT_MAX_BYTES)
+        over = self.write("over.json", {"candidates": [dict(candidates[0], statement="가" * (room + 1))], "dropped": []})
+        code, _, stderr = stage("verify-inputs", "--run-dir", self.run, "--synthesis", over, *self.extract_args(),
+                                "--out", str(self.root / "v-big"))
+        self.assertEqual(code, 2)
+        self.assertIn("candidate_max_bytes %d" % stage_inputs.CANDIDATE_MAX_BYTES, stderr)
+        use_limits(self, {"CANDIDATE_MAX_BYTES": None})
         too_long = self.write("long.json", {"candidates": [dict(candidates[0], statement="가" * (limit + 1))], "dropped": []})
         code, _, stderr = stage("verify-inputs", "--run-dir", self.run, "--synthesis", too_long, *self.extract_args(),
                                 "--out", str(self.root / "v-long"))
@@ -688,7 +723,7 @@ class ShardedRunTests(unittest.TestCase):
         return make_run(self, self.root, ("--max-bytes", "1200"))
 
     def test_the_call_limit_is_shards_times_lenses_plus_synthesis_verify_and_final(self):
-        self.assertEqual(12, stage_inputs.MAX_MODEL_CALLS)
+        self.assertEqual(10, stage_inputs.MAX_MODEL_CALLS)      # 5 + 1 + synthesis_max_candidates 3 + 1 (#248)
         self.assertEqual({"shards": 1, "lenses": 5, "extract": 5, "synthesis": 1, "verify": 5, "final": 1,
                           "max_model_calls": 12}, {k: v for k, v in stage_inputs.model_call_plan(1, 5, 5).items()
                                                    if k != "formula"})
@@ -698,11 +733,11 @@ class ShardedRunTests(unittest.TestCase):
         self.assertEqual("2 shards x 5 lenses + 1 (synthesis) + 3 (verify, at most max_candidates) + 1 (final) = 15",
                          plan["formula"])
 
-    def test_a_single_shard_run_records_the_twelve_call_plan(self):
+    def test_a_single_shard_run_records_the_ten_call_plan(self):
         run = make_run(self, self.root)
         code, summary, stderr = stage("extract-inputs", "--run-dir", run, "--out", str(self.root / "x"))
         self.assertEqual(code, 0, stderr)
-        self.assertEqual(12, summary["max_model_calls"])
+        self.assertEqual(10, summary["max_model_calls"])        # 12 under the earlier 5 candidates (#248)
         self.assertEqual(5, len(summary["calls"]))
         self.assertEqual(1, summary["call_plan"]["shards"])
         self.assertEqual(summary, json.loads((self.root / "x" / "stage.json").read_text(encoding="utf-8")))
@@ -712,14 +747,17 @@ class ShardedRunTests(unittest.TestCase):
         self.assertEqual(code, 0, stderr)
         names = sorted(call["input_dir"] for call in summary["calls"])
         self.assertEqual(sorted("extract-%s-%02d" % (lens, n) for lens in LENSES for n in (1, 2)), names)
-        groups = stage_inputs.MAX_SYNTHESIS_GROUPS
-        self.assertEqual(10 + groups + 1 + 5 + 1, summary["max_model_calls"])
-        self.assertEqual({"mode": "extraction-only", "shards": 2, "lenses": 5, "extract": 10, "synthesis": groups + 1,
-                          "synthesis_min": 1, "synthesis_groups_max": groups, "verify": 5, "final": 1,
-                          "max_model_calls": 10 + groups + 1 + 5 + 1},
-                         {k: v for k, v in summary["call_plan"].items() if k not in ("formula", "inputs")})
-        self.assertEqual({"max_candidates": 5, "shards": 2, "lenses": 5, "max_synthesis_groups": groups},
-                         summary["call_plan"]["inputs"])
+        # The worst-case plan (#248): every answer at the stage output limits. Ten answers of 7,680 bytes make 4
+        # groups of at most 3 (the fixture's PR index is small), and their candidates fit one merge.
+        plan = summary["call_plan"]
+        self.assertEqual({"mode": "extraction-only", "shards": 2, "lenses": 5, "extract": 10, "synthesis": 5,
+                          "synthesis_levels": [4, 1], "verify": 3, "final": 1, "max_model_calls": 19},
+                         {k: v for k, v in plan.items() if k not in ("formula", "inputs")})
+        self.assertEqual(plan["max_model_calls"], plan["extract"] + plan["synthesis"] + plan["verify"] + plan["final"])
+        self.assertEqual({"max_candidates": 3, "shards": 2, "lenses": 5, "limits": stage_inputs.output_limits()},
+                         plan["inputs"])
+        self.assertEqual(19, summary["max_model_calls"])
+        self.assertEqual(plan, stage("dry-plan", "--run-dir", str(self.root / "run"))[1]["call_plan"])
         for call in summary["calls"]:
             self.assertLessEqual(call["bytes"], stage_inputs.PROMPT_MAX_BYTES)
             self.assertEqual("%s.result.json" % call["input_dir"], call["result_name"])
@@ -795,7 +833,12 @@ class Run928InputTests(unittest.TestCase):
 
     And the search clue rule (#82, after the 2026-10-05 discover read nothing with Korean clues): the analyzer's
     extract prompt and finalize.md now ask for GitHub search strings. With those sentences taken back
-    (CLUE_TEXT_CHANGES, FINAL_CLUE_CHANGES) every prompt is the earlier one byte for byte; the new bytes are pinned."""
+    (CLUE_TEXT_CHANGES, FINAL_CLUE_CHANGES) every prompt is the earlier one byte for byte; the new bytes are pinned.
+
+    All of that under the stage output limits the run was made under (EARLIER_LIMITS, #248). Under run_limits.json's
+    own limits the extract inputs also state the answer size limit (pinned below), and two of the run's extract
+    answers (blind 11,571 and review 8,740 bytes) are over it, so synthesis-input refuses them; its verify and final
+    inputs are the same bytes as under the earlier limits."""
 
     # The analyzer's extract prompt: the search clue sentence, the output sentence and the schema placeholder.
     CLUE_TEXT_CHANGES = (
@@ -856,7 +899,8 @@ class Run928InputTests(unittest.TestCase):
     def same(self, built: Path, kept: Path):
         self.assertEqual(kept.read_bytes(), built.read_bytes(), str(kept))
 
-    def test_every_input_of_the_run_is_reproduced_byte_for_byte(self):
+    def test_every_input_of_the_run_is_reproduced_byte_for_byte_under_the_limits_it_was_made_under(self):
+        use_limits(self, EARLIER_LIMITS)
         answers = self.analysis / "answers"
         extract = [item for lens in LENSES for item in ("--extract-result", str(answers / ("extract-%s.result.json" % lens)))]
         code, summary, stderr = stage("extract-inputs", "--run-dir", self.run, "--out", str(self.root / "extract"))
@@ -895,6 +939,45 @@ class Run928InputTests(unittest.TestCase):
             built.replace(rule[0].encode("utf-8"), b"", 1).replace(clue_rule[0].encode("utf-8"), b"", 1),
             self.FINAL_CLUE_CHANGES))
         self.assertEqual(self.FINAL_SHA256, hashlib.sha256(built).hexdigest())
+
+    # sha256 of the bundle's extract inputs for this run under run_limits.json: the count and the size rule (#248).
+    SIZED_EXTRACT_SHA256 = {
+        "blind": "cce7c3a1593e2994381c8b6d81f02b3643f699d33ef12c596743b3e2bb39a2e9",
+        "correctness": "fa58c7ad76aa78d557e29be192dd489357abad32b54c6e4645a008b9c93e2c99",
+        "maintenance": "88b3a9f4d3853fd1c52093ddafbb965f973d5232479f9b04ab79de1fdf1ad12a",
+        "review": "c860b9dcfc5606a1ede94d2d2e61446ace0c0e8a4fb902a3301ef5cad2da9f54",
+        "structure": "d4f3bf6fe6732604c7a8c88b6ac17402bfe1d2b6fb336a17c2305a036840a24d",
+    }
+
+    def test_under_the_new_limits_the_extract_inputs_state_the_size_limit_and_the_larger_answers_are_refused(self):
+        answers = self.analysis / "answers"
+        extract = [item for lens in LENSES for item in ("--extract-result", str(answers / ("extract-%s.result.json" % lens)))]
+        code, summary, stderr = stage("extract-inputs", "--run-dir", self.run, "--out", str(self.root / "extract"))
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(10, summary["max_model_calls"])
+        size_rule = stage_inputs.Context(self.run).siblings.build_prompts.SIZE_RULE.format(answer_bytes=7680)
+        for lens in LENSES:
+            built = (self.root / "extract" / ("extract-" + lens) / "task.txt").read_bytes()
+            self.assertEqual(self.SIZED_EXTRACT_SHA256[lens], hashlib.sha256(built).hexdigest(), lens)
+            self.assertEqual(self.EXTRACT_SHA256[lens],
+                             hashlib.sha256(built.replace(size_rule.encode("utf-8"), b"", 1)).hexdigest(), lens)
+        code, _, stderr = stage("synthesis-input", "--run-dir", self.run, *extract, "--out", str(self.root / "synthesis"))
+        self.assertEqual(code, 2)
+        self.assertIn("extract result extract-blind is 11571 bytes as a prompt holds it (> extract_answer_max_bytes 7680)",
+                      stderr)
+        self.assertFalse((self.root / "synthesis").exists())
+        synthesis = str(answers / "synthesis.result.json")
+        code, summary, stderr = stage("verify-inputs", "--run-dir", self.run, "--synthesis", synthesis, *extract,
+                                      "--out", str(self.root / "verify"))
+        self.assertEqual(code, 0, stderr)
+        for call in summary["calls"]:
+            self.same(self.root / "verify" / call["input_dir"] / "task.txt",
+                      self.analysis / "in-verify" / call["input_dir"] / "task.txt")
+        verify = [item for path in sorted(answers.glob("verify-*.result.json")) for item in ("--verify-result", str(path))]
+        code, _, stderr = stage("final-input", "--run-dir", self.run, "--synthesis", synthesis, *extract, *verify,
+                                "--out", str(self.root / "final"))
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(self.FINAL_SHA256, hashlib.sha256((self.root / "final/final/task.txt").read_bytes()).hexdigest())
 
 
 if __name__ == "__main__":

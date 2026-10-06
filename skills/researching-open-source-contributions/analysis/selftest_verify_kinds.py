@@ -120,7 +120,14 @@ SPECIFIC = {
     ("synthesis", "six candidates"): (dict(answer={"candidates": [{"id": "C%d" % n, "statement": "s", "cited_prs": list(KEYS)[:2]} for n in range(6)], "dropped": []}), 1, {"R3": "FAIL"}),
     ("synthesis", "extra key"): (dict(answer={**GOOD["synthesis"], "note": 1}), 1, {"R3": "FAIL"}),
     ("synthesis", "statement too long"): (dict(answer={"candidates": [{"id": "C1", "statement": "s" * 601, "cited_prs": list(KEYS)[:2]}], "dropped": []}), 1, {"R3": "FAIL"}),
+    # The stage output limits of run_limits.json (#248): the prompt states them, the strict check uses the same values.
+    ("synthesis", "four candidates over synthesis_max_candidates 3"): (dict(answer={"candidates": [{"id": "C%d" % n, "statement": "s", "cited_prs": list(KEYS)[:2]} for n in range(1, 5)], "dropped": []}), 1, {"R3": "FAIL"}),
+    ("synthesis", "candidate over candidate_max_bytes"): (dict(answer={"candidates": [{"id": "C1", "statement": "가" * 340, "cited_prs": list(KEYS)[:2]}], "dropped": []}), 1, {"R3": "FAIL"}),
+    ("synthesis", "candidate id not C1 ... C99"): (dict(answer={"candidates": [{"id": "X1", "statement": "s", "cited_prs": list(KEYS)[:2]}], "dropped": []}), 1, {"R3": "FAIL"}),
+    ("synthesis", "21 dropped ideas"): (dict(answer={"candidates": [], "dropped": [{"idea": "i", "reason": "r"}] * 21}), 1, {"R3": "FAIL"}),
+    ("extract", "answer over extract_answer_max_bytes"): (dict(answer={**GOOD["extract"], "observations": [{"pr": KEY, "note": "n" * 7700, "quote": QUOTE}]}), 1, {"R3": "FAIL"}),
     ("verify", "answer over verify_answer_max_bytes"): (dict(answer={**GOOD["verify"], "actionable_reason": "r" * 6144}), 1, {"R3": "FAIL"}),
+    ("verify", "answer over verify_answer_max_bytes 5120"): (dict(answer={**GOOD["verify"], "actionable_reason": "r" * 5000}), 1, {"R3": "FAIL"}),
     ("verify", "other candidate id"): (dict(answer={**GOOD["verify"], "id": "C2"}), 1, {"R3": "FAIL"}),
     ("verify", "no evidence checks"): (dict(answer={**GOOD["verify"], "evidence_checks": []}), 1, {"R3": "FAIL"}),
     ("verify", "reworded quote"): (dict(answer={**GOOD["verify"], "evidence_checks": [{"pr": KEY, "holds": True, "quote": reworded, "reason": "r"}]}), 1, {"Q1": "FAIL"}),
@@ -132,6 +139,9 @@ SPECIFIC = {
 }
 if len(KEYS) >= 2:
     SPECIFIC[("synthesis", "two keys is evidence")] = (dict(answer={"candidates": [{"id": "C1", "statement": "s", "cited_prs": list(KEYS)[:2]}], "dropped": []}), 0, {"class": "evidence"})
+    SPECIFIC[("synthesis", "three candidates of 1024 bytes is evidence")] = (dict(answer={"candidates": [
+        {"id": "C%d" % n, "statement": "가" * 300 + "a" * (1024 - 3 * 300 - len(json.dumps({"id": "C1", "statement": "", "cited_prs": list(KEYS)[:2]}, ensure_ascii=False, indent=1).encode("utf-8"))),
+         "cited_prs": list(KEYS)[:2]} for n in range(1, 4)], "dropped": []}), 0, {"class": "evidence"})
 
 
 def main():

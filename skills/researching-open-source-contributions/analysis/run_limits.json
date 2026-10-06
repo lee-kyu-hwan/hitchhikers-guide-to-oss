@@ -15,9 +15,11 @@
   "max_patterns": 5,
   "max_observations": 20,
   "max_rejected": 20,
-  "max_synthesis_groups": 8,
+  "synthesis_max_candidates": 3,
+  "candidate_max_bytes": 1024,
+  "extract_answer_max_bytes": 7680,
   "candidate_statement_max_chars": 600,
-  "verify_answer_max_bytes": 6144,
+  "verify_answer_max_bytes": 5120,
   "final_dynamic_reserve_bytes": 8192,
   "worker": {
     "profile": "claude-profile2",

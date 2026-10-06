@@ -3,7 +3,8 @@
 
   extract  one prompt per digest shard and lens: OUT/prompts/extract-<lens>[-NN].md
            (--max-patterns/--max-observations/--max-rejected, all three or none, state
-           the answer's count limits in the rules; without them the bytes are as before)
+           the answer's count limits in the rules, and --max-answer-bytes with them its
+           size limit; without them the bytes are as before)
   verify   one prompt per merged candidate: OUT/prompts/verify-<id>.md
 
 A prompt file is the whole input of one call, so any executor can run it: agy
@@ -95,6 +96,12 @@ COUNT_RULE = (
     "- 개수 상한: patterns 는 최대 {patterns}개, observations 는 최대 {observations}개, rejected 는 최대 {rejected}개다. "
     "넘으면 답 전체가 거부된다. 넘치는 항목은 근거가 약한 것부터 버려라(rejected 나 observations 로 옮기지 마라). "
     "개수를 맞추려고 근거를 지어내지 마라.\n"
+)
+# The rule after the count rule when the caller also passes the answer size limit its checker enforces.
+SIZE_RULE = (
+    "- 답 크기 상한: 답 JSON 을 들여쓰기 1칸으로 다시 쓴 크기(UTF-8, 한글 한 글자는 3바이트)가 {answer_bytes} 바이트 "
+    "이하여야 한다. 넘으면 답 전체가 거부된다. 넘칠 것 같으면 note·claim·description 을 짧게 쓰고 근거가 약한 "
+    "항목부터 버려라. 인용(quote)은 원문 그대로 두고 자르지 마라.\n"
 )
 
 VERIFY_TAIL = """너는 반박 검증자다. 아래 후보 패턴 하나가 다이제스트로 뒷받침되는지 따진다. 후보를 만든 사람의 편을 들지 마라. 근거가 약하면 약하다고 말하는 것이 네 일이다.
@@ -193,10 +200,14 @@ def _write(prompts_dir, name, text):
 
 
 def extract_tail(limits=None):
-    """EXTRACT_TAIL, with the count rule after the last criterion when limits {patterns, observations, rejected}."""
+    """EXTRACT_TAIL, with the count rule after the last criterion when limits {patterns, observations, rejected},
+    and the size rule after it when limits also holds answer_bytes."""
     if limits is None:
         return EXTRACT_TAIL
-    return EXTRACT_TAIL.replace(COUNT_RULE_ANCHOR, COUNT_RULE_ANCHOR + COUNT_RULE.format(**limits), 1)
+    rules = COUNT_RULE.format(**limits)
+    if limits.get("answer_bytes") is not None:
+        rules += SIZE_RULE.format(**limits)
+    return EXTRACT_TAIL.replace(COUNT_RULE_ANCHOR, COUNT_RULE_ANCHOR + rules, 1)
 
 
 def extract(digest_dir, out_dir, lenses, limits=None):
@@ -328,6 +339,9 @@ def main(argv=None):
         extract_parser.add_argument(
             "--max-" + kind, type=_positive, help="count limit the answer's " + kind + " must keep; give all three or none"
         )
+    extract_parser.add_argument(
+        "--max-answer-bytes", type=_positive, help="size limit of the answer (indent-1 JSON, UTF-8); needs the count limits"
+    )
     verify_parser = commands.add_parser("verify", help="one adversarial prompt per candidate")
     verify_parser.add_argument("--digest-dir", required=True, help="build_digest.py --out directory")
     verify_parser.add_argument("--candidates", required=True, help='JSON array of {"id", "statement", "cited_prs"}')
@@ -338,6 +352,9 @@ def main(argv=None):
         given = [value is not None for value in limits.values()]
         if any(given) and not all(given):
             extract_parser.error("--max-patterns, --max-observations and --max-rejected go together")
+        if args.max_answer_bytes is not None and not all(given):
+            extract_parser.error("--max-answer-bytes needs --max-patterns, --max-observations and --max-rejected")
+        limits["answer_bytes"] = args.max_answer_bytes
     try:
         if args.command == "extract":
             written = extract(args.digest_dir, args.out, args.lens or list(LENSES), limits if all(given) else None)

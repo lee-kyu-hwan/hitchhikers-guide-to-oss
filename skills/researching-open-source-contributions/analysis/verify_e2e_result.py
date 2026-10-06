@@ -185,10 +185,19 @@ def corpus_keys(corpus_doc: dict) -> dict:
     return records_by_key(corpus_doc)
 
 
+def answer_bytes(value) -> int:
+    """An answer (or one candidate) the way the next stage's prompt block holds it: indent-1 JSON, UTF-8. The stage
+    output limits of run_limits.json (#248) are in this measure (stage_inputs.answer_bytes)."""
+    return len(json.dumps(value, ensure_ascii=False, indent=1).encode("utf-8"))
+
+
 def schema_problems(answer: object, limits: dict, lens: str) -> list:
     problems = []
     if not isinstance(answer, dict) or set(answer) != {"lens", "patterns", "observations", "rejected"}:
         return ["keys must be exactly lens, patterns, observations, rejected"]
+    if answer_bytes(answer) > limits["extract_answer_max_bytes"]:
+        problems.append("the answer is %d bytes as a prompt holds it (> extract_answer_max_bytes %d)"
+                        % (answer_bytes(answer), limits["extract_answer_max_bytes"]))
     if answer["lens"] != lens:
         problems.append("lens %r" % (answer["lens"],))
     for key, cap in (("patterns", "max_patterns"), ("observations", "max_observations"),
@@ -235,8 +244,8 @@ def synthesis_problems(answer: object, limits: dict, keys: dict) -> list:
     if not isinstance(answer, dict) or set(answer) != {"candidates", "dropped"}:
         return ["keys must be exactly candidates, dropped"]
     candidates, dropped = answer["candidates"], answer["dropped"]
-    if not isinstance(candidates, list) or len(candidates) > limits["max_patterns"]:
-        return ["candidates must be a list of at most %d" % limits["max_patterns"]]
+    if not isinstance(candidates, list) or len(candidates) > limits["synthesis_max_candidates"]:
+        return ["candidates must be a list of at most %d (synthesis_max_candidates)" % limits["synthesis_max_candidates"]]
     if not isinstance(dropped, list) or len(dropped) > limits["max_rejected"]:
         return ["dropped must be a list of at most %d" % limits["max_rejected"]]
     problems, seen = [], set()
@@ -246,9 +255,12 @@ def synthesis_problems(answer: object, limits: dict, keys: dict) -> list:
                 or set(item) - {"id", "statement", "cited_prs", "found_by"}:
             problems.append(where + " needs id, statement, cited_prs (and optional found_by) only")
             continue
-        if not isinstance(item["id"], str) or re.fullmatch(r"[A-Za-z0-9_-]+", item["id"]) is None or item["id"] in seen:
-            problems.append(where + ".id must be unique [A-Za-z0-9_-]+")
+        if not isinstance(item["id"], str) or re.fullmatch(r"C[1-9][0-9]?", item["id"]) is None or item["id"] in seen:
+            problems.append(where + ".id must be a unique C1 … C99")
         seen.add(item.get("id"))
+        if answer_bytes(item) > limits["candidate_max_bytes"]:
+            problems.append(where + " is %d bytes as a prompt holds it (> candidate_max_bytes %d)"
+                            % (answer_bytes(item), limits["candidate_max_bytes"]))
         if not isinstance(item["statement"], str) or not item["statement"].strip() \
                 or len(item["statement"]) > limits["candidate_statement_max_chars"]:
             problems.append(where + ".statement must be a nonempty string of at most %d characters"

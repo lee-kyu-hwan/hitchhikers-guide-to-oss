@@ -3361,6 +3361,44 @@ exit 0
         self.assertEqual(self.call(plan, kind="sentinel").returncode, 5)  # sentinels are not counted
         self.assertEqual(self.call(self.stage(14, name="other.json"), kind="sentinel").returncode, 3)
 
+    def worst_case_stage(self, name="worst.json"):
+        """A stage.json as extract-inputs writes it for the eslint bundle's worst-case plan (#248): the synthesis
+        groups and every merge level above them are synthesis calls (synthesis_levels 7 + 3 + 1)."""
+        plan = {"mode": "extraction-only", "shards": 4, "lenses": 5, "extract": 20, "synthesis": 11,
+                "synthesis_levels": [7, 3, 1], "verify": 3, "final": 1, "max_model_calls": 35, "formula": "...",
+                "inputs": {"max_candidates": 3, "shards": 4, "lenses": 5, "limits": {"synthesis_max_candidates": 3}}}
+        path = self.root / name
+        path.write_text(json.dumps({"stage": "extract", "max_model_calls": 35, "call_plan": plan,
+                                    "worst_case": {"levels": 3}}))
+        return path
+
+    def test_a_worst_case_plan_of_several_merge_levels_binds_the_ledger_as_any_plan(self):
+        plan = self.worst_case_stage()
+        refused = self.run_until_refused(plan)
+        self.assertEqual(refused.returncode, 3, refused.stderr)
+        self.assertEqual(refused.stderr, "refused: the ledger already holds 35 model calls\n")
+        self.assertEqual(self.token_lines(), 35)
+        self.assertEqual(json.loads((self.ledger_dir / "ledger-limit.json").read_text()),
+                         {"limit": 35, "call_plan_sha256": hashlib.sha256(plan.read_bytes()).hexdigest()})
+
+    def test_the_continuation_of_a_worst_case_plan_counts_its_merge_levels_within_forty(self):
+        plan = self.worst_case_stage()
+        for _ in range(20):                                    # the extract calls, under the parent ledger
+            self.assertEqual(self.call(plan).returncode, 0)
+        before = self.limactl_calls()
+        over = self.continuation(plan, remaining=21, name="c21.json", synthesis=17, synthesis_groups=7,
+                                 synthesis_levels=[7, 4, 3, 2, 1], verify=3)
+        refused = self.call(over, ledger=self.root / "child", parent=self.ledger_dir)
+        self.assertEqual(refused.returncode, 2, refused.stderr)
+        self.assertIn("20 parent calls + 21 is over the absolute cap 40", refused.stderr)
+        self.assertFalse((self.root / "child").exists())
+        self.assertEqual(self.limactl_calls(), before)
+        within = self.continuation(plan, remaining=15, name="c15.json", synthesis=11, synthesis_groups=7,
+                                   synthesis_levels=[7, 3, 1], verify=3)
+        done = self.call(within, ledger=self.root / "child", parent=self.ledger_dir)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(15, json.loads((self.root / "child" / "ledger-limit.json").read_text())["limit"])
+
     def test_a_call_plan_over_forty_is_refused_before_anything_starts(self):
         refused = self.call(self.stage(41))
         self.assertEqual(refused.returncode, 2, refused.stderr)

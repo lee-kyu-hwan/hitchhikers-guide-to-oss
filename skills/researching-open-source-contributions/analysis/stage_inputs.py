@@ -6,12 +6,15 @@ holds the collected corpus, the digest, and the five lens extraction prompts. Th
 script only moves bytes between that run and one input directory per isolated model
 call, and assembles the final analysis envelope deterministically:
 
+  dry-plan         RUN → the worst-case plan on stdout          (no model, nothing written; #248)
   extract-inputs   RUN → OUT/extract-<lens>/task.txt           (5 independent calls)
   continue-plan    RUN + adopted extract results + their extract stage → OUT/stage.json
                    (or + a continue stage and the adopted synthesis/verify answers of its ledger, or of the
                    ancestor ledgers of a straight chain: the rest)
                    (no prompt: the call plan of the stages not yet run, #82)
-  synthesis-input  RUN + extract results → OUT/task.txt        (1 call: candidates)
+  synthesis-input  RUN + extract results → OUT/task.txt        (1 call: candidates, or a call per group)
+  synthesis-merge-input  RUN + a synthesis (or merge) stage + its group answers → OUT/<call>/task.txt
+                   (1 last merge call, or the merge calls of another level, #248)
   verify-inputs    RUN + synthesis answer → OUT/verify-<id>/task.txt  (k calls, k may be 0)
   final-input      RUN + all answers → OUT/task.txt            (1 call: judgment fields)
   assemble         RUN + final answer → analysis.json          (no model; validated)
@@ -29,15 +32,25 @@ check_extraction.py (every quote against the corpus), validate_corpus.py
 generated_by/source_licenses/history) itself; a model answer that carries any of
 them is refused. Nothing here opens the network, starts a model, or reads a credential.
 
-Counts follow run_limits.json and are refused, never truncated: at most
-``max_patterns`` candidates (so at most that many verify calls) and final
-patterns, ``max_rejected`` dropped ideas, and the extract caps per lens result.
+Counts and sizes follow run_limits.json and are refused, never truncated: at most
+``synthesis_max_candidates`` candidates of at most ``candidate_max_bytes`` each (so at most
+that many verify calls), ``max_patterns`` final patterns, ``max_rejected`` dropped ideas,
+the extract caps per lens result and ``extract_answer_max_bytes`` per extract answer. Each
+prompt states the limits its answer is checked against (render_limits, build_prompts
+--max-answer-bytes), and verify_e2e_result.py checks the same values.
 The model calls of one run are therefore at most
-``shards x lenses + synthesis calls + max_candidates (verify) + 1 (final)``: 12
-for a digest that fits one shard and whose final prompt can carry it (5 + 1 + 5 + 1).
+``shards x lenses + synthesis calls + synthesis_max_candidates (verify) + 1 (final)``: 10
+for a digest that fits one shard and whose final prompt can carry it (5 + 1 + 3 + 1).
 The digest is sharded by ``oss_workflow.py digest --max-bytes`` so that each lens
 prompt stays under the worker's input limit; every lens runs on every shard, and a
 prompt over PROMPT_MAX_BYTES is refused before anything is written, never cut.
+
+Worst-case plan (#248): from the corpus, the digest and those limits alone, every stage
+input is sized with every answer at its limit, the reduce levels are counted (synthesis
+groups, then merges of merges until one call) and so are the model calls; extract-inputs
+records that plan as the call plan and refuses, before any model call, an extraction-only
+run whose plan can pass PROMPT_MAX_BYTES or ABSOLUTE_MAX_CALLS. dry-plan shows it, with
+repository bundles that would pass when it does not.
 
 Two paths, chosen by the run (Context.reduced). When the digest is one shard and the
 final prompt can carry it, every stage input is what it always was (the 2026-09-28 run's
@@ -45,7 +58,8 @@ inputs are reproduced byte for byte, test_stage_inputs.py). Otherwise the reduce
 take the extraction answers, never the digest (map, then reduce):
 
   synthesis        the extract answers and a PR index; split in groups (and merged by
-                   synthesis-merge-input: a synthesis of syntheses) when they do not fit one prompt
+                   synthesis-merge-input: a synthesis of syntheses, itself split in another
+                   level when the group answers do not fit one merge prompt) when they do not fit one prompt
   verify           the candidate and the digest sections of the PRs it cites, no others
   final            the synthesis, the verify answers, the verified quotes and the PR index
 
@@ -88,39 +102,29 @@ REPO = HERE.parents[2]
 WORKFLOW = REPO / "dot_agents/skills/researching-open-source-contributions/scripts/oss_workflow.py"
 PROMPTS = HERE / "prompts"
 LIMITS = json.loads((HERE / "run_limits.json").read_text(encoding="utf-8"))
-MAX_CANDIDATES = LIMITS["max_patterns"]
+# Stage output limits (#248): each is stated in the prompt of the stage that answers and checked, with the same
+# value, by verify_e2e_result.py and here; the worst-case plan (dry-plan) sizes the next stage's input from them.
+MAX_CANDIDATES = LIMITS["synthesis_max_candidates"]     # candidates of one synthesis, group or merge answer
 MAX_FINAL_PATTERNS = LIMITS["max_patterns"]
 MAX_DROPPED = LIMITS["max_rejected"]
+CANDIDATE_MAX_BYTES = LIMITS["candidate_max_bytes"]     # one candidate as a prompt block holds it (answer_bytes)
+EXTRACT_ANSWER_MAX_BYTES = LIMITS["extract_answer_max_bytes"]   # one extract answer, the same measure
 EXTRACT_CAPS = {"patterns": LIMITS["max_patterns"], "observations": LIMITS["max_observations"],
                 "rejected": LIMITS["max_rejected"]}
 EXTRACT_CALLS = 5
-MAX_SYNTHESIS_GROUPS = LIMITS["max_synthesis_groups"]
+# The harness ledger's absolute cap (analysis_call.sh): a plan over it is refused before any model call.
+ABSOLUTE_MAX_CALLS = 40
+CANDIDATE_ID = re.compile(r"C[1-9][0-9]?")
 
 
-def model_call_plan(shards: int, lenses: int, max_candidates: int, synthesis_calls: int = 1,
-                    mode: str | None = None) -> dict:
-    """The most model calls one run can make, from the corpus-dependent shard count.
-
-    Every lens reads every shard (extract), then the synthesis (one call, or up to
-    ``max_synthesis_groups`` group calls and one merge on the extraction-only path), at
-    most one verify per candidate, and one final. The limit is recorded in the extract
-    stage's manifest; the synthesis stage records how many synthesis calls it needs.
-    """
-    total = shards * lenses + synthesis_calls + max_candidates + 1
-    plan = {"shards": shards, "lenses": lenses, "extract": shards * lenses, "synthesis": synthesis_calls,
-            "verify": max_candidates, "final": 1, "max_model_calls": total}
-    if mode is None:
-        plan["formula"] = ("%d shards x %d lenses + 1 (synthesis) + %d (verify, at most max_candidates) + 1 (final) = %d"
-                           % (shards, lenses, max_candidates, total)) if synthesis_calls == 1 else (
-            "%d shards x %d lenses + %d (synthesis) + %d (verify, at most max_candidates) + 1 (final) = %d"
-            % (shards, lenses, synthesis_calls, max_candidates, total))
-        return plan
-    groups = synthesis_calls - 1
-    plan = {"mode": mode, **plan, "synthesis_min": 1, "synthesis_groups_max": groups}
-    plan["formula"] = ("%d shards x %d lenses + %d (synthesis: 1 call, or up to %d group calls + 1 merge) + %d (verify, "
-                       "at most max_candidates) + 1 (final) = %d"
-                       % (shards, lenses, synthesis_calls, groups, max_candidates, total))
-    return plan
+def model_call_plan(shards: int, lenses: int, max_candidates: int) -> dict:
+    """The model calls of a digest-in-final run: every lens reads the one shard, then one synthesis, at most one
+    verify per candidate, and one final. (An extraction-only run takes its plan from worst_case_plan.)"""
+    total = shards * lenses + 1 + max_candidates + 1
+    return {"shards": shards, "lenses": lenses, "extract": shards * lenses, "synthesis": 1, "verify": max_candidates,
+            "final": 1, "max_model_calls": total,
+            "formula": "%d shards x %d lenses + 1 (synthesis) + %d (verify, at most max_candidates) + 1 (final) = %d"
+                       % (shards, lenses, max_candidates, total)}
 
 
 MAX_MODEL_CALLS = model_call_plan(1, EXTRACT_CALLS, MAX_CANDIDATES)["max_model_calls"]
@@ -205,6 +209,11 @@ class Context:
         self.keymap = read_json(self.digest_dir / "keymap.json", PROMPT_MAX_BYTES, "keymap")
         self.shards = len(self.keymap["shards"])
         self.references = list(self.request["source"].get("reference_repositories") or [])
+        # as check_extraction and build_digest compare them (lower case), for the worst-case plan's own reads
+        try:
+            self.references_normalized = self.siblings.validate_corpus.normalize_reference_repositories(self.references)
+        except ValueError as error:
+            raise StageError("request reference_repositories: %s" % error) from error
         # Extraction-only reduce stages when the digest is sharded or its final prompt could not carry it.
         self.reduced = self.shards > 1 or self._final_cannot_carry_the_digest()
         self.mode = "extraction-only" if self.reduced else "digest-in-final"
@@ -282,11 +291,14 @@ class Context:
 
     def extract_prompt_texts(self) -> dict[str, str]:
         """The extract prompts of this digest, written again by the analyzer with the count limits the answers are
-        checked against (EXTRACT_CAPS, from run_limits.json), so the prompt and the checks say the same numbers.
+        checked against (EXTRACT_CAPS, from run_limits.json) and the answer size limit (extract_answer_max_bytes,
+        #248), so the prompt and the checks say the same numbers.
         The digest's own prompts were written without them; only their names are taken from there."""
         stems = self.extract_stems()
         with tempfile.TemporaryDirectory(prefix="stage-extract-") as tmp:
             limits = [item for kind, cap in EXTRACT_CAPS.items() for item in ("--max-" + kind, str(cap))]
+            if EXTRACT_ANSWER_MAX_BYTES is not None:
+                limits += ["--max-answer-bytes", str(EXTRACT_ANSWER_MAX_BYTES)]
             code, _, stderr = self.wf.run_main(self.siblings.build_prompts.main, [
                 "extract", "--digest-dir", str(self.digest_dir), "--out", tmp, *limits])
             if code != 0:
@@ -371,6 +383,44 @@ def write_json(path: Path, value) -> None:
     path.write_text(json.dumps(value, ensure_ascii=False, indent=1) + "\n", encoding="utf-8")
 
 
+def answer_bytes(value) -> int:
+    """A model answer (or one candidate of it) measured the way a prompt block holds it: indent-1 JSON, UTF-8. The
+    stage output limits are in this measure, whatever whitespace the model wrote."""
+    return len(json.dumps(value, ensure_ascii=False, indent=1).encode("utf-8"))
+
+
+LIMIT_TOKEN = re.compile(r"\{\{([a-z_]+)\}\}")
+
+
+def output_limits() -> dict:
+    """The stage output limits in force (module constants, read when used)."""
+    return {"synthesis_max_candidates": MAX_CANDIDATES, "max_rejected": MAX_DROPPED, "max_patterns": MAX_FINAL_PATTERNS,
+            "candidate_max_bytes": CANDIDATE_MAX_BYTES, "extract_answer_max_bytes": EXTRACT_ANSWER_MAX_BYTES,
+            "verify_answer_max_bytes": VERIFY_ANSWER_MAX_BYTES}
+
+
+def render_limits(text: str) -> str:
+    """A prompt template with ``{{limit}}`` filled from the limits in force, so a prompt states the numbers its answer
+    is checked against. A line naming a limit that is not set (None: a cap set from before that limit existed) is left
+    out whole, so such a cap set renders the template as it was before the limit."""
+    limits = output_limits()
+    lines = []
+    for line in text.split("\n"):
+        names = LIMIT_TOKEN.findall(line)
+        unknown = [name for name in names if name not in limits]
+        if unknown:
+            raise StageError("prompt template names unknown limits: " + ", ".join(unknown))
+        if any(limits[name] is None for name in names):
+            continue
+        lines.append(LIMIT_TOKEN.sub(lambda match: str(limits[match.group(1)]), line))
+    return "\n".join(lines)
+
+
+def template(name: str) -> str:
+    """A stage prompt template of this bundle, its limits filled in (render_limits)."""
+    return render_limits(read_bounded(PROMPTS / name, PROMPT_MAX_BYTES, "template " + name).decode("utf-8"))
+
+
 def block(title: str, value) -> str:
     body = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, indent=1)
     return "\n\n=== " + title + " ===\n" + body.rstrip() + "\n=== " + title + " 끝 ==="
@@ -437,11 +487,11 @@ def parse_quote_lines(text: str) -> list:
     return [{"pr_id": item["pr_id"], "pr": item["pr"], "quote": "\n".join(item["lines"])} for item in found]
 
 
-def reduced_final_prompt_text(context: "Context", candidates: list, verify: dict, report: dict) -> str:
+def reduced_final_prompt_text(context: "Context", candidates: list, verify: dict, report: dict, rows=None) -> str:
     """Extraction-only final: the PR index, the candidates, the verify answers and the verified quotes
-    (as the source text, quote_report_text)."""
-    text = read_bounded(PROMPTS / "finalize-reduced.md", PROMPT_MAX_BYTES, "finalize template").decode("utf-8")
-    text += block("PR 색인", context.pr_index())
+    (as the source text, quote_report_text). ``rows`` replaces the run's PR index (the worst-case plan of a part)."""
+    text = template("finalize-reduced.md")
+    text += block("PR 색인", context.pr_index() if rows is None else rows)
     text += block("후보", candidates)
     for stem in sorted(verify):
         text += block("반박 검증 " + stem, verify[stem])
@@ -454,7 +504,7 @@ def legacy_final_prompt_text(context: "Context", candidates: list, verify: dict,
     shards = "\n\n".join(
         read_bounded(context.digest_dir / name, PROMPT_MAX_BYTES, "digest shard").decode("utf-8").rstrip()
         for name in context.keymap["shards"])
-    text = read_bounded(PROMPTS / "finalize.md", PROMPT_MAX_BYTES, "finalize template").decode("utf-8")
+    text = template("finalize.md")
     text += block("PR 목록", context.pr_list())
     text += block("다이제스트", shards)
     text += block("후보", candidates)
@@ -527,10 +577,12 @@ def parse_synthesis(context: Context, path: str) -> list[dict]:
         if not isinstance(candidate, dict) or not {"id", "statement", "cited_prs"} <= set(candidate) \
                 or set(candidate) - {"id", "statement", "cited_prs", "found_by"}:
             raise StageError(label + " must hold id, statement, cited_prs, and optional found_by")
-        if not isinstance(candidate["id"], str) or not context.siblings.build_prompts.CANDIDATE_ID.fullmatch(candidate["id"]) \
-                or candidate["id"] in seen:
-            raise StageError(label + " id must be unique [A-Za-z0-9_-]+")
+        if not isinstance(candidate["id"], str) or not CANDIDATE_ID.fullmatch(candidate["id"]) or candidate["id"] in seen:
+            raise StageError(label + " id must be a unique C1 … C99")
         seen.add(candidate["id"])
+        if CANDIDATE_MAX_BYTES is not None and answer_bytes(candidate) > CANDIDATE_MAX_BYTES:
+            raise StageError(label + " is %d bytes as a prompt holds it (> candidate_max_bytes %d); refused, not cut"
+                             % (answer_bytes(candidate), CANDIDATE_MAX_BYTES))
         if not isinstance(candidate["statement"], str) or not candidate["statement"].strip() \
                 or len(candidate["statement"]) > STATEMENT_MAX_CHARS:
             raise StageError(label + " statement must be a nonempty string of at most %d characters"
@@ -544,18 +596,462 @@ def parse_synthesis(context: Context, path: str) -> list[dict]:
     return candidates
 
 
+# -- worst-case plan (#248): every stage input at the stage output limits, before any model call ----------------
+#
+# The answers are not known before the extract calls, so each stage input is sized with every answer at its limit
+# (extract_answer_max_bytes, synthesis_max_candidates x candidate_max_bytes, verify_answer_max_bytes) and every
+# quote at the widest 300 characters (validate_corpus MAX_QUOTE_LENGTH) its PR's own text holds. Calls are packed in
+# order (next fit), so with every answer within the limits each call holds at least ``per_call`` inputs and a level
+# needs at most ceil(inputs / per_call) calls: the real run never needs more than the plan.
+
+# An extract answer's share of its group's quote report: its verified quotes once each (an adopted answer has no
+# failed quote: Q1) and its file entry. At most the answer's own bytes plus this.
+REPORT_SHARE_SLACK_BYTES = 2048
+# A verify answer in the final prompt: its block (indent-1 JSON, which may be a little larger than the answer bytes)
+# and its verified quotes again in the quote report: at most twice the answer bytes plus this.
+VERIFY_BLOCK_SLACK_BYTES = 512
+WIDE_COUNT = 9999          # report totals measured at four digits
+WIDE_ID = "C99"            # the longest candidate id (CANDIDATE_ID)
+
+
+def json_width(char: str) -> int:
+    """Bytes one character takes inside a JSON string of a prompt block (indent-1, ensure_ascii off)."""
+    if char in '"\\':
+        return 2
+    if ord(char) < 0x20:
+        return 2 if char in "\b\f\n\r\t" else 6
+    return len(char.encode("utf-8"))
+
+
+def widest_window(text: str, length: int, width) -> int:
+    """The most bytes any ``length`` consecutive characters of ``text`` take."""
+    widths = [width(char) for char in text]
+    total = best = sum(widths[:length])
+    for index in range(length, len(widths)):
+        total += widths[index] - widths[index - length]
+        best = max(best, total)
+    return best
+
+
+class PlanInputs:
+    """What the worst-case plan needs of a run, or of a part of its corpus (the split suggestion): the corpus, the
+    digest and the limits, never an answer."""
+
+    def __init__(self, *, mode, shards, stems, rows, quotes, extract_bytes, verify_bytes, legacy=None):
+        self.mode, self.shards, self.stems, self.rows = mode, shards, stems, rows
+        self.quotes = quotes                    # key -> (widest quote in a JSON block, widest raw quote)
+        self.extract_bytes = extract_bytes      # the largest extract prompt (known: the digest's own)
+        self.verify_bytes = verify_bytes        # the verify prompt of a limit-size candidate citing the 2 largest PRs
+        self.legacy = legacy                    # digest-in-final: {"synthesis": fixed bytes, "final": fixed bytes}
+        self.pr_ids = {row["key"]: row["pr_id"] for row in rows}
+        self.repositories = sorted({row["repository"] for row in rows})
+
+
+def record_quote_bounds(validate, record, references) -> tuple[int, int]:
+    """(JSON block bytes, raw bytes) of the widest quote a record can give: MAX_QUOTE_LENGTH characters of one of its
+    quotable texts (what check_extraction accepts a quote from)."""
+    texts = validate.quotable_texts(record, references) or [""]
+    length = validate.MAX_QUOTE_LENGTH
+    return (max(widest_window(text, length, json_width) for text in texts),
+            max(widest_window(text, length, lambda char: len(char.encode("utf-8"))) for text in texts))
+
+
+def worst_candidate(cited: list[str]) -> dict:
+    """A candidate of exactly candidate_max_bytes (or as close as the characters allow) citing ``cited``."""
+    candidate = {"id": WIDE_ID, "statement": "", "cited_prs": list(cited), "found_by": ""}
+    budget = CANDIDATE_MAX_BYTES - answer_bytes(candidate)
+    wide = min(STATEMENT_MAX_CHARS, max(budget, 0) // 3)
+    candidate["statement"] = "가" * wide + "a" * min(STATEMENT_MAX_CHARS - wide, max(budget - 3 * wide, 0))
+    return candidate
+
+
+def candidate_shape(keys: list[str]) -> tuple[int, int]:
+    """(the most cited PRs one candidate within candidate_max_bytes can hold, the most lines it then takes): every
+    extra line of a nested block adds its indent."""
+    shortest = min(keys, key=len)
+    cited = 2
+    while answer_bytes({"id": "C1", "statement": "x", "cited_prs": [shortest] * (cited + 1)}) <= CANDIDATE_MAX_BYTES:
+        cited += 1
+    return cited, cited + 7
+
+
+def top_sum(values: list[int], count: int) -> int:
+    return sum(sorted(values, reverse=True)[:count])
+
+
+def merge_input_bound(inputs: PlanInputs, name: str) -> int:
+    """One group (or lower merge) answer in a merge prompt: its block of synthesis_max_candidates limit-size
+    candidates and, for every PR they can cite, its verified quote or a no-quote entry per citing candidate."""
+    cited, lines = candidate_shape(list(inputs.quotes))
+    empty = len(block("그룹 종합 " + name, {"candidates": []}).encode("utf-8"))
+    candidates = MAX_CANDIDATES * (CANDIDATE_MAX_BYTES + 2 * lines + 2) + 8
+    per_pr = []
+    for key, (quote_json, _) in inputs.quotes.items():
+        quoted = answer_bytes({"pr": key, "pr_id": inputs.pr_ids[key], "quote": ""}) + quote_json + 2 * 5 + 2
+        missing = answer_bytes({"group": name, "candidate": WIDE_ID, "pr": key}) + 2 * 5 + 2
+        per_pr.append(max(quoted, MAX_CANDIDATES * missing))
+    return empty + candidates + top_sum(per_pr, MAX_CANDIDATES * cited)
+
+
+def final_bound(inputs: PlanInputs) -> int:
+    """The extraction-only final prompt with synthesis_max_candidates limit-size candidates, as many verify answers
+    of verify_answer_max_bytes, and for every PR they can cite its widest verified quote (or no-quote entries)."""
+    cited, lines = candidate_shape(list(inputs.quotes))
+    empty_report = {"totals": {"verified": WIDE_COUNT, "total": WIDE_COUNT}, "verified_evidence": [], "no_quote": []}
+    text = template("finalize-reduced.md") + block("PR 색인", inputs.rows) + block("후보", []) \
+        + block("인용 확인 보고서", quote_report_text(empty_report))
+    candidates = MAX_CANDIDATES * (CANDIDATE_MAX_BYTES + lines + 2) + 8
+    verify_block = len(block("반박 검증 verify-" + WIDE_ID, {}).encode("utf-8")) - 2
+    verify = MAX_CANDIDATES * (verify_block + 2 * VERIFY_ANSWER_MAX_BYTES + VERIFY_BLOCK_SLACK_BYTES)
+    per_pr = []
+    for key, (_, quote_raw) in inputs.quotes.items():
+        quoted = len(("- %s %s\n" % (inputs.pr_ids[key], key)).encode("utf-8")) + quote_raw + 1
+        missing = len(json.dumps({"candidate": WIDE_ID, "pr": key}, ensure_ascii=False).encode("utf-8")) + 2
+        per_pr.append(max(quoted, MAX_CANDIDATES * missing))
+    return len(text.encode("utf-8")) + candidates + verify + top_sum(per_pr, MAX_CANDIDATES * cited)
+
+
+def synthesis_fixed(rows: list, note: str | None) -> int:
+    report = {"totals": {"verified": WIDE_COUNT, "total": WIDE_COUNT}, "files": [], "verified_evidence": []}
+    text = template("synthesize-reduced.md") + (block("범위", note) if note else "") + block("PR 색인", rows) \
+        + block("인용 확인 보고서", report)
+    return len(text.encode("utf-8"))
+
+
+def merge_fixed(rows: list, note: str | None) -> int:
+    report = {"totals": {"verified": WIDE_COUNT, "total": WIDE_COUNT}, "verified_evidence": [], "no_quote": []}
+    text = template("synthesize-merge.md") + (block("범위", note) if note else "") + block("PR 색인", rows) \
+        + block("인용 확인 보고서", report)
+    return len(text.encode("utf-8"))
+
+
+def extract_answer_bound(stem: str) -> int:
+    """One extract answer in a synthesis prompt: its block, and its share of the quote report."""
+    return len(block("추출 결과 " + stem, {}).encode("utf-8")) - 2 + 2 * EXTRACT_ANSWER_MAX_BYTES \
+        + REPORT_SHARE_SLACK_BYTES
+
+
+def widest(names: list[str], count: int) -> list[str]:
+    return sorted(names, key=len, reverse=True)[:count]
+
+
+def pack_level(names: list[str], bound, fixed, note) -> dict:
+    """One reduce level in the worst case: every input at ``bound(name)``. One call (no note) when they all fit,
+    else as many per call as fit beside the widest note."""
+    single = fixed(None) + sum(bound(name) for name in names)
+    if single <= PROMPT_MAX_BYTES:
+        return {"inputs": len(names), "calls": 1, "per_call": len(names), "worst_bytes": single, "ok": True}
+    largest = max(bound(name) for name in names)
+    per_call = 0
+    while per_call < len(names):
+        size = fixed(note(widest(names, per_call + 1))) + (per_call + 1) * largest
+        if size > PROMPT_MAX_BYTES:
+            break
+        per_call += 1
+    worst = fixed(note(widest(names, max(per_call, 1)))) + max(per_call, 1) * largest
+    calls = -(-len(names) // per_call) if per_call else len(names)
+    return {"inputs": len(names), "calls": calls, "per_call": per_call, "worst_bytes": worst, "ok": per_call >= 2}
+
+
+def synthesis_group_level(rows: list, stems: list[str]) -> dict:
+    """The synthesis groups in the worst case: every extract answer at extract_answer_max_bytes."""
+    level = pack_level(stems, extract_answer_bound, lambda note: synthesis_fixed(rows, note),
+                       lambda names: group_note(99, 99, names))
+    level["ok"] = level["per_call"] >= 1
+    return level
+
+
+def synthesis_group_bound(rows: list, stems: list[str]) -> int:
+    """The most synthesis groups the answers within the limits can need (one per answer without a size limit)."""
+    if EXTRACT_ANSWER_MAX_BYTES is None:
+        return len(stems)
+    level = synthesis_group_level(rows, stems)
+    return level["calls"] if level["ok"] else len(stems)
+
+
+def synthesis_levels(inputs: PlanInputs, groups: int | None = None) -> tuple[list, list]:
+    """The reduce levels of an extraction-only run: the synthesis groups (unless ``groups`` gives their real number),
+    then merge levels until one call. Returns (levels, refusals)."""
+    levels, refusals = [], []
+    if groups is None:
+        if EXTRACT_ANSWER_MAX_BYTES is None:
+            return [{"stage": "synthesis", "level": 1, "inputs": len(inputs.stems), "calls": len(inputs.stems),
+                     "per_call": 0, "worst_bytes": None, "ok": False}], [
+                "synthesis: no extract_answer_max_bytes in the limits, so the groups are not bounded"]
+        level = synthesis_group_level(inputs.rows, inputs.stems)
+        levels.append({"stage": "synthesis", "level": 1, **level})
+        if not level["ok"]:
+            refusals.append("synthesis: one extract answer at extract_answer_max_bytes %d makes a group prompt of %d "
+                            "bytes (> %d)" % (EXTRACT_ANSWER_MAX_BYTES, level["worst_bytes"], PROMPT_MAX_BYTES))
+            return levels, refusals
+        groups = level["calls"]
+    if groups == 1:
+        return levels, refusals
+    if CANDIDATE_MAX_BYTES is None:
+        levels.append({"stage": "merge", "level": 2, "inputs": groups, "calls": None, "per_call": 0,
+                       "worst_bytes": None, "ok": False})
+        return levels, refusals + ["merge: no candidate_max_bytes in the limits, so the merge is not bounded"]
+    names = ["synthesis-%02d" % number for number in range(1, groups + 1)]
+    number = 2
+    while True:
+        level = pack_level(names, lambda name: merge_input_bound(inputs, name),
+                           lambda note: merge_fixed(inputs.rows, note),
+                           lambda members: merge_note(99, 99, 99, members))     # measured as synthesis-merge-input does
+        levels.append({"stage": "merge", "level": number, **level})
+        if level["calls"] == 1:
+            return levels, refusals
+        if not level["ok"]:
+            refusals.append("merge level %d: %d group answers at the limits need %d calls (%d per call): another level "
+                            "would merge nothing" % (number, level["inputs"], level["calls"], level["per_call"]))
+            return levels, refusals
+        names = ["merge-%02d-%02d" % (number, index) for index in range(1, level["calls"] + 1)]
+        number += 1
+
+
+def worst_case_plan(inputs: PlanInputs) -> dict:
+    """Every stage input at the stage output limits, the reduce levels, and the model calls of the run, before any
+    model call (#248). ``ok`` is false when a stage input can pass PROMPT_MAX_BYTES or the calls ABSOLUTE_MAX_CALLS."""
+    lenses = len(inputs.stems) // inputs.shards
+    stages = [{"stage": "extract", "calls": len(inputs.stems), "worst_bytes": inputs.extract_bytes,
+               "ok": inputs.extract_bytes <= PROMPT_MAX_BYTES}]
+    refusals = [] if stages[0]["ok"] else ["extract: the largest extract prompt is %d bytes (> %d)"
+                                            % (inputs.extract_bytes, PROMPT_MAX_BYTES)]
+    if inputs.mode == "extraction-only":
+        levels, problems = synthesis_levels(inputs)
+        refusals += problems
+        final = final_bound(inputs) if CANDIDATE_MAX_BYTES is not None else None
+    else:
+        single = inputs.legacy["synthesis"] + (sum(extract_answer_bound(stem) for stem in inputs.stems)
+                                               if EXTRACT_ANSWER_MAX_BYTES is not None else 0)
+        levels = [{"stage": "synthesis", "level": 1, "inputs": len(inputs.stems), "calls": 1,
+                   "per_call": len(inputs.stems), "worst_bytes": single,
+                   "ok": EXTRACT_ANSWER_MAX_BYTES is not None and single <= PROMPT_MAX_BYTES}]
+        if not levels[0]["ok"]:
+            refusals.append("synthesis: the digest-in-final synthesis is one call and is %s bytes at the limits"
+                            % single)
+        final = None
+    stages += levels
+    synthesis = sum(level["calls"] or 0 for level in levels)
+    stages.append({"stage": "verify", "calls": MAX_CANDIDATES, "worst_bytes": inputs.verify_bytes,
+                   "ok": inputs.verify_bytes is not None and inputs.verify_bytes <= PROMPT_MAX_BYTES})
+    if not stages[-1]["ok"]:
+        refusals.append("verify: a limit-size candidate citing the two largest PR sections makes a verify prompt of "
+                        "%s bytes (> %d)" % (inputs.verify_bytes, PROMPT_MAX_BYTES))
+    stages.append({"stage": "final", "calls": 1, "worst_bytes": final,
+                   "ok": final is not None and final <= PROMPT_MAX_BYTES})
+    if not stages[-1]["ok"]:
+        refusals.append("final: %s at the limits (> %d)" % ("%d bytes" % final if final is not None else
+                                                            "not bounded (digest-in-final carries every quote)",
+                                                            PROMPT_MAX_BYTES))
+    extract = len(inputs.stems)
+    total = extract + synthesis + MAX_CANDIDATES + 1
+    if total > ABSOLUTE_MAX_CALLS:
+        refusals.append("calls: %d model calls at the limits, over the absolute cap %d" % (total, ABSOLUTE_MAX_CALLS))
+    counts = [level["calls"] or 0 for level in levels]
+    plan = {"mode": inputs.mode, "shards": inputs.shards, "lenses": lenses, "extract": extract, "synthesis": synthesis,
+            "synthesis_levels": counts, "verify": MAX_CANDIDATES, "final": 1, "max_model_calls": total,
+            "formula": "%d shards x %d lenses + %d (synthesis levels %s) + %d (verify, at most "
+                       "synthesis_max_candidates) + 1 (final) = %d, every answer at the stage output limits"
+                       % (inputs.shards, lenses, synthesis, " + ".join(map(str, counts)), MAX_CANDIDATES, total),
+            "inputs": {"max_candidates": MAX_CANDIDATES, "shards": inputs.shards, "lenses": lenses,
+                       "limits": output_limits()}}
+    return {"ok": not refusals, "mode": inputs.mode, "cap": PROMPT_MAX_BYTES, "max_calls": ABSOLUTE_MAX_CALLS,
+            "records": len(inputs.rows), "repositories": inputs.repositories, "stages": stages,
+            "levels": len(levels), "synthesis_levels": counts, "total_calls": total, "call_plan": plan,
+            "refusals": refusals}
+
+
+def quote_bounds(context: Context) -> dict:
+    """Per digest key, the widest quote its record can give (record_quote_bounds); computed once per run."""
+    if getattr(context, "_quote_bounds", None) is None:
+        validate = context.siblings.validate_corpus
+        by_pr_id = {record.get("pr_id"): record for record in context.records}
+        context._quote_bounds = {key: record_quote_bounds(validate, by_pr_id[section["pr_id"]],
+                                                          context.references_normalized)
+                                 for key, section in context.keymap["sections"].items()}
+    return context._quote_bounds
+
+
+def section_sizes(context: Context, keymap: dict, digest_dir: Path) -> dict:
+    sections = {}
+    for name in keymap["shards"]:
+        text = read_bounded(digest_dir / name, PROMPT_MAX_BYTES * 4, "digest shard").decode("utf-8")
+        sections.update(context.siblings.build_prompts._sections(text, keymap["sections"]))
+    return {key: len(text.encode("utf-8")) for key, text in sections.items()}
+
+
+def worst_verify_bytes(context: Context, keymap: dict, digest_dir: Path, reduced: bool) -> int | None:
+    """The verify prompt of a candidate of candidate_max_bytes citing the two PRs that make it largest (the first two
+    a verify input must hold, fit_verify_prompt): a cited PR brings its section and leaves the title list of the
+    others, so the two with the most section bytes over their title line. None when candidates are not bounded."""
+    if CANDIDATE_MAX_BYTES is None:
+        return None
+    sizes = section_sizes(context, keymap, digest_dir)
+
+    def gain(key):
+        section = keymap["sections"][key]
+        line = "- " + key + " — " + str(section["title"]) + " (" + str(section["state"]) + ")\n"
+        return sizes[key] - len(line.encode("utf-8"))
+
+    largest = sorted(sizes, key=lambda key: (-gain(key), key))[:2]
+    candidate = worst_candidate(largest)
+    if reduced:
+        return len(verify_prompt(context, candidate, keymap, digest_dir).encode("utf-8"))
+    with tempfile.TemporaryDirectory(prefix="stage-plan-") as tmp:
+        (Path(tmp) / "candidates.json").write_text(json.dumps([candidate], ensure_ascii=False), encoding="utf-8")
+        code, _, stderr = context.wf.run_main(context.siblings.build_prompts.main, [
+            "verify", "--digest-dir", str(digest_dir), "--candidates", str(Path(tmp) / "candidates.json"),
+            "--out", str(Path(tmp) / "build")])
+        if code != 0:
+            raise StageError("build_prompts verify failed: " + stderr.strip())
+        return len((Path(tmp) / "build" / "prompts" / ("verify-" + WIDE_ID + ".md")).read_bytes())
+
+
+def legacy_fixed(context: Context, rows: list, shards_text: str) -> dict:
+    """The fixed parts of the digest-in-final synthesis and final prompts (PR list, and for final the digest)."""
+    synthesis = template("synthesize.md") + block("PR 목록", rows) + block(
+        "인용 확인 보고서", {"totals": {"verified": WIDE_COUNT, "total": WIDE_COUNT}, "files": [], "verified_evidence": []})
+    final = template("finalize.md") + block("PR 목록", rows) + block("다이제스트", shards_text) + block("후보", []) \
+        + block("인용 확인 보고서", EMPTY_REPORT)
+    return {"synthesis": len(synthesis.encode("utf-8")), "final": len(final.encode("utf-8"))}
+
+
+def plan_inputs(context: Context) -> PlanInputs:
+    """The worst-case plan inputs of this run: its digest, its extract prompts, its PR index and its quotes."""
+    texts = context.extract_prompt_texts()
+    shards_text = "\n\n".join(read_bounded(context.digest_dir / name, PROMPT_MAX_BYTES, "digest shard")
+                              .decode("utf-8").rstrip() for name in context.keymap["shards"])
+    return PlanInputs(mode=context.mode, shards=context.shards, stems=context.extract_stems(), rows=context.pr_index(),
+                      quotes=quote_bounds(context),
+                      extract_bytes=max(len(text.encode("utf-8")) for text in texts.values()),
+                      verify_bytes=worst_verify_bytes(context, context.keymap, context.digest_dir, context.reduced),
+                      legacy=None if context.reduced else legacy_fixed(context, context.pr_list(), shards_text))
+
+
+def part_inputs(context: Context, repositories: list[str]) -> PlanInputs:
+    """The plan inputs a run of only these repositories' PRs would have: the same sections, re-sharded the way the
+    digest shards them (build_digest.plan_shards at the digest's own max_bytes) and given the analyzer's own extract
+    prompts. The verify prompt is the whole run's (an upper bound: a part's two largest sections and its title list
+    are no larger)."""
+    digest = context.siblings.build_digest
+    keys = [key for key, section in context.keymap["sections"].items() if section["repository"] in repositories]
+    by_pr_id = {record.get("pr_id"): record for record in context.records}
+    records = [by_pr_id[context.keymap["sections"][key]["pr_id"]] for key in keys]
+    sections = {key: digest.render_section(key, record, context.references_normalized)
+                for key, record in zip(keys, records)}
+    shards = digest.plan_shards(keys, records, sections, context.keymap["max_bytes"])
+    names = ["digest.md"] if len(shards) == 1 else ["digest-%02d.md" % index for index in range(1, len(shards) + 1)]
+    keymap = deepcopy(context.keymap)
+    keymap["shards"], keymap["sections"] = names, {}
+    with tempfile.TemporaryDirectory(prefix="stage-plan-") as tmp:
+        directory = Path(tmp) / "digest"
+        directory.mkdir()
+        for name, shard in zip(names, shards):
+            (directory / name).write_text("\n\n".join(sections[key] for key in shard) + "\n", encoding="utf-8")
+            for key in shard:
+                keymap["sections"][key] = dict(context.keymap["sections"][key], shard=name)
+        keymap["sections"] = {key: keymap["sections"][key] for key in keys}
+        (directory / "keymap.json").write_text(json.dumps(keymap), encoding="utf-8")
+        limits = [item for kind, cap in EXTRACT_CAPS.items() for item in ("--max-" + kind, str(cap))]
+        if EXTRACT_ANSWER_MAX_BYTES is not None:
+            limits += ["--max-answer-bytes", str(EXTRACT_ANSWER_MAX_BYTES)]
+        code, _, stderr = context.wf.run_main(context.siblings.build_prompts.main, [
+            "extract", "--digest-dir", str(directory), "--out", str(Path(tmp) / "build"), *limits])
+        if code != 0:
+            raise StageError("build_prompts extract failed: " + stderr.strip())
+        extract = max(path.stat().st_size for path in (Path(tmp) / "build" / "prompts").glob("*.md"))
+        shards_text = "\n\n".join((directory / name).read_text(encoding="utf-8").rstrip() for name in names)
+        listed = [row for row in context.pr_list() if row["key"] in keys]
+        legacy = legacy_fixed(context, listed, shards_text)
+        reduced = len(shards) > 1 or legacy["final"] + FINAL_RESERVE_BYTES > PROMPT_MAX_BYTES
+        # a part whose own digest the final prompt carries is verified on that whole digest
+        verify = None if reduced else worst_verify_bytes(context, keymap, directory, False)
+    rows = [row for row in context.pr_index() if row["key"] in keys]
+    lenses = sorted(context.siblings.build_prompts.LENSES)
+    suffixes = [""] if len(shards) == 1 else ["-%02d" % number for number in range(1, len(shards) + 1)]
+    stems = sorted("extract-%s%s" % (lens, suffix) for lens in lenses for suffix in suffixes)
+    quotes = quote_bounds(context)
+    return PlanInputs(mode="extraction-only" if reduced else "digest-in-final", shards=len(shards), stems=stems,
+                      rows=rows, quotes={key: quotes[key] for key in keys}, extract_bytes=extract,
+                      verify_bytes=worst_verify_bytes(context, context.keymap, context.digest_dir, True)
+                      if reduced else verify, legacy=None if reduced else legacy)
+
+
+def split_suggestion(context: Context) -> list:
+    """Repository bundles whose own runs would each pass the worst-case plan: the repositories of one owner together
+    first (an owner whose bundle does not pass is taken repository by repository), the largest first, each joining
+    the first bundle it still passes with. A bundle that does not pass alone is listed as such (collect less)."""
+    counts = {}
+    for row in context.pr_index():
+        counts[row["repository"]] = counts.get(row["repository"], 0) + 1
+    owners = {}
+    for repository in counts:
+        owners.setdefault(repository.split("/", 1)[0], []).append(repository)
+    plans = {}
+
+    def plan_of(repositories):
+        key = tuple(sorted(repositories))
+        if key not in plans:
+            plan = worst_case_plan(part_inputs(context, list(key)))
+            plan["runs"] = runnable(plan)
+            plans[key] = plan
+        return plans[key]
+
+    units = []
+    for repositories in sorted(owners.values(), key=lambda group: (-sum(counts[r] for r in group), group)):
+        if len(repositories) > 1 and not plan_of(repositories)["runs"]:
+            units += [[repository] for repository in sorted(repositories, key=lambda r: (-counts[r], r))]
+        else:
+            units.append(sorted(repositories))
+    bundles = []
+    for unit in units:
+        for bundle in bundles:
+            if plan_of(bundle + unit)["runs"]:
+                bundle += unit
+                break
+        else:
+            bundles.append(list(unit))
+    suggestion = []
+    for bundle in bundles:
+        plan = plan_of(bundle)
+        suggestion.append({"repositories": sorted(bundle), "records": sum(counts[r] for r in bundle),
+                           "mode": plan["mode"], "shards": plan["call_plan"]["shards"],
+                           "synthesis_levels": plan["synthesis_levels"], "total_calls": plan["total_calls"],
+                           "ok": plan["runs"], "refusals": plan["refusals"]})
+    return suggestion
+
+
+def runnable(plan: dict) -> bool:
+    """A bundle the split may propose: its worst-case plan passes, or it is small enough for the digest-in-final path
+    (its extract prompts fit, at most ABSOLUTE_MAX_CALLS calls), which keeps that path's dynamic checks (README 3.4)
+    instead of a guarantee."""
+    if plan["ok"]:
+        return True
+    extract = plan["stages"][0]
+    return plan["mode"] == "digest-in-final" and extract["ok"] and plan["total_calls"] <= ABSOLUTE_MAX_CALLS
+
+
 # -- commands ----------------------------------------------------------------
 
 
+def planned(context: Context) -> bool:
+    """An extraction-only run under stage output limits that bound every reduce input: its worst-case plan, made at
+    extract-inputs, governs the later budgets (#248)."""
+    return context.reduced and CANDIDATE_MAX_BYTES is not None and EXTRACT_ANSWER_MAX_BYTES is not None
+
+
 def cmd_extract_inputs(context: Context, args) -> dict:
+    """The extract prompts of the run and its call plan. An extraction-only run's plan is the worst-case plan
+    (dry-plan, #248): every reduce level at the stage output limits; a run whose plan does not pass (a stage input
+    over PROMPT_MAX_BYTES or more than ABSOLUTE_MAX_CALLS calls) is refused here, before its first model call."""
     lenses = len(context.siblings.build_prompts.LENSES)
+    worst = None
     if context.reduced:
-        plan = model_call_plan(context.shards, lenses, MAX_CANDIDATES, MAX_SYNTHESIS_GROUPS + 1, context.mode)
+        worst = worst_case_plan(plan_inputs(context))
+        plan = worst["call_plan"]
     else:
         plan = model_call_plan(context.shards, lenses, MAX_CANDIDATES)
-    plan["inputs"] = {"max_candidates": MAX_CANDIDATES, "shards": context.shards, "lenses": lenses}
-    if context.reduced:
-        plan["inputs"]["max_synthesis_groups"] = MAX_SYNTHESIS_GROUPS
+        plan["inputs"] = {"max_candidates": MAX_CANDIDATES, "shards": context.shards, "lenses": lenses}
     # Every prompt is checked before anything is written: one over the cap refuses the whole stage.
     texts = context.extract_prompt_texts()
     oversize = ["%s is %d bytes" % (stem, len(text.encode("utf-8"))) for stem, text in sorted(texts.items())
@@ -570,6 +1066,9 @@ def cmd_extract_inputs(context: Context, args) -> dict:
         raise budget_refusal("extract-inputs", fixed + FINAL_RESERVE_BYTES,
                              "fixed part %d + reserve %d for candidates, verify answers and quotes"
                              % (fixed, FINAL_RESERVE_BYTES))
+    if worst is not None and not worst["ok"]:
+        raise StageError("extract-inputs: the worst-case plan does not pass, refused before any model call "
+                         "(dry-plan shows the stages and a repository split): %s" % "; ".join(worst["refusals"]))
     out = new_directory(args.out)
     written = []
     for stem, text in sorted(texts.items()):
@@ -578,7 +1077,19 @@ def cmd_extract_inputs(context: Context, args) -> dict:
         written.append(entry)
     summary = {"stage": "extract", "mode": context.mode, "calls": written, "max_model_calls": plan["max_model_calls"],
                "call_plan": plan, "final_budget": final_budget}
+    if worst is not None:
+        summary["worst_case"] = {"stages": worst["stages"], "levels": worst["levels"]}
     write_json(out / "stage.json", summary)
+    return summary
+
+
+def cmd_dry_plan(context: Context, args) -> dict:
+    """The worst-case plan of the run (#248), with no model call and nothing written: each stage's worst input,
+    the reduce levels and the model calls. When it does not pass, repository bundles that would."""
+    plan = worst_case_plan(plan_inputs(context))
+    summary = {"stage": "dry-plan", **plan}
+    if not plan["ok"] and plan["mode"] == "extraction-only" and len(plan["repositories"]) > 1:
+        summary["split"] = split_suggestion(context)
     return summary
 
 
@@ -613,7 +1124,7 @@ def write_scope(out: Path, name: str, keys: list[str], quotes: list[dict] | None
 
 
 def synthesis_group_text(context: Context, results: dict, report: dict, stems: list[str], note: str | None) -> str:
-    text = read_bounded(PROMPTS / "synthesize-reduced.md", PROMPT_MAX_BYTES, "synthesis template").decode("utf-8")
+    text = template("synthesize-reduced.md")
     if note:
         text += block("범위", note)
     text += block("PR 색인", context.pr_index())
@@ -629,9 +1140,26 @@ def group_note(number: int, total: int, group: list[str]) -> str:
             "이 그룹의 결과만으로 후보를 만든다." % (number, total, ", ".join(group)))
 
 
+def next_fit(units: list[list[str]], fits) -> list[list[str]]:
+    """Pack the units in order: a unit opens a new call when it no longer fits the current one."""
+    calls, current = [], []
+    for unit in units:
+        if current and not fits(current + unit):
+            calls.append(current)
+            current = []
+        current = current + unit
+    calls.append(current)
+    return calls
+
+
 def plan_synthesis_groups(context: Context, results: dict, report: dict, stems: list[str]) -> list[list[str]]:
     """One group when every answer fits one prompt; else whole lenses (all shards of a lens together, so a
-    lens still sees every shard), a lens that does not fit alone split by shard, packed in order."""
+    lens still sees every shard), a lens that does not fit alone split by shard, packed in order.
+
+    There is no fixed group limit (#248): the merge above the groups is itself split when it does not fit. A lens
+    packing that needs more groups than the worst-case plan counts (possible only when some lens is split) gives way
+    to packing the answers one by one in the same order, which never needs more: with every answer within the stage
+    output limits, any ``per_call`` answers fit one prompt (worst_case_plan)."""
     def fits(group):
         # the note's own numbers are measured at their widest (two digits)
         return len(synthesis_group_text(context, results, report, group, group_note(99, 99, group)).encode("utf-8")) \
@@ -639,27 +1167,20 @@ def plan_synthesis_groups(context: Context, results: dict, report: dict, stems: 
 
     if len(synthesis_group_text(context, results, report, stems, None).encode("utf-8")) <= PROMPT_MAX_BYTES:
         return [stems]
+    for stem in stems:
+        if not fits([stem]):
+            raise StageError("synthesis-input: the extract answer %s alone makes a prompt over %d bytes; refused, "
+                             "not cut" % (stem, PROMPT_MAX_BYTES))
     units = []
     for lens in sorted({EXTRACT_STEM.fullmatch(stem).group(1) for stem in stems}):
         unit = [stem for stem in stems if EXTRACT_STEM.fullmatch(stem).group(1) == lens]
-        if fits(unit):
-            units.append(unit)
-            continue
-        for stem in unit:
-            if not fits([stem]):
-                raise StageError("synthesis-input: the extract answer %s alone makes a prompt over %d bytes; refused, "
-                                 "not cut" % (stem, PROMPT_MAX_BYTES))
-            units.append([stem])
-    groups, current = [], []
-    for unit in units:
-        if current and not fits(current + unit):
-            groups.append(current)
-            current = []
-        current = current + unit
-    groups.append(current)
-    if len(groups) > MAX_SYNTHESIS_GROUPS:
-        raise StageError("synthesis-input: the extract answers need %d synthesis groups, over the limit of %d "
-                         "(max_synthesis_groups); refused, not cut" % (len(groups), MAX_SYNTHESIS_GROUPS))
+        units += [unit] if fits(unit) else [[stem] for stem in unit]
+    groups = next_fit(units, fits)
+    bound = synthesis_group_bound(context.pr_index(), stems)
+    if len(groups) > bound:
+        one_by_one = next_fit([[stem] for stem in stems], fits)
+        if len(one_by_one) < len(groups):
+            return one_by_one
     return groups
 
 
@@ -715,12 +1236,12 @@ class QuoteSelection:
                 self.add(item)
 
 
-def merge_quotes(previous: dict, candidates_of: dict, results: dict, report: dict) -> tuple[list, list]:
+def merge_quotes(groups: list, candidates_of: dict, results: dict, report: dict) -> tuple[list, list]:
     """For each (group candidate, cited PR), the first verified quote of that candidate's own group: the group's
     extract answers in its stem order, then each answer's order. A pair with no verified quote in its group is
     listed in the second list (no quote), never filled from another group."""
     selection = QuoteSelection(report)
-    for group in previous["groups"]:
+    for group in groups:
         files = [Path(results[stem][0]).name for stem in group["stems"]]
         for candidate in candidates_of[group["input_dir"]]:
             selection.first(files, candidate, {"group": group["input_dir"]})
@@ -738,44 +1259,103 @@ def final_quotes(context: Context, candidates: list, extract: dict, verify: dict
     return selection.evidence, selection.missing
 
 
+def merge_note(level: int, number: int, total: int, members: list[str]) -> str:
+    return ("합침 %d층 묶음 %d/%d: 이 입력은 그룹 종합 중 일부(%s)다. 다른 묶음은 따로 합쳐지고 조정자가 다음 층에서 "
+            "다시 합친다. 이 묶음의 후보만으로 합친다." % (level, number, total, ", ".join(members)))
+
+
+def merge_text(context: Context, groups: list, candidates_of: dict, results: dict, report: dict,
+               note: str | None) -> tuple[str, list, list]:
+    """One merge prompt over some groups (in their order): the template, the PR index, each group's candidates and
+    the quote report of their cited PRs. Returns (text, verified quotes listed, no-quote pairs)."""
+    evidence, missing = merge_quotes(groups, candidates_of, results, report)
+    text = template("synthesize-merge.md")
+    if note:
+        text += block("범위", note)
+    text += block("PR 색인", context.pr_index())
+    for group in groups:
+        text += block("그룹 종합 " + group["input_dir"], {"candidates": candidates_of[group["input_dir"]]})
+    text += block("인용 확인 보고서", {"totals": report["totals"], "verified_evidence": evidence, "no_quote": missing})
+    return text, evidence, missing
+
+
 def cmd_synthesis_merge_input(context: Context, args) -> dict:
-    """The second level of a synthesis that did not fit one prompt: the group candidates (never their dropped
-    ideas), the PR index, and one verified quote per (candidate, cited PR) from the candidate's own group."""
+    """The next level of a synthesis that did not fit one prompt: the group candidates (never their dropped
+    ideas), the PR index, and one verified quote per (candidate, cited PR) from the candidate's own group.
+
+    When every group fits one merge prompt this is the last level: one call named ``synthesis`` (its answer is the
+    run's synthesis). Otherwise the groups are packed in order into merge calls (#248), each with a note naming its
+    groups, and the stage asks for another level (merge_required): its calls are the next level's groups, each
+    holding the extract answers of the groups it merged. A group too large for a merge prompt alone, or a level that
+    would not merge anything (one group per call), is refused, never cut."""
     if not context.reduced:
         raise StageError("synthesis-merge-input is for the extraction-only path; this run's synthesis is one call")
     previous = read_json(Path(args.synthesis_stage) / "stage.json", PROMPT_MAX_BYTES, "synthesis stage")
     if not isinstance(previous, dict) or not previous.get("merge_required"):
         raise StageError("that synthesis stage was one call; there is nothing to merge")
-    expected = [group["input_dir"] for group in previous["groups"]]
+    groups = previous["groups"]
+    expected = [group["input_dir"] for group in groups]
     found = load_results(args.group_result, expected, "group result")
-    group_keys = {group["input_dir"]: set(group["keys"]) for group in previous["groups"]}
-    candidates_of, cited = {}, []
+    group_keys = {group["input_dir"]: set(group["keys"]) for group in groups}
+    candidates_of = {}
     for name in expected:
         candidates = parse_synthesis(context, found[name][0])
         outside = sorted({key for c in candidates for key in c["cited_prs"]} - group_keys[name])
         if outside:
             raise StageError("group result %s cites keys its own input did not hold: %s" % (name, ", ".join(outside)))
         candidates_of[name] = candidates
-        cited += [key for c in candidates for key in c["cited_prs"]]
-    cited = list(dict.fromkeys(cited))
     results = load_results(args.extract_result, context.extract_stems(), "extract result")
     report = check_quotes(context, [path for path, _ in results.values()])
-    evidence, missing = merge_quotes(previous, candidates_of, results, report)
-    text = read_bounded(PROMPTS / "synthesize-merge.md", PROMPT_MAX_BYTES, "merge template").decode("utf-8")
-    text += block("PR 색인", context.pr_index())
-    for name in expected:
-        text += block("그룹 종합 " + name, {"candidates": candidates_of[name]})
-    text += block("인용 확인 보고서", {"totals": report["totals"], "verified_evidence": evidence, "no_quote": missing})
-    if len(text.encode("utf-8")) > PROMPT_MAX_BYTES:
-        raise StageError("synthesis-merge-input: the merge prompt is %d bytes (> %d) with these group answers; "
-                         "refused, not cut" % (len(text.encode("utf-8")), PROMPT_MAX_BYTES))
+    level = previous.get("level", 1) + 1
+    calls_before = previous.get("calls_made", len(previous["calls"]))
+
+    def size(members, note):
+        return len(merge_text(context, members, candidates_of, results, report, note)[0].encode("utf-8"))
+
+    def fits(names):
+        members = [group for group in groups if group["input_dir"] in names]
+        return size(members, merge_note(99, 99, 99, names)) <= PROMPT_MAX_BYTES
+
+    if size(groups, None) <= PROMPT_MAX_BYTES:
+        packed = [expected]
+    else:
+        for name in expected:
+            if not fits([name]):
+                raise StageError("synthesis-merge-input: the group answer %s alone makes a merge prompt over %d bytes; "
+                                 "refused, not cut" % (name, PROMPT_MAX_BYTES))
+        packed = next_fit([[name] for name in expected], fits)
+        if len(packed) == len(expected):
+            raise StageError("synthesis-merge-input: no two of the %d group answers fit one merge prompt (%d bytes), so "
+                             "another level would merge nothing; refused, not cut" % (len(expected), PROMPT_MAX_BYTES))
     out = new_directory(args.out)
-    entry = write_prompt(out / "synthesis", text)
-    entry["result_name"] = "synthesis.result.json"
-    write_scope(out, "synthesis", cited, [{"pr": item["pr"], "quote": item["quote"]} for item in evidence])
-    summary = {"stage": "synthesis-merge", "mode": context.mode, "calls": [entry], "groups": len(expected),
-               "synthesis_calls": len(expected) + 1, "quotes": report["totals"],
-               "merge_quotes": {"listed": len(evidence), "no_quote": len(missing)}}
+    calls, listed, quotes = [], [], {"listed": 0, "no_quote": 0}
+    for number, names in enumerate(packed, 1):
+        members = [group for group in groups if group["input_dir"] in names]
+        name = "synthesis" if len(packed) == 1 else "merge-%02d-%02d" % (level, number)
+        note = None if len(packed) == 1 else merge_note(level, number, len(packed), names)
+        text, evidence, missing = merge_text(context, members, candidates_of, results, report, note)
+        if len(text.encode("utf-8")) > PROMPT_MAX_BYTES:
+            raise StageError("synthesis-merge-input: the merge prompt is %d bytes (> %d) with these group answers; "
+                             "refused, not cut" % (len(text.encode("utf-8")), PROMPT_MAX_BYTES))
+        entry = write_prompt(out / name, text)
+        entry["result_name"] = name + ".result.json"
+        calls.append(entry)
+        cited = list(dict.fromkeys(key for group in members for c in candidates_of[group["input_dir"]]
+                                   for key in c["cited_prs"]))
+        write_scope(out, name, cited, [{"pr": item["pr"], "quote": item["quote"]} for item in evidence])
+        listed.append({"input_dir": name, "members": names,
+                       "stems": [stem for group in members for stem in group["stems"]], "keys": sorted(cited)})
+        quotes["listed"] += len(evidence)
+        quotes["no_quote"] += len(missing)
+    if len(packed) == 1:
+        summary = {"stage": "synthesis-merge", "mode": context.mode, "calls": calls, "groups": len(expected),
+                   "synthesis_calls": calls_before + 1, "quotes": report["totals"], "merge_quotes": quotes}
+        if level > 2:
+            summary["level"] = level
+    else:
+        summary = {"stage": "synthesis-merge", "mode": context.mode, "level": level, "calls": calls, "groups": listed,
+                   "merge_required": True, "calls_made": calls_before + len(calls), "quotes": report["totals"],
+                   "merge_quotes": quotes}
     write_json(out / "stage.json", summary)
     return summary
 
@@ -792,9 +1372,15 @@ def checked_extract_answers(context: Context, paths: list[str], stage: str) -> t
         for key, cap in EXTRACT_CAPS.items():
             if not isinstance(document[key], list) or len(document[key]) > cap:
                 raise StageError("extract result %s may hold at most %d %s" % (stem, cap, key))
+        if EXTRACT_ANSWER_MAX_BYTES is not None and answer_bytes(document) > EXTRACT_ANSWER_MAX_BYTES:
+            raise StageError("extract result %s is %d bytes as a prompt holds it (> extract_answer_max_bytes %d); "
+                             "refused, not cut" % (stem, answer_bytes(document), EXTRACT_ANSWER_MAX_BYTES))
     report = check_quotes(context, [path for path, _ in results.values()])
     projected = len(final_prompt_text(context, [], {}, compact_report(report)).encode("utf-8"))
-    if projected > PROMPT_MAX_BYTES:
+    # An extraction-only run under the stage output limits has its final prompt bounded by the worst-case plan
+    # (final_bound, which holds only the quotes final_quotes keeps); this projection with every verified quote is then
+    # recorded, not a refusal (#248). Without those limits it refuses as before.
+    if projected > PROMPT_MAX_BYTES and not planned(context):
         raise budget_refusal(stage, projected, "digest and the verified extract quotes alone"
                              if not context.reduced else "PR index and the verified extract quotes alone")
     return stems, results, report, projected
@@ -805,7 +1391,7 @@ def cmd_synthesis_input(context: Context, args) -> dict:
     compact = compact_report(report)
     if context.reduced:
         return reduced_synthesis_input(context, args, stems, results, report, projected)
-    text = read_bounded(PROMPTS / "synthesize.md", PROMPT_MAX_BYTES, "synthesis template").decode("utf-8")
+    text = template("synthesize.md")
     text += block("PR 목록", context.pr_list())
     for stem in stems:
         text += block("추출 결과 " + stem, results[stem][1])
@@ -1040,19 +1626,30 @@ def cmd_continue_plan(context: Context, args) -> dict:
         answers = [adopted_extract_answer(context, stem, results[stem][0], prompts[stem], Path(args.records))
                    for stem in stems]
         groups = len(plan_synthesis_groups(context, results, report, stems)) if context.reduced else 1
+        # the merge levels above the real groups, at the stage output limits (#248)
+        merges, refusals = synthesis_levels(plan_inputs(context), groups) if groups > 1 else ([], [])
+        if refusals:
+            raise StageError("the merge of these %d groups does not pass the worst-case plan: %s"
+                             % (groups, "; ".join(refusals)))
     except StageError as error:
         raise StageError("continue-plan: %s" % error) from error
-    synthesis = 1 if groups == 1 else groups + 1
+    levels = [groups] + [level["calls"] for level in merges]
+    synthesis = sum(levels)
     total = synthesis + MAX_CANDIDATES + 1
     lenses = len(context.siblings.build_prompts.LENSES)
     plan = {"mode": context.mode,
             "continues": {"extract_stage_sha256": hashlib.sha256(data).hexdigest(), "completed": {"extract": len(stems)}},
             "shards": context.shards, "lenses": lenses, "extract": 0, "synthesis": synthesis,
-            "synthesis_groups": groups, "verify": MAX_CANDIDATES, "final": 1, "max_model_calls": total,
-            "formula": "%d extract calls done; %s + %d (verify, at most max_candidates) + 1 (final) = %d"
-                       % (len(stems), "1 (synthesis)" if groups == 1 else "%d (synthesis: %d group calls + 1 merge)"
-                          % (synthesis, groups), MAX_CANDIDATES, total),
-            "inputs": {"max_candidates": MAX_CANDIDATES, "max_synthesis_groups": MAX_SYNTHESIS_GROUPS}}
+            "synthesis_groups": groups, "synthesis_levels": levels, "verify": MAX_CANDIDATES, "final": 1,
+            "max_model_calls": total,
+            "formula": "%d extract calls done; %s + %d (verify, at most synthesis_max_candidates) + 1 (final) = %d"
+                       % (len(stems), "1 (synthesis)" if groups == 1 else
+                          "%d (synthesis: %d group calls, then merge levels %s at the limits)"
+                          % (synthesis, groups, " + ".join(map(str, levels[1:]))), MAX_CANDIDATES, total),
+            "inputs": {"max_candidates": MAX_CANDIDATES, "limits": output_limits()}}
+    if total > ABSOLUTE_MAX_CALLS:
+        raise StageError("continue-plan: %d model calls remain at the limits, over the absolute cap %d"
+                         % (total, ABSOLUTE_MAX_CALLS))
     out = new_directory(args.out)
     summary = {"stage": "continue", "mode": context.mode, "answers": answers, "max_model_calls": total,
                "call_plan": plan, "final_projection_bytes": projected}
@@ -1060,16 +1657,18 @@ def cmd_continue_plan(context: Context, args) -> dict:
     return summary
 
 
-def verify_prompt(context: Context, candidate: dict) -> str:
+def verify_prompt(context: Context, candidate: dict, keymap: dict | None = None, digest_dir: Path | None = None) -> str:
     """The analyzer's verify prompt (build_prompts verify) for one candidate, with the digest sections of the
     PRs it cites and only a title list of the others. A digest of one shard gets an empty second shard so the
-    analyzer's own multi-shard form is used: the cited sections, never the whole digest."""
+    analyzer's own multi-shard form is used: the cited sections, never the whole digest. ``keymap`` and
+    ``digest_dir`` replace the run's digest (the worst-case plan)."""
+    digest_dir = context.digest_dir if digest_dir is None else digest_dir
     with tempfile.TemporaryDirectory(prefix="stage-verify-") as tmp:
         directory = Path(tmp) / "digest"
         directory.mkdir()
-        keymap = deepcopy(context.keymap)
+        keymap = deepcopy(context.keymap if keymap is None else keymap)
         for name in keymap["shards"]:
-            (directory / name).write_bytes(read_bounded(context.digest_dir / name, PROMPT_MAX_BYTES * 4, "digest shard"))
+            (directory / name).write_bytes(read_bounded(digest_dir / name, PROMPT_MAX_BYTES * 4, "digest shard"))
         if len(keymap["shards"]) == 1:
             keymap["shards"].append("digest-none.md")
             (directory / "digest-none.md").write_text("", encoding="utf-8")
@@ -1121,8 +1720,14 @@ def reduced_verify_inputs(context: Context, args, candidates: list, budget: dict
 def cmd_verify_inputs(context: Context, args) -> dict:
     candidates = parse_synthesis(context, args.synthesis)
     extract = load_results(args.extract_result, context.extract_stems(), "extract result")
-    compact = compact_report(check_quotes(context, [path for path, _ in extract.values()]))
-    base = len(final_prompt_text(context, candidates, {}, compact).encode("utf-8"))
+    report = check_quotes(context, [path for path, _ in extract.values()])
+    if planned(context):
+        # the quotes the final input will hold for these candidates (final_quotes), not every verified quote (#248)
+        kept, missing = final_quotes(context, candidates, extract, {}, report)
+        quotes = {"totals": report["totals"], "verified_evidence": kept, "no_quote": missing}
+    else:
+        quotes = compact_report(report)
+    base = len(final_prompt_text(context, candidates, {}, quotes).encode("utf-8"))
     k = len(candidates)
     floor, bound = base + k * VERIFY_FLOOR_BYTES, base + k * 2 * VERIFY_ANSWER_MAX_BYTES
     if floor > PROMPT_MAX_BYTES:
@@ -1586,6 +2191,7 @@ def build_parser() -> argparse.ArgumentParser:
         return sub
 
     command("extract-inputs").add_argument("--out", required=True)
+    command("dry-plan")
     resume = command("continue-plan")
     resume.add_argument("--extract-stage", required=True,
                         help="the extract-inputs output directory whose stage.json made the adopted answers' prompts, "
@@ -1635,6 +2241,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 HANDLERS = {
     "extract-inputs": cmd_extract_inputs,
+    "dry-plan": cmd_dry_plan,
     "continue-plan": cmd_continue_plan,
     "synthesis-input": cmd_synthesis_input,
     "synthesis-merge-input": cmd_synthesis_merge_input,
@@ -1661,6 +2268,9 @@ def main(argv=None) -> int:
         print("error: %s" % error, file=sys.stderr)
         return 2
     print(json.dumps(summary, ensure_ascii=False, indent=1))
+    if args.command == "dry-plan" and not summary["ok"]:
+        print("error: the worst-case plan does not pass: %s" % "; ".join(summary["refusals"]), file=sys.stderr)
+        return 2
     return 0
 
 

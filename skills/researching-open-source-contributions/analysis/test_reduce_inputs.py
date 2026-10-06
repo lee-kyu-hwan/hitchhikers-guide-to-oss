@@ -111,8 +111,7 @@ class ReducedCase(unittest.TestCase):
         report = stage_inputs.check_quotes(self.context, [path for path, _ in results.values()])
         stems = self.context.extract_stems()
         for cap in range(self.group_size([], pad), self.group_size(list(LENSES), pad) + 10, 10):
-            with mock.patch.object(stage_inputs, "PROMPT_MAX_BYTES", cap), \
-                    mock.patch.object(stage_inputs, "MAX_SYNTHESIS_GROUPS", 99):
+            with mock.patch.object(stage_inputs, "PROMPT_MAX_BYTES", cap):
                 try:
                     if len(stage_inputs.plan_synthesis_groups(self.context, results, report, stems)) == wanted:
                         return cap
@@ -159,34 +158,30 @@ class ModeTests(ReducedCase):
 
 
 class PlanTests(ReducedCase):
-    def test_the_call_limit_counts_the_synthesis_groups_it_may_need(self):
-        plan = stage_inputs.model_call_plan(3, 5, 5, synthesis_calls=4)
-        self.assertEqual(3 * 5 + 4 + 5 + 1, plan["max_model_calls"])
-        self.assertEqual(4, plan["synthesis"])
+    def test_a_digest_in_final_run_counts_one_synthesis_call(self):
         self.assertEqual(12, stage_inputs.model_call_plan(1, 5, 5)["max_model_calls"])
+        self.assertEqual(10, stage_inputs.model_call_plan(1, 5, 3)["max_model_calls"])
+        self.assertEqual(1, stage_inputs.model_call_plan(1, 5, 3)["synthesis"])
 
-    def test_extract_inputs_needs_no_overflow_flag_and_records_the_plan(self):
+    def test_extract_inputs_needs_no_overflow_flag_and_records_the_worst_case_plan(self):
         summary, _ = self.stage("extract-inputs", "--run-dir", self.run, "--out", str(self.root / "x"))
         self.assertEqual("extraction-only", summary["mode"])
         self.assertEqual(15, len(summary["calls"]))
         self.assertTrue(all(call["bytes"] <= CAP for call in summary["calls"]))
         plan = summary["call_plan"]
-        groups = stage_inputs.LIMITS["max_synthesis_groups"]
-        self.assertEqual(3 * 5 + (groups + 1) + 5 + 1, summary["max_model_calls"])
-        self.assertEqual({"mode": "extraction-only", "shards": 3, "lenses": 5, "extract": 15,
-                          "synthesis": groups + 1, "synthesis_min": 1, "synthesis_groups_max": groups,
-                          "verify": 5, "final": 1, "max_model_calls": summary["max_model_calls"]},
+        # 15 answers of 7,680 bytes: 3 per group (5 groups), whose candidates fit one merge (#248)
+        self.assertEqual({"mode": "extraction-only", "shards": 3, "lenses": 5, "extract": 15, "synthesis": 6,
+                          "synthesis_levels": [5, 1], "verify": 3, "final": 1, "max_model_calls": 25},
                          {k: v for k, v in plan.items() if k not in ("formula", "inputs")})
-        self.assertIn("synthesis", plan["formula"])
+        self.assertEqual(plan["max_model_calls"], summary["max_model_calls"])
+        self.assertIn("synthesis levels 5 + 1", plan["formula"])
         self.assertNotIn("status", summary["final_budget"])
+        self.assertEqual([stage["stage"] for stage in summary["worst_case"]["stages"]],
+                         ["extract", "synthesis", "merge", "verify", "final"])
 
-    def test_the_group_limit_is_eight_so_extract_inputs_plans_nine_synthesis_calls(self):
-        self.assertEqual(8, stage_inputs.LIMITS["max_synthesis_groups"])
-        self.assertEqual(8, stage_inputs.MAX_SYNTHESIS_GROUPS)
-        summary, _ = self.stage("extract-inputs", "--run-dir", self.run, "--out", str(self.root / "x"))
-        self.assertEqual(9, summary["call_plan"]["synthesis"])
-        self.assertEqual(8, summary["call_plan"]["synthesis_groups_max"])
-        self.assertEqual(3 * 5 + 9 + 5 + 1, summary["max_model_calls"])
+    def test_there_is_no_fixed_group_limit(self):
+        self.assertNotIn("max_synthesis_groups", stage_inputs.LIMITS)
+        self.assertFalse(hasattr(stage_inputs, "MAX_SYNTHESIS_GROUPS"))
 
     def test_the_overflow_flag_is_gone(self):
         self.stage("extract-inputs", "--run-dir", self.run, "--allow-final-overflow", "--out", str(self.root / "x"), code=2)
@@ -251,7 +246,7 @@ class SynthesisTests(ReducedCase):
     def test_a_lens_that_does_not_fit_alone_is_split_by_shard(self):
         pad = 1000
         cap = self.group_size(["blind"], pad) - 200                      # one whole lens does not fit
-        with mock.patch.object(stage_inputs, "PROMPT_MAX_BYTES", cap), mock.patch.object(stage_inputs, "MAX_SYNTHESIS_GROUPS", 30):
+        with mock.patch.object(stage_inputs, "PROMPT_MAX_BYTES", cap):
             summary, _ = self.build(pad=pad, name="g")
             by_lens = {}
             for group in summary["groups"]:
@@ -262,7 +257,7 @@ class SynthesisTests(ReducedCase):
                 self.assertLessEqual(call["bytes"], cap)
             self.assertEqual(sorted(self.context.extract_stems()), sorted(s for g in summary["groups"] for s in g["stems"]))
 
-    def test_seven_groups_are_within_the_limit_of_eight_and_their_merge_is_checked_against_the_cap(self):
+    def test_seven_groups_merge_in_one_call_when_their_candidates_fit_and_in_another_level_when_not(self):
         pad = 1000
         cap = self.cap_for_groups(7, pad)
         with mock.patch.object(stage_inputs, "PROMPT_MAX_BYTES", cap):
@@ -277,20 +272,37 @@ class SynthesisTests(ReducedCase):
                 *self.extract_args(pad))
         merged, _ = self.stage(*argv, "--out", str(self.root / "m"))
         self.assertEqual(8, merged["synthesis_calls"])
+        self.assertEqual(["synthesis"], [call["input_dir"] for call in merged["calls"]])
+        self.assertNotIn("merge_required", merged)
         self.assertLessEqual(merged["calls"][0]["bytes"], CAP)
+        # One byte less and the seven no longer fit one merge prompt: packed in order into merge calls of a next
+        # level, each naming its groups (#248), never refused for the count of groups.
         with mock.patch.object(stage_inputs, "PROMPT_MAX_BYTES", merged["calls"][0]["bytes"] - 1):
-            self.stage(*argv, "--out", str(self.root / "over"), code=2)
-        self.assertFalse((self.root / "over").exists())
+            level, _ = self.stage(*argv, "--out", str(self.root / "over"))
+        self.assertTrue(level["merge_required"])
+        self.assertEqual(2, level["level"])
+        self.assertEqual(["merge-02-01", "merge-02-02"], [call["input_dir"] for call in level["calls"]])
+        self.assertEqual(sorted(group["input_dir"] for group in summary["groups"]),
+                         sorted(name for group in level["groups"] for name in group["members"]))
+        self.assertEqual(7 + 2, level["calls_made"])
+        self.assertTrue(all(call["bytes"] < merged["calls"][0]["bytes"] for call in level["calls"]))
 
-    def test_too_many_groups_and_an_answer_too_large_alone_are_refused_before_anything_is_written(self):
+    def test_any_number_of_groups_is_taken_and_an_answer_too_large_alone_is_refused_before_anything_is_written(self):
         # pad 1200 (was 1000): the escape rule made finalize-reduced.md longer, and at the 11-group cap of pad 1000
         # (9,850 B) the final projection (template, PR index, quotes; no pad) came first at 9,881 B (#82).
         cap = self.cap_for_groups(11, 1200)
-        with mock.patch.object(stage_inputs, "PROMPT_MAX_BYTES", cap):       # single-answer groups: more than the limit of 8
-            _, stderr = self.stage("synthesis-input", "--run-dir", self.run, *self.extract_args(1200),
-                                   "--out", str(self.root / "many"), code=2)
-            self.assertIn("need 11 synthesis groups, over the limit of 8", stderr)
-            self.assertFalse((self.root / "many").exists())
+        with mock.patch.object(stage_inputs, "PROMPT_MAX_BYTES", cap):       # 11 groups: over the earlier limit of 8
+            summary, _ = self.stage("synthesis-input", "--run-dir", self.run, *self.extract_args(1200),
+                                    "--out", str(self.root / "many"))
+            self.assertEqual(11, len(summary["groups"]))
+            self.assertTrue(summary["merge_required"])
+            # an answer over extract_answer_max_bytes is refused for its size, before any group is made
+            _, stderr = self.stage("synthesis-input", "--run-dir", self.run, *self.extract_args(9000),
+                                   "--out", str(self.root / "big"), code=2)
+            self.assertIn("extract_answer_max_bytes", stderr)
+            self.assertFalse((self.root / "big").exists())
+            # without that limit (the earlier limits) it is refused as too large for a prompt alone
+            base.use_limits(self, base.EARLIER_LIMITS)
             _, stderr = self.stage("synthesis-input", "--run-dir", self.run, *self.extract_args(9000),
                                    "--out", str(self.root / "big"), code=2)
             self.assertIn("alone", stderr)
@@ -791,6 +803,7 @@ class Run13InputTests(unittest.TestCase):
         return found
 
     def extract_result(self, stem, quotes):
+        """A full answer within extract_answer_max_bytes (7,680 bytes as a prompt holds it, #248)."""
         lens = stem.split("-")[1]
         shard = "digest-%s.md" % stem.rsplit("-", 1)[1]
         keys = [k for k, section in self.context.keymap["sections"].items() if section["shard"] == shard]
@@ -798,15 +811,15 @@ class Run13InputTests(unittest.TestCase):
         for number in range(3):
             cited = [keys[(number + step) % len(keys)] for step in range(3)]
             patterns.append({
-                "title": "%s pattern %d" % (lens, number), "description": fx.SYNTHETIC + " " + "d" * 280,
+                "title": "%s pattern %d" % (lens, number), "description": fx.SYNTHETIC + " " + "d" * 120,
                 "kind": "convention",
-                "evidence": [{"pr": key, "role": "supports", "quote": quotes[key][number % 3], "claim": "c" * 120}
+                "evidence": [{"pr": key, "role": "supports", "quote": quotes[key][number % 3], "claim": "c" * 50}
                              for key in cited],
-                "applicability": ["a" * 150], "counterconditions": ["c" * 150], "search_clues": ["s" * 120],
-                "expected_tests": ["t" * 120], "maintainer_judgment_required": ["m" * 120],
-                "confidence": "low", "confidence_reason": "r" * 150})
+                "applicability": ["a" * 80], "counterconditions": ["c" * 80], "search_clues": ["s" * 60],
+                "expected_tests": ["t" * 60], "maintainer_judgment_required": ["m" * 60],
+                "confidence": "low", "confidence_reason": "r" * 80})
         answer = {"lens": lens, "patterns": patterns, "rejected": [{"idea": "i" * 100, "reason": "r" * 100}],
-                  "observations": [{"pr": key, "note": "o" * 160, "quote": quotes[key][0]} for key in keys]}
+                  "observations": [{"pr": key, "note": "o" * 60, "quote": quotes[key][0]} for key in keys]}
         path = self.answers / (stem + ".result.json")
         path.write_text(json.dumps(answer), encoding="utf-8")
         return str(path)
@@ -860,6 +873,8 @@ class Run13InputTests(unittest.TestCase):
                                     *verify_args, "--out", str(self.root / "final"))
         self.assertEqual(code, 0, stderr)
         sizes["final"] = {c["input_dir"]: c["bytes"] for c in final["calls"]}
+        self.answer_bytes = {Path(path).name: stage_inputs.answer_bytes(json.loads(Path(path).read_text()))
+                             for path in extract_args[1::2]}
         return sizes, extract["call_plan"], synthesis
 
     def test_every_stage_input_of_the_13_pull_request_run_is_within_the_prompt_limit(self):
@@ -876,6 +891,11 @@ class Run13InputTests(unittest.TestCase):
         self.assertLessEqual(total, plan["max_model_calls"])
         self.assertTrue(synthesis["merge_required"])           # ten full extract answers do not fit one synthesis prompt
         self.assertEqual(len(synthesis["groups"]) + 1, len(sizes["synthesis"]) + len(sizes["synthesis-merge"]))
+        self.assertLessEqual(max(self.answer_bytes.values()), stage_inputs.EXTRACT_ANSWER_MAX_BYTES)
+        # the worst-case plan the extract stage recorded covers the calls the stand-ins needed (#248)
+        self.assertLessEqual(len(sizes["synthesis"]), plan["synthesis_levels"][0])
+        self.assertLessEqual(len(sizes["synthesis"]) + len(sizes["synthesis-merge"]), plan["synthesis"])
+        self.assertEqual([4, 1], plan["synthesis_levels"])
 
 
 if __name__ == "__main__":

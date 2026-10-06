@@ -69,22 +69,42 @@ class ContinuePlanTests(reduce.ReducedCase):
         plan = summary["call_plan"]
         self.assertEqual({"extract_stage_sha256": sha256(self.extract_stage / "stage.json"), "completed": {"extract": 15}},
                          plan["continues"])
-        self.assertEqual((0, 1, 1, 5, 1, 7), (plan["extract"], plan["synthesis"], plan["synthesis_groups"],
+        # verify at most synthesis_max_candidates 3 (7 calls under the earlier 5, #248)
+        self.assertEqual((0, 1, 1, 3, 1, 5), (plan["extract"], plan["synthesis"], plan["synthesis_groups"],
                                               plan["verify"], plan["final"], plan["max_model_calls"]))
+        self.assertEqual([1], plan["synthesis_levels"])
         self.assertEqual(plan["shards"] * plan["lenses"], plan["continues"]["completed"]["extract"])
-        self.assertEqual(7, summary["max_model_calls"])
+        self.assertEqual(5, summary["max_model_calls"])
         self.assertEqual(summary, json.loads((self.root / "c" / "stage.json").read_text(encoding="utf-8")))
         self.assertEqual(sorted(self.context.extract_stems()), [answer["stem"] for answer in summary["answers"]])
 
-    def test_grouped_answers_plan_one_call_per_group_and_the_merge(self):
+    def test_grouped_answers_plan_one_call_per_group_and_the_merge_levels_above_them_at_the_limits(self):
         pad = 1000
         cap = self.cap_for_groups(7, pad)
         paths = self.adopted(pad)
+        # the merge above the real groups is planned with every group answer at the limits (#248): limits scaled
+        # down with the cap, so that the groups' candidates need more than one merge level
+        base.use_limits(self, {"CANDIDATE_MAX_BYTES": 400, "MAX_CANDIDATES": 2})
         with mock.patch.object(stage_inputs, "PROMPT_MAX_BYTES", cap):
             summary, _ = self.continue_plan(paths)
+            inputs = stage_inputs.PlanInputs(mode="extraction-only", shards=3, stems=self.context.extract_stems(),
+                                             rows=self.context.pr_index(), quotes=stage_inputs.quote_bounds(self.context),
+                                             extract_bytes=0, verify_bytes=0)
+            merges, refusals = stage_inputs.synthesis_levels(inputs, 7)
         plan = summary["call_plan"]
-        self.assertEqual((7, 8, 14), (plan["synthesis_groups"], plan["synthesis"], plan["max_model_calls"]))
-        self.assertIn("7 group calls + 1 merge", plan["formula"])
+        self.assertEqual([], refusals)
+        levels = [7] + [level["calls"] for level in merges]
+        self.assertGreater(len(levels), 2)
+        self.assertEqual(1, levels[-1])
+        self.assertEqual((7, levels, sum(levels), sum(levels) + 2 + 1),
+                         (plan["synthesis_groups"], plan["synthesis_levels"], plan["synthesis"], plan["max_model_calls"]))
+        self.assertIn("7 group calls, then merge levels", plan["formula"])
+        # a merge that cannot shrink at these limits is refused before the next model call
+        with mock.patch.object(stage_inputs, "PROMPT_MAX_BYTES", cap), \
+                mock.patch.object(stage_inputs, "CANDIDATE_MAX_BYTES", cap):
+            _, stderr = self.continue_plan(paths, out="c2", code=2)
+        self.assertIn("does not pass the worst-case plan", stderr)
+        self.assertFalse((self.root / "c2").exists())
 
     def test_an_answer_not_bound_to_its_recorded_prompt_is_refused(self):
         def edit_json(path, change):
@@ -369,11 +389,16 @@ EVIDENCE_R2 =Path("/Users/lee-kyu-hwan/.oss-research-vm/logs/a78-period-analysis
 
 class RunR2Case(unittest.TestCase):
     """The eslint r2 run rebuilt from the same collections in a temporary directory (same corpus, same digest,
-    same extract prompts); the evidence is only read."""
+    same extract prompts); the evidence is only read. Its answers were made and adopted under the stage output
+    limits before #248 (base.EARLIER_LIMITS), under which every stage input below is what it was; RunR2NewLimitsTests
+    shows what run_limits.json's own limits do with them."""
+
+    LIMITS = base.EARLIER_LIMITS
 
     def setUp(self):
         self.root = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
+        base.use_limits(self, self.LIMITS)
         state = json.loads((EVIDENCE_R2 / "wf-run/state.json").read_text(encoding="utf-8"))
         inputs = state["stages"]["collect"]["generations"][0]["inputs"]
         adopt = []
@@ -416,6 +441,8 @@ class RunR2ContinuationTests(RunR2Case):
         self.assertEqual(7, len(synthesis["groups"]))
         self.assertEqual(8, synthesis["synthesis_calls"])
         self.assertTrue(all(call["bytes"] <= CAP for call in synthesis["calls"]))
+        # the group inputs r3 was given, byte for byte (no fixed group limit any more, #248)
+        self.assertEqual([60575, 44558, 63190, 57468, 64492, 51021, 41632], [call["bytes"] for call in synthesis["calls"]])
 
 
 
@@ -439,6 +466,8 @@ class RunR3MergeTests(RunR2Case):
         self.assertLessEqual(merged["calls"][0]["bytes"], CAP)
         self.assertEqual({"listed": 61, "no_quote": 0}, merged["merge_quotes"])
         self.assertEqual(8, merged["synthesis_calls"])
+        self.assertEqual((40205, "291230b69b8f73cb775958dd4b49e5a24a8555be3b986977e2a6649af2ab2500"),
+                         (merged["calls"][0]["bytes"], merged["calls"][0]["sha256"]))     # the r4 merge input
         scope = json.loads((self.root / "m" / "synthesis.scope.json").read_text(encoding="utf-8"))
         self.assertEqual((25, 61), (len(scope["keys"]), len(scope["quotes"])))
 
@@ -460,6 +489,8 @@ class RunR4FinalTests(RunR2Case):
         self.assertEqual(0, code, stderr)
         self.assertLessEqual(final["calls"][0]["bytes"], CAP)
         self.assertEqual({"listed": 38, "no_quote": 0}, final["final_quotes"])
+        self.assertEqual((44108, "fc66309c06a61ad65f88198f3aae1e333dc26610c7648297539942caaf051a06"),
+                         (final["calls"][0]["bytes"], final["calls"][0]["sha256"]))     # the r6 final input (README 3.1f)
         scope = json.loads((self.root / "f" / "final.scope.json").read_text(encoding="utf-8"))
         self.assertEqual((28, 38), (len(scope["keys"]), len(scope["quotes"])))
 
@@ -487,6 +518,43 @@ class RunR3ChainTests(RunR2Case):
         self.assertEqual("continue", plan["continues"]["parent_stage"])
         self.assertEqual((0, 0, 0, 1, 1), (plan["extract"], plan["synthesis"], plan["verify"], plan["final"],
                                            plan["max_model_calls"]))
+
+
+@unittest.skipUnless((EVIDENCE_R3 / "in-continue/stage.json").is_file() and (EVIDENCE_R3 / "answers/verify-C5.result.json").is_file()
+                     and (EVIDENCE_R2 / "answers").is_dir(), "the 2026-10-05 eslint r2-r4 answers are only on the machine that made them")
+class RunR2NewLimitsTests(RunR2Case):
+    """The same evidence under run_limits.json's own stage output limits (#248): 13 of r2's 20 extract answers are
+    over extract_answer_max_bytes (7,680), r3's group and merge answers hold 5 candidates (over 3), and r4's verify
+    answer C1 is 5,691 bytes (over 5,120). Each is refused, never cut; the evidence stays as it is."""
+
+    LIMITS = {}
+
+    def test_the_answers_adopted_under_the_earlier_limits_are_refused_under_the_new_ones(self):
+        sizes = {Path(path).name: stage_inputs.answer_bytes(json.loads(Path(path).read_text(encoding="utf-8")))
+                 for path in self.answers}
+        self.assertEqual(13, len([size for size in sizes.values() if size > 7680]))
+        self.assertEqual(18294, sizes["extract-blind-01.result.json"])
+        code, _, stderr = stage("synthesis-input", "--run-dir", self.run, *self.extract, "--out", str(self.root / "s"))
+        self.assertEqual(2, code)
+        self.assertIn("extract result extract-blind-01 is 18294 bytes as a prompt holds it (> extract_answer_max_bytes "
+                      "7680)", stderr)
+        for name in ("synthesis-01.result.json", "synthesis.result.json"):
+            code, _, stderr = stage("verify-inputs", "--run-dir", self.run, "--synthesis",
+                                    str(EVIDENCE_R3 / "answers" / name), *self.extract, "--out", str(self.root / "v"))
+            self.assertEqual(2, code, name)
+            self.assertIn("synthesis may hold at most 3 candidates", stderr)
+        over = [path.name for path in sorted((EVIDENCE_R3 / "answers").glob("verify-C*.result.json"))
+                if path.stat().st_size > stage_inputs.VERIFY_ANSWER_MAX_BYTES]
+        self.assertEqual(["verify-C1.result.json"], over)
+        verify = [item for path in sorted((EVIDENCE_R3 / "answers").glob("verify-C*.result.json"))
+                  for item in ("--verify-result", str(path))]
+        code, _, stderr = stage("continue-plan", "--run-dir", self.run, "--extract-stage",
+                                str(EVIDENCE_R3 / "in-continue"), *self.extract, "--synthesis-result",
+                                str(EVIDENCE_R3 / "answers/synthesis.result.json"), *verify,
+                                "--records", str(EVIDENCE_R3), "--out", str(self.root / "chain"))
+        self.assertEqual(2, code)
+        self.assertIn("extract_answer_max_bytes", stderr)
+        self.assertFalse(any((self.root / name).exists() for name in ("s", "v", "chain")))
 
 
 EVIDENCE_R6 = Path("/Users/lee-kyu-hwan/.oss-research-vm/logs/a78-period-analysis-eslint-r6-20261005T043448Z")
