@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import argparse
 from contextlib import redirect_stderr, redirect_stdout
+import copy
 from datetime import datetime, timezone
 import hashlib
 import importlib.util
@@ -336,6 +337,9 @@ def _curated_source_errors(source: dict, errors: List[str]) -> None:
 # adopt-locus-search require the run's budget to equal the request's, so a larger request budget could never be
 # adopted (#82). init refuses it.
 CANDIDATE_READS_MAX_REQUEST_BUDGET = 60
+# The entry's clue cap per pattern (MAX_CLUES), the verifier's default: the request count of a planned discover
+# run uses it, since the workflow request states no clue cap.
+CANDIDATE_READS_MAX_CLUES = 5
 
 
 def validate_request(request: object) -> List[str]:
@@ -432,6 +436,8 @@ class Run:
         self.path = Path(os.path.abspath(directory))
         # Current sibling/workflow revisions; set by main, compared with every active checkpoint.
         self.revisions: Optional[Dict[str, str]] = None
+        # The loaded siblings; set by main so plan data (status) can use the verifier's own counting.
+        self.siblings: Optional["Siblings"] = None
 
     def _check_real(self) -> None:
         if self.path.is_symlink() or not self.path.is_dir():
@@ -1855,6 +1861,162 @@ def _merge_discoveries(siblings: Siblings, target: dict, bundles: List[dict]) ->
     return merged, summary, capped
 
 
+# ---------------------------------------------------------------------------
+# One target repository, several discover runs (#3): the static reads and the
+# searches split over runs that each fit the candidate-reads budget
+# ---------------------------------------------------------------------------
+
+# The discovery inputs a split run may set on its own; every other input is shared.
+SPLIT_RUN_INPUTS = {"pattern_ids", "static_reads", "static_dirs"}
+HEAD_MOVED_BETWEEN_RUNS = "head-moved-between-split-runs"
+
+
+def _split_cross_errors(request: dict, target: dict, bundles: List[dict]) -> List[str]:
+    """What only the set shows: one repository that is the whole target, one shared scope, at most one REST run."""
+    errors: List[str] = []
+    repository = bundles[0]["repository"]
+    if [item.lower() for item in target["repositories"]] != [repository.lower()]:
+        errors.append("split discover runs of %s are adopted only for a target of exactly that repository; "
+                      "target.repositories is %s" % (repository, json.dumps(target["repositories"])))
+    keys = sorted({key for bundle in bundles for key in bundle["declared"]} - SPLIT_RUN_INPUTS)
+    differing = [key for key in keys if len({json.dumps(bundle["declared"].get(key), sort_keys=True) for bundle in bundles}) > 1]
+    if differing:
+        errors.append("split discover runs differ in inputs other than the patterns and the static reads: " + ", ".join(differing))
+    rest = [bundle["index"] for bundle in bundles if bundle["declared"].get("static_reads") == "rest"]
+    if len(rest) > 1:
+        errors.append("more than one split run carries the REST static reads (%s); the reads are one run's"
+                      % ", ".join(str(index) for index in rest))
+    for bundle in bundles:
+        document = bundle["document"]
+        if bundle["declared"].get("static_reads") == "rest":
+            section = document.get("static_reads")
+            if not (isinstance(section, list) and len(section) == 1 and isinstance(section[0], dict)
+                    and section[0].get("repository") == repository
+                    and isinstance(section[0].get("static_search"), dict)):
+                errors.append("discovery %d: a REST run needs one static_reads entry for %s" % (bundle["index"], repository))
+        elif "static_reads" in document:
+            errors.append("discovery %d: a plain run must not carry a static_reads section" % bundle["index"])
+    for label, part in (("discovery", "document"), ("verifier manifest", "manifest")):
+        if len({json.dumps(bundle[part].get("generated_by"), sort_keys=True) for bundle in bundles}) > 1:
+            errors.append("split discover runs differ in verifier revision (%s generated_by)" % label)
+    limits = sum(_int_or_none(bundle["budget"].get("request_limit")) or 0 for bundle in bundles)
+    if limits > request["budget"]["total_api_requests"]:
+        errors.append("per-run discover request budgets sum to %d, over budget.total_api_requests %d"
+                      % (limits, request["budget"]["total_api_requests"]))
+    return errors
+
+
+def _search_rank(record: dict, index: int) -> Tuple[bool, int, int, int]:
+    """Fuller search first: complete and available, fewer unused clues, more queries, the later run."""
+    duplicate = record.get("duplicate_search") if isinstance(record.get("duplicate_search"), dict) else {}
+    code = record.get("code_search") if isinstance(record.get("code_search"), dict) else {}
+    unused = duplicate.get("unused_clues") if isinstance(duplicate.get("unused_clues"), list) else []
+    queries = duplicate.get("queries") if isinstance(duplicate.get("queries"), list) else []
+    return (duplicate.get("complete") is True and code.get("available") is True, -len(unused), len(queries), index)
+
+
+def _merge_split_discoveries(siblings: Siblings, target: dict, current: List[str],
+                             bundles: List[dict]) -> Tuple[dict, List[dict], List[dict], List[str]]:
+    """One discovery of the repository over the split runs, in analysis pattern order, under the target caps.
+
+    Every pattern keeps the run record with the fullest search (a pattern the REST run
+    carried with a smaller clue cap is searched again in full in a plain run); the REST
+    run's static reads are copied into every record, as one discover run does. A pattern
+    with no record in any run keeps one failed scope. The verifier's own partition and
+    document checks must accept the result.
+    """
+    repository = bundles[0]["repository"]
+    union = [pattern for pattern in current if any(pattern in bundle["patterns"] for bundle in bundles)]
+    universe = [(repository, pattern) for pattern in union]
+    selected, skipped = siblings.verifier._cap_combinations(
+        [repository], [{"pattern_id": pattern} for pattern in union],
+        target["max_candidates_per_repo"], target["max_candidates_total"])
+    kept = {str(pattern["pattern_id"]) for _, pattern in selected}
+    rest = next((bundle for bundle in bundles if bundle["declared"].get("static_reads") == "rest"), None)
+    static_entry = copy.deepcopy(rest["document"]["static_reads"][0]) if rest is not None else None
+    static = static_entry["static_search"] if static_entry is not None else None
+    records: List[dict] = []
+    failed: List[dict] = []
+    capped: List[dict] = []
+    chosen: List[dict] = []
+    moved: List[str] = []
+    for pattern in union:
+        candidates = [(bundle["index"], item) for bundle in bundles for item in bundle["document"]["records"]
+                      if item["pattern_id"] == pattern]
+        failures = [(bundle["index"], item) for bundle in bundles for item in bundle["document"]["failed_scopes"]
+                    if item["pattern_id"] == pattern]
+        if pattern not in kept:
+            capped.extend({"discovery": index, "repository": repository, "pattern_id": pattern, "section": section}
+                          for section, items in (("records", candidates), ("failed_scopes", failures)) for index, _ in items)
+            continue
+        if candidates:
+            index, record = max(candidates, key=lambda pair: _search_rank(pair[1], pair[0]))
+            record = copy.deepcopy(record)
+            warnings = list(record.get("warnings") or [])
+            if static is not None:
+                record["static_search"] = copy.deepcopy(static)
+                code = record.get("code_search") if isinstance(record.get("code_search"), dict) else {}
+                record["evidence_status"] = siblings.verifier._evidence_status(bool(code.get("hits")), bool(static.get("hits")))
+                if static.get("read_failures"):
+                    warning = "static-search-incomplete:%d" % len(static["read_failures"])
+                    if warning not in warnings:
+                        warnings.append(warning)
+                if static_entry.get("head_sha") != record.get("head_sha"):
+                    if HEAD_MOVED_BETWEEN_RUNS not in warnings:
+                        warnings.append(HEAD_MOVED_BETWEEN_RUNS)
+                    moved.append(pattern)
+            record["warnings"] = warnings
+            records.append(record)
+            chosen.append({"pattern_id": pattern, "discovery": index,
+                           "searched_in": sorted(i for i, _ in candidates)})
+        elif failures:
+            failed.append(copy.deepcopy(failures[-1][1]))
+        else:
+            raise WorkflowError("scope-conflict: no split run holds a record or a failed scope for %s %s" % (repository, pattern))
+    try:
+        siblings.verifier._validate_discover_partition(universe, selected, records, skipped, failed)
+    except ValueError as error:
+        raise WorkflowError("scope-conflict: the merged split discovery breaks the verifier's partition: %s" % error) from error
+    limitations: List[str] = []
+    for bundle in bundles:
+        for item in bundle["document"]["method_limitations"]:
+            if item not in limitations:
+                limitations.append(item)
+    summary = [{"index": bundle["index"], "repository": repository, "sha256": bundle["sha256"],
+                "pattern_ids": list(bundle["patterns"]), "static_reads": bundle["declared"].get("static_reads", "none"),
+                "head_sha": next((r.get("head_sha") for r in bundle["document"]["records"]), None)
+                if bundle["declared"].get("static_reads") != "rest" else bundle["document"]["static_reads"][0].get("head_sha"),
+                "status": bundle["document"]["status"], "records": len(bundle["document"]["records"]),
+                "skipped_by_cap": len(bundle["document"]["skipped_by_cap"]),
+                "failed_scopes": len(bundle["document"]["failed_scopes"]), "run_id": bundle["run"].get("run_id"),
+                "request_budget": bundle["budget"].get("request_limit"),
+                "requests_consumed": bundle["budget"].get("requests_consumed")} for bundle in bundles]
+    source = rest if rest is not None else bundles[0]
+    inputs = {key: (union if key == "pattern_ids" else value) for key, value in source["declared"].items()}
+    public = [{"repository": repository, "outcome": "checked", "reason": failed[0]["reason"] if failed else None,
+               "stages_completed": [], "head_sha": records[0].get("head_sha") if records else None}]
+    code = siblings.verifier.discover_exit_code(public, records, records)
+    status = {0: "complete", 3: "partial", 4: "failed"}[code]
+    if all(bundle["document"]["status"] == "failed" for bundle in bundles):
+        status = "failed"
+    elif (moved or failed) and status == "complete":
+        status = "partial"  # a head that moved between the runs, or a combination no run finished
+    merged = {
+        "schema_version": "1.0.0", "generated_by": source["document"]["generated_by"], "inputs": inputs,
+        "records": records, "skipped_by_cap": skipped, "failed_scopes": failed, "method_limitations": limitations,
+        "status": status,
+        "workflow_merge": {"merged_by": SKILL_NAME, "kind": "split-runs", "discoveries": summary, "chosen": chosen,
+                           "capped": capped, "head_moved": moved},
+    }
+    if static_entry is not None:
+        merged["static_reads"] = [static_entry]
+    try:
+        siblings.verifier._validate_discovery_document(merged)
+    except ValueError as error:
+        raise WorkflowError("verifier rejects the merged split discovery document: %s" % error) from error
+    return merged, summary, capped, moved
+
+
 def _adopt_discoveries(args, siblings: Siblings, request: dict, state: dict, run: Run, target: dict, analysis: dict) -> dict:
     """Adopt one discovery per target repository as one merged discovery checkpoint.
 
@@ -1887,10 +2049,16 @@ def _adopt_discoveries(args, siblings: Siblings, request: dict, state: dict, run
             errors.extend(found)
             if bundle:
                 bundles.append(bundle)
+        # Several runs of one repository are a split (#3), not several repositories (#267).
+        split = len(bundles) == len(raw) and len({bundle["repository"].lower() for bundle in bundles}) == 1
         if len(bundles) == len(raw):
-            errors.extend(_discoveries_cross_errors(request, target, bundles))
+            errors.extend((_split_cross_errors if split else _discoveries_cross_errors)(request, target, bundles))
         if errors:
             raise WorkflowError("scope-conflict: " + "; ".join(errors))
+        if split:
+            generation = _commit_split(args, siblings, request, state, run, current, bundles, inputs, revisions, incoming)
+            incoming = None  # committed as the checkpoint; not removed below
+            return generation
         merged, summary, capped = _merge_discoveries(siblings, target, bundles)
         write_json_atomic(incoming / "discovery.json", merged)
         reasons = ["discovery %d (%s): %s" % (item["index"], item["repository"], item["status"])
@@ -1926,6 +2094,48 @@ def _adopt_discoveries(args, siblings: Siblings, request: dict, state: dict, run
     finally:
         if incoming is not None and incoming.exists():
             shutil.rmtree(incoming)
+
+
+def _commit_split(args, siblings: Siblings, request: dict, state: dict, run: Run, current: List[str], bundles: List[dict],
+                  inputs: dict, revisions: dict, incoming: Path) -> dict:
+    """The split's checkpoint: one merged discovery.json that the single-document steps read on."""
+    merged, summary, capped, moved = _merge_split_discoveries(siblings, request["target"], current, bundles)
+    write_json_atomic(incoming / "discovery.json", merged)
+    # The checkpoint's manifest holds every run's discover entry, in argument order, so the locus search and
+    # the record continue on it as on a single run's manifest (the originals stay under bundles/NN/).
+    write_json_atomic(incoming / "manifest.json", {
+        "schema_version": "1.0.0", "generated_by": merged["generated_by"],
+        "runs": [copy.deepcopy(entry) for bundle in bundles for entry in bundle["manifest"]["runs"]]})
+    reasons = ["run %d (%s): %s" % (item["index"], ", ".join(item["pattern_ids"]) or "no pattern", item["status"])
+               for item in summary if item["status"] != "complete"]
+    missing_patterns = sorted(set(current) - set(merged["inputs"]["pattern_ids"]))
+    if missing_patterns:
+        reasons.append("patterns not discovered: " + ", ".join(missing_patterns))
+    if merged["skipped_by_cap"]:
+        reasons.append("skipped by cap: %d combinations" % len(merged["skipped_by_cap"]))
+    if capped:
+        reasons.append("merged caps moved %d combinations to skipped_by_cap" % len(capped))
+    if merged["failed_scopes"]:
+        reasons.append("failed scopes: %d combinations" % len(merged["failed_scopes"]))
+    if moved:
+        reasons.append("head moved between the split runs for: " + ", ".join(moved))
+    status = merged["status"]
+    if status == "complete" and reasons:
+        status = "partial"
+    if status != "failed" and not merged["records"]:
+        status, reasons = "no-candidates", reasons + ["discovery produced no repository-pattern record"]
+    generation = {"status": status, "reasons": reasons, "inputs": inputs, "tool_revisions": revisions,
+                  "details": {"records": len(merged["records"]), "skipped_by_cap": len(merged["skipped_by_cap"]),
+                              "failed_scopes": len(merged["failed_scopes"]), "split_runs": summary, "capped": capped}}
+    ledger = [entry for bundle in bundles for entry in _verifier_ledger(request, bundle["manifest"])]
+    added, total = record_ledger(state, "discovery", ledger)
+    violations = budget_violations(request, state)
+    if violations:
+        generation["status"], generation["reasons"] = "blocked", reasons + violations
+    commit(run, state, "discovery", incoming, generation, args.replace)
+    event(state, "adopt-discovery", generation["status"], "gen-%03d from %d split runs ledger+%d total=%d"
+          % (generation["generation"], len(bundles), added, total))
+    return generation
 
 
 def _adopt_locus_searches(args, siblings: Siblings, request: dict, state: dict, run: Run, discovery: dict) -> dict:
@@ -2375,27 +2585,12 @@ def next_steps(run: Run, request: dict, state: dict) -> List[dict]:
     if analysis["status"] == "no-patterns":
         return []
     if active(state, "discovery") is None:
-        def discover_argv(repositories):
-            argv = ["verify_candidates.py", "discover", "--analysis", "stages/analysis/gen-%03d/analysis.json" % analysis["generation"]]
-            for repository in repositories:
-                argv += ["--repo", repository]
-            return argv + ["--max-candidates-per-repo", str(target["max_candidates_per_repo"]),
-                           "--max-candidates-total", str(target["max_candidates_total"]),
-                           "--request-budget", str(target["discover_request_budget"]),
-                           "--output", "<ISOLATED_OUTPUT>/discovery.json", "--manifest", "<ISOLATED_OUTPUT>/manifest.json"]
-        if len(target["repositories"]) > 1:
-            # The candidate-reads entry reads one repository per run.
-            then = ("adopt-discovery with --discovery ... --manifest ... repeated once per repository (%d), in any "
-                    "order; the target caps are applied again over the set" % len(target["repositories"]))
-            return [{"stage": "discovery", "repository": repository, "kind": "external-network-step", "executed": False,
-                     "argv": discover_argv([repository]), "note": unverified_note, "then": then}
-                    for repository in target["repositories"]]
-        return [{"stage": "discovery", "kind": "external-network-step", "executed": False,
-                 "argv": discover_argv(target["repositories"]), "note": unverified_note,
-                 "then": "adopt-discovery --discovery ... --manifest ..."}]
+        return _discovery_steps(run, analysis, target, unverified_note)
     discovery = active(state, "discovery")
     if discovery["status"] == "no-candidates":
-        return []
+        # A REST run whose budget ended in the searches (#266) leaves the reads and no record (#3): plan
+        # the split from what it read instead of stopping at no-candidates.
+        return _replan_after_budget_exhausted(run, analysis, discovery, target, unverified_note)
     bundles = discovery["details"].get("discoveries")
     record_step = {"stage": "record", "kind": "local", "executed": False, "command": "record --assessment ... --origin ai"}
     if bundles:
@@ -2429,6 +2624,117 @@ def next_steps(run: Run, request: dict, state: dict) -> List[dict]:
     if active(state, "record") is None:
         return [record_step]
     return []
+
+
+def _discover_argv(analysis: dict, target: dict, repositories: Sequence[str], run: Optional[dict] = None) -> List[str]:
+    """Plan argv of one discover run; ``run`` narrows it to a split run's patterns, clue cap and static reads."""
+    argv = ["verify_candidates.py", "discover", "--analysis", "stages/analysis/gen-%03d/analysis.json" % analysis["generation"]]
+    for repository in repositories:
+        argv += ["--repo", repository]
+    if run is not None:
+        for pattern in run["pattern_ids"]:
+            argv += ["--pattern", pattern]
+        argv += ["--max-clues-per-pattern", str(run["max_clues_per_pattern"])]
+        if run["static_reads"] == "rest":
+            argv += ["--static-reads", "rest"]
+            for directory in run["static_dirs"]:
+                argv += ["--static-dir", directory]
+    return argv + ["--max-candidates-per-repo", str(target["max_candidates_per_repo"]),
+                   "--max-candidates-total", str(target["max_candidates_total"]),
+                   "--request-budget", str(target["discover_request_budget"]),
+                   "--output", "<ISOLATED_OUTPUT>/discovery.json", "--manifest", "<ISOLATED_OUTPUT>/manifest.json"]
+
+
+def _discover_plan(run: Run, analysis: dict, target: dict, repositories: Sequence[str], *, static_reads: str = "none",
+                   static_dirs: Sequence[str] = (), rule_documents: Optional[int] = None) -> dict:
+    """The verifier's pre-run count for these repositories: the most requests, whether the budget covers them, a split."""
+    document = json.loads((gen_dir(run, "analysis", analysis) / "analysis.json").read_text(encoding="utf-8"))
+    patterns = [p for p in document.get("patterns", []) if isinstance(p, dict) and p.get("superseded_by") is None]
+    siblings = run.siblings
+    if siblings is None:
+        raise WorkflowError("plan data needs the loaded siblings (main sets run.siblings)")
+    plan = siblings.verifier.plan_discover(
+        patterns, list(repositories), target["max_candidates_per_repo"], target["max_candidates_total"],
+        CANDIDATE_READS_MAX_CLUES, target["discover_request_budget"], static_reads, static_dirs, rule_documents)
+    plan["lines"] = siblings.verifier.render_plan(plan)
+    return plan
+
+
+def _split_steps(analysis: dict, target: dict, plan: dict, note: str, then: str) -> List[dict]:
+    return [{"stage": "discovery", "repository": item["repository"], "kind": "external-network-step", "executed": False,
+             "run": index, "argv": _discover_argv(analysis, target, [item["repository"]], item), "note": note,
+             "plan": {"requests": item["requests"], "request_budget": plan["request_budget"], "fits": True},
+             "then": then}
+            for index, item in enumerate(plan["split"], 1)]
+
+
+def _discovery_steps(run: Run, analysis: dict, target: dict, note: str) -> List[dict]:
+    """The discover step(s) before any discovery is adopted, with the verifier's pre-run count (#3)."""
+    if len(target["repositories"]) > 1:
+        # The candidate-reads entry reads one repository per run. A split of one repository's run is adopted
+        # only for a target of that one repository, so a multi-repository target shows its count per repository.
+        then = ("adopt-discovery with --discovery ... --manifest ... repeated once per repository (%d), in any "
+                "order; the target caps are applied again over the set" % len(target["repositories"]))
+        steps = []
+        for repository in target["repositories"]:
+            plan = _discover_plan(run, analysis, target, [repository])
+            steps.append({"stage": "discovery", "repository": repository, "kind": "external-network-step", "executed": False,
+                          "argv": _discover_argv(analysis, target, [repository]), "note": note,
+                          "plan": {key: plan[key] for key in ("requests", "request_budget", "fits", "shortfall", "lines")},
+                          "then": then})
+        return steps
+    plan = _discover_plan(run, analysis, target, target["repositories"])
+    summary = {key: plan[key] for key in ("requests", "request_budget", "fits", "shortfall", "lines")}
+    if plan["fits"] or plan["split"] is None:
+        step = {"stage": "discovery", "kind": "external-network-step", "executed": False,
+                "argv": _discover_argv(analysis, target, target["repositories"]), "note": note, "plan": summary,
+                "then": "adopt-discovery --discovery ... --manifest ..."}
+        if not plan["fits"]:
+            step["detail"] = ("the searches would end in budget-exhausted (%d requests short) and no split fits: %s"
+                              % (plan["shortfall"], plan["split_problem"]))
+        return [step]
+    then = ("adopt-discovery with --discovery ... --manifest ... once per run (%d), together in one command: the "
+            "workflow merges the split runs of one repository (every pattern keeps its fullest search, the REST "
+            "run's static reads go to every record)" % len(plan["split"]))
+    return _split_steps(analysis, target, plan, note, then)
+
+
+def _replan_after_budget_exhausted(run: Run, analysis: dict, discovery: dict, target: dict, note: str) -> List[dict]:
+    """After a no-candidates discovery whose combinations ended budget-exhausted: the split, from the reads it kept."""
+    if not discovery["details"].get("failed_scopes"):
+        return []
+    try:
+        document = json.loads((gen_dir(run, "discovery", discovery) / "discovery.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    if not any(item.get("reason") == "budget-exhausted" for item in document.get("failed_scopes", [])):
+        return []
+    repositories = document.get("inputs", {}).get("repositories")
+    if repositories != target["repositories"] or len(repositories) != 1:
+        return []
+    static_reads = document["inputs"].get("static_reads", "none")
+    static_dirs = document["inputs"].get("static_dirs", [])
+    rule_documents = None
+    for entry in document.get("static_reads", []):
+        files = entry.get("static_search", {}).get("files") if isinstance(entry, dict) else None
+        if isinstance(files, list) and files:
+            rule_documents = max(1, len([f for f in files if isinstance(f, dict) and f.get("path") != "README.md"]))
+    plan = _discover_plan(run, analysis, target, repositories, static_reads=static_reads, static_dirs=static_dirs,
+                          rule_documents=rule_documents)
+    detail = ("stages/discovery/gen-%03d ended budget-exhausted before a record (%s); the plan below counts %s"
+              % (discovery["generation"], " | ".join(plan["lines"]),
+                 "the %d rule documents that run read" % rule_documents if rule_documents is not None
+                 else "the rule document cap"))
+    if plan["fits"] or plan["split"] is None:
+        return [{"stage": "discovery", "kind": "external-network-step", "executed": False,
+                 "argv": _discover_argv(analysis, target, repositories), "note": note, "detail": detail,
+                 "plan": {key: plan[key] for key in ("requests", "request_budget", "fits", "shortfall", "lines")},
+                 "then": "adopt-discovery --discovery ... --manifest ... --replace"}]
+    then = ("adopt-discovery with --discovery ... --manifest ... once per run (%d), together in one command with "
+            "--replace: the workflow merges the split runs of one repository" % len(plan["split"]))
+    steps = _split_steps(analysis, target, plan, note, then)
+    steps[0]["detail"] = detail
+    return steps
 
 
 def _per_repository_steps(analysis: dict, discovery: dict, target: dict, note: str) -> List[dict]:
@@ -2817,6 +3123,7 @@ def main(argv: Optional[Sequence[str]] = None, *, environ=os.environ) -> int:
         run = Run(args.run_dir)
         request, state = run.load()
         run.revisions = siblings.revisions()
+        run.siblings = siblings
         if args.command == "status":
             print(json.dumps(status_document(run, request, state), ensure_ascii=False, indent=2, sort_keys=True))
             return 0

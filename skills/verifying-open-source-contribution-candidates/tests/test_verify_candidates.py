@@ -7333,5 +7333,143 @@ class SearchPacingTests(unittest.TestCase):
         self.assertEqual(verify_candidates.MAX_RETRIES + 1, len(calls))
 
 
+def plan_pattern(pattern_id, clue_count):
+    return {"pattern_id": pattern_id, "search_clues": ["clue %s %d" % (pattern_id, n) for n in range(clue_count)]}
+
+
+class DiscoverPlanTests(unittest.TestCase):
+    """The pre-run count and split of a discover run (#3): what the budget covers before any request."""
+
+    run_main = VerifyCandidatesTests.run_main
+    FACTS = verify_candidates.REPOSITORY_FACT_REQUESTS  # 26
+
+    def plan(self, patterns, budget=60, **kwargs):
+        kwargs.setdefault("static_reads", "none")
+        if kwargs["static_reads"] == "rest":
+            kwargs.setdefault("static_dirs", ("docs/rules",))
+        return verify_candidates.plan_discover(patterns, ["eslint/css"], 5, 5, 5, budget, **kwargs)
+
+    def test_s1_fifteen_rule_documents_and_eight_clues_need_83_and_split_into_a_static_and_a_search_run(self):
+        patterns = [plan_pattern("PAT-001", 5), plan_pattern("PAT-002", 3)]
+        plan = self.plan(patterns, static_reads="rest", rule_documents=15)
+        # 26 facts + README + listing + 15 documents = 43, then 5 requests for each of the 8 clues.
+        self.assertEqual({"repository_facts": 26, "static_reads": 17, "searches": 40, "total": 83}, plan["requests"])
+        self.assertEqual((False, 23, 8, 58, True, False), (plan["fits"], plan["shortfall"], plan["used_clues"],
+                                                            plan["static_floor"], plan["static_floor_covered"],
+                                                            plan["rule_documents_assumed"]))
+        self.assertIsNone(plan["split_problem"])
+        self.assertEqual([
+            {"repository": "eslint/css", "pattern_ids": ["PAT-002"], "max_clues_per_pattern": 5, "static_reads": "rest",
+             "static_dirs": ["docs/rules"], "requests": 43 + 15},
+            {"repository": "eslint/css", "pattern_ids": ["PAT-001"], "max_clues_per_pattern": 5, "static_reads": "none",
+             "static_dirs": [], "requests": 26 + 25},
+        ], plan["split"])
+        self.assertTrue(all(run["requests"] <= 60 for run in plan["split"]))
+        lines = verify_candidates.render_plan(plan)
+        self.assertEqual("discover plan: at most 83 requests (repository facts 26, static reads 17, searches 40 for 8 clues) "
+                         "against a budget of 60; the searches take at least 65.1 s", lines[0])
+        self.assertIn("does not fit: 23 requests short", lines[2])
+        self.assertIn("run 1: eslint/css --pattern PAT-002 --max-clues-per-pattern 5 --static-reads rest --static-dir docs/rules "
+                      "(at most 58 requests)", lines[4])
+        self.assertIn("run 2: eslint/css --pattern PAT-001 --max-clues-per-pattern 5 (at most 51 requests)", lines[5])
+
+    def test_a_search_that_fits_beside_no_pattern_carries_one_with_a_smaller_clue_cap_and_searches_it_again(self):
+        patterns = [plan_pattern("PAT-001", 5), plan_pattern("PAT-002", 5)]
+        plan = self.plan(patterns, static_reads="rest", rule_documents=15)
+        self.assertEqual(43 + 50, plan["requests"]["total"])
+        self.assertEqual([("PAT-001", 3, "rest", 58), ("PAT-001", 5, "none", 51), ("PAT-002", 5, "none", 51)],
+                         [(" ".join(r["pattern_ids"]), r["max_clues_per_pattern"], r["static_reads"], r["requests"])
+                          for r in plan["split"]])
+
+    def test_the_document_cap_is_assumed_when_the_count_is_unknown_and_can_leave_no_room_for_a_search(self):
+        plan = self.plan([plan_pattern("PAT-001", 1)], static_reads="rest")
+        self.assertEqual((30, True, 26 + 32 + 5, False), (plan["rule_documents"], plan["rule_documents_assumed"],
+                                                          plan["requests"]["total"], plan["fits"]))
+        self.assertIsNone(plan["split"])
+        self.assertIn("the static reads alone take 58 of 60 requests", plan["split_problem"])
+        self.assertIn("30 rule documents assumed", verify_candidates.render_plan(plan)[1])
+        self.assertIn("no split found", verify_candidates.render_plan(plan)[3])
+        # Below the static floor the plan still counts and says that discover refuses the run.
+        below = self.plan([plan_pattern("PAT-001", 1)], budget=57, static_reads="rest", rule_documents=15)
+        self.assertFalse(below["static_floor_covered"])
+        self.assertIn("NOT covered: discover refuses the run", verify_candidates.render_plan(below)[1])
+
+    def test_a_plain_run_over_the_budget_splits_by_pattern_and_a_fitting_one_has_no_split(self):
+        plan = self.plan([plan_pattern("PAT-001", 5), plan_pattern("PAT-002", 3)])
+        self.assertEqual((26 + 40, False, 6), (plan["requests"]["total"], plan["fits"], plan["shortfall"]))
+        self.assertEqual([(["PAT-001"], 51), (["PAT-002"], 41)], [(r["pattern_ids"], r["requests"]) for r in plan["split"]])
+        packed = self.plan([plan_pattern("PAT-%03d" % n, 3) for n in range(1, 5)])
+        self.assertEqual([["PAT-001", "PAT-002"], ["PAT-003", "PAT-004"]], [r["pattern_ids"] for r in packed["split"]])
+        fits = self.plan([plan_pattern("PAT-001", 5)])
+        self.assertEqual((True, 0, None, 51), (fits["fits"], fits["shortfall"], fits["split"], fits["requests"]["total"]))
+        self.assertEqual("fits: one run finishes the static reads and every search", verify_candidates.render_plan(fits)[-1])
+        # The caps bound the count as they bound the run: a combination skipped by cap is not searched.
+        capped = verify_candidates.plan_discover([plan_pattern("PAT-001", 5), plan_pattern("PAT-002", 5)], ["eslint/css"],
+                                                 1, 5, 5, 60)
+        self.assertEqual((1, 1, 26 + 25, True), (capped["combinations"], capped["skipped_by_cap"],
+                                                 capped["requests"]["total"], capped["fits"]))
+        # A pattern whose searches alone pass the budget is named, not silently planned.
+        too_big = self.plan([plan_pattern("PAT-001", 5)], budget=40)
+        self.assertIsNone(too_big["split"])
+        self.assertIn("PAT-001: one pattern's searches alone take 51 of 40 requests", too_big["split_problem"])
+
+    def test_the_plan_command_prints_the_count_requests_nothing_and_writes_no_manifest_run(self):
+        analysis = json.loads((SKILL_DIR / "tests/fixtures/common/analysis.json").read_text(encoding="utf-8"))
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            analysis_path = root / "analysis.json"
+            analysis_path.write_text(json.dumps(analysis), encoding="utf-8")
+            output = root / "plan.json"
+            code, stdout, stderr, calls = self.run_main([
+                "plan", "--analysis", str(analysis_path), "--repo", "eslint/css", "--pattern", "PAT-001", "--pattern", "PAT-002",
+                "--pattern", "PAT-003", "--request-budget", "60", "--static-reads", "rest", "--rule-documents", "15",
+                "--output", str(output)])
+            self.assertEqual((0, "", []), (code, stderr, calls))
+            self.assertTrue(stdout.startswith("discover plan: at most 88 requests (repository facts 26, static reads 17, "
+                                              "searches 45 for 9 clues) against a budget of 60"), stdout)
+            self.assertIn("split into 2 runs, adopted together:", stdout)
+            plan = json.loads(output.read_text(encoding="utf-8"))
+            self.assertEqual(["PAT-001", "PAT-002", "PAT-003"], plan["inputs"]["pattern_ids"])
+            self.assertEqual(hashlib.sha256(analysis_path.read_bytes()).hexdigest(), plan["inputs"]["analysis_sha256"])
+            self.assertEqual([["PAT-001"], ["PAT-002", "PAT-003"]], [r["pattern_ids"] for r in plan["split"]])
+            self.assertEqual(sorted(p.name for p in root.iterdir()), ["analysis.json", "plan.json"])
+            # The scope checks are discover's; the budget floor is reported, not refused.
+            code, _, stderr, _ = self.run_main(["plan", "--analysis", str(analysis_path), "--repo", "eslint/css",
+                                                "--static-reads", "rest", "--static-dir", "docs/../x"])
+            self.assertEqual(2, code)
+            self.assertIn("static-dir", stderr)
+            code, stdout, _, _ = self.run_main(["plan", "--analysis", str(analysis_path), "--repo", "eslint/css",
+                                                "--request-budget", "30", "--static-reads", "rest"])
+            self.assertEqual(0, code)
+            self.assertIn("NOT covered", stdout)
+            code, _, stderr, _ = self.run_main(["plan", "--analysis", str(analysis_path), "--repo", "eslint/css",
+                                                "--pattern", "PAT-099"])
+            self.assertEqual(2, code)
+            self.assertIn("pattern not found", stderr)
+
+    def test_discover_says_its_plan_on_stderr_in_rest_mode_and_when_the_count_passes_the_budget(self):
+        rest = RestStaticReadsTests()
+        analysis, responses = rest.rest_responses()
+        code, stderr, discovery, _, _ = rest.run_rest(analysis, responses)
+        self.assertEqual(0, code, stderr)
+        self.assertTrue(stderr.startswith("discover plan: at most %d requests" % (26 + 32 + 5)), stderr)
+        self.assertIn("fits: one run finishes", stderr)
+        # Plain mode over the budget: the four fixture patterns take 26 + 60 against 45.
+        analysis = json.loads((SKILL_DIR / "tests/fixtures/common/analysis.json").read_text(encoding="utf-8"))
+        responses = make_responses("example-org/repo", [c for p in analysis["patterns"] for c in p["search_clues"]])
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            write_fixture(root / "fixture", responses, analysis)
+            code, _, stderr, _ = self.run_main([
+                "discover", "--analysis", str(root / "fixture/analysis.json"), "--repo", "example-org/repo",
+                "--request-budget", "45", "--fixture-dir", str(root / "fixture"),
+                "--output", str(root / "discovery.json"), "--manifest", str(root / "manifest.json")])
+            self.assertEqual(3, code)
+            self.assertIn("does not fit: 41 requests short", stderr)
+            self.assertIn("split into 4 runs", stderr)
+            discovery = json.loads((root / "discovery.json").read_text(encoding="utf-8"))
+            self.assertEqual("partial", discovery["status"])
+
+
 if __name__ == "__main__":
     unittest.main()

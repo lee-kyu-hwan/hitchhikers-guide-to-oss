@@ -77,3 +77,14 @@ macOS(작성자 호스트, 같은 날)도 모듈별 시험 수·skip이 dotfiles
 | 분석 번들 `test_*.py` 12개 + `selftest_*.py` 3개 | 모두 OK(skip은 위와 같음), selftest failures=0 | `test_continue_plan` 1건 실패(위에 적은 이 호스트의 증거 `continued-by.json` 탓, 변경과 무관), 나머지 OK |
 | 스킬 시험 6묶음 | 624개 OK (researching 138, 나머지 위와 같음) | 같음 |
 | `__pycache__` | 0 | 0 |
+
+### 2026-10-08, discover 예산 사전 계산과 분할 실행(hitchhikers-guide-to-oss#3)
+
+같은 Docker 방식(`python:3.14` linux/arm64, Python 3.14.8, `--network none --cpuset-cpus=0,1`, 비root). 새 시험은 verifier의 `DiscoverPlanTests` 6개(S1: 규칙 문서 15개·단서 8개의 사전 계산과 분할 제안, `plan` 명령, discover의 stderr 계획 줄)와 workflow 스킬의 `tests/test_split_discovery.py` 7개(S2: 정적 run + 검색 run 채택 → 검색까지 complete·레코드 생성, cap 축소 run, head 이동, 반례, 예산 소진 뒤 재계획)다.
+
+| 묶음 | Linux | macOS(작성자 호스트) |
+|---|---|---|
+| 저장소 시험 `tests/test_*.py` 19모듈 | 671개 OK (skip 40) | 모듈별 모두 OK(skip 39; `worker_runtime` 21·`worker_linux` 9·`worker_supervisor` 4·`offline_integration` 3·`worker_skills` 2) |
+| 분석 번들 `test_*.py` 12개 + `selftest_*.py` 3개 | 모두 OK(skip은 위와 같음), selftest failures=0 | `test_continue_plan` 1건 실패(위에 적은 이 호스트의 증거 `continued-by.json` 탓, 변경과 무관), 나머지 OK |
+| 스킬 시험 6묶음 | 637개 OK (researching 145, verifying 133, 나머지 위와 같음) | 같음 |
+| `__pycache__` | 0 | 0 |

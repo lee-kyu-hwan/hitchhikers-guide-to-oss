@@ -190,7 +190,7 @@ For compatibility, missing complete is unknown/incomplete, never implicitly true
 
 ## Manifest and exit codes
 
-The manifest envelope is `{schema_version, generated_by, runs}`. Each append-only run contains `run_id`, `command`, start and completion observations, `inputs`, `budget`, `repositories`, `clones`, `failed_scopes`, `retry_events`, `method_limitations`, `warnings`, `status`, and `outcome`. Every requested repository has one ordered `{repository, outcome, reason, stages_completed, head_sha}` entry. The recorded commands are `discover`, `locus-search`, `record`, and `recheck`.
+The manifest envelope is `{schema_version, generated_by, runs}`. Each append-only run contains `run_id`, `command`, start and completion observations, `inputs`, `budget`, `repositories`, `clones`, `failed_scopes`, `retry_events`, `method_limitations`, `warnings`, `status`, and `outcome`. Every requested repository has one ordered `{repository, outcome, reason, stages_completed, head_sha}` entry. The recorded commands are `discover`, `locus-search`, `record`, and `recheck`. `plan` is offline: it counts the requests a discover run can take against its budget and proposes a split, makes no request and writes no run.
 
 | Code | Meaning |
 | --- | --- |
@@ -211,6 +211,7 @@ The sibling PR collector owns normalized historical PR collection. The sibling p
 Recovery paths are explicit:
 
 - partial → new discover run
+- budget exhausted in the searches → `plan`, then the proposed discover runs adopted together as one discovery
 - stale → new discover + record
 - gate failure → fix assessment, then record
 - missing or incomplete locus search → new locus-search run, then record

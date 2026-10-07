@@ -307,6 +307,59 @@ revisions, and, for AI stages, the claimed provenance.
    pattern revisions they carry are the recorded one. Regenerating is the other
    path, with its model cost; this workflow does not choose it for the caller.
 
+9. Several discover runs of one target repository (hitchhikers-guide-to-oss#3).
+   A REST discover (`--static-reads rest`) reads the repository facts, the policy
+   paths, README.md and the rule documents before its first search, so at the
+   candidate-reads budget of 60 the searches often end `budget-exhausted` with
+   the reads kept and no record (#266). `status` therefore counts the run before
+   it with the verifier's own `plan_discover` (the most requests the fixed order
+   can take: 26 repository requests, the static reads, five per used clue under
+   the target caps and the entry's clue cap of 5) and shows `plan` on the
+   discovery step: `requests`, `request_budget`, `fits`, `shortfall` and the
+   verifier's `lines`. When the count passes the budget and a split exists, the
+   step is one step per run (`run` 1..n), each run's argv narrowed to its
+   `--pattern` list, `--max-clues-per-pattern` and, for the one run that carries
+   the static reads, `--static-reads rest --static-dir ...`. A `no-candidates`
+   discovery whose combinations ended `budget-exhausted` is replanned from the
+   rule documents its `static_reads` section read, with `--replace` in `then`.
+   The plain plan assumes no static reads (the request states none); a REST run
+   is planned with the verifier's `plan --static-reads rest --rule-documents N`.
+
+   `adopt-discovery` with several `--discovery D --manifest M` pairs that all
+   name the same one repository adopts them as a split, not as several
+   repositories. All of these must hold, or it is a `scope-conflict` that changes
+   nothing:
+   - `target.repositories` is exactly that repository (a split inside a
+     several-repositories target is not adopted);
+   - the inputs other than `pattern_ids`, `static_reads` and `static_dirs` are
+     the same in every run (analysis SHA-256, `request_budget` equal to
+     `target.discover_request_budget`, clone flag, API version), every run's
+     manifest has a discover run with its inputs and the target caps, and every
+     document and manifest names the same verifier `generated_by`;
+   - at most one run carries the REST static reads, with one `static_reads`
+     entry for the repository; a plain run carries none;
+   - the per-run request limits sum to at most `budget.total_api_requests`.
+
+   The originals stay under `bundles/NN/` as in rule 7. The stage's
+   `discovery.json` is one discovery of the repository: the pattern list is the
+   union in analysis order under the target caps (a combination over the caps
+   moves to `skipped_by_cap`, listed in `workflow_merge.capped`); each pattern
+   keeps the record with the fullest search (complete and available first, then
+   fewer `unused_clues`, more queries, the later run), so a pattern the static run
+   carried with a smaller clue cap is replaced by its full search from a plain
+   run; the static run's `static_search` is copied into every record and its
+   `evidence_status` recomputed, as one run does, and the `static_reads` section
+   is that run's; a pattern with a record in no run keeps one failed scope.
+   `workflow_merge` records `kind: split-runs`, every run (`discoveries`), the
+   run chosen per pattern (`chosen`, with every run that searched it) and
+   `head_moved`. A head that moved between the runs leaves the merge `partial`
+   with a reason and the warning `head-moved-between-split-runs` on the record
+   (its `static_search.ref` is the static run's head). The checkpoint's
+   `manifest.json` holds every run's discover entry, and every run enters the
+   ledger once. The merged document names one repository, so assessment, locus
+   search and record follow the single-document steps on it; the checkpoint's
+   `details.split_runs` lists the runs and there are no per-repository bundles.
+
 ## Digest shard size
 
 `digest [--max-bytes N]` passes N to the analyzer's digest builder: the largest
