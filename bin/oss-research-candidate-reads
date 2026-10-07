@@ -58,7 +58,11 @@ STATIC_MAX_FILES). The relay's routes, methods and hosts are unchanged. The rese
 covers the static reads only: the searches need 5 more requests per clue and pattern,
 so near the floor they can run out. The verifier then keeps the finished reads in the
 discovery's static_reads section (one entry per repository, #266) while the patterns
-go to failed_scopes.
+go to failed_scopes. Count the run before it with the verifier's offline ``plan`` (the
+same options plus --rule-documents): when the searches do not fit, it proposes runs
+that each fit the budget (one with the static reads and a pattern subset or a smaller
+clue cap, plain ones for the other patterns); each is one request of this entry as it
+is, and the workflow's adopt-discovery merges them (hitchhikers-guide-to-oss#3).
 
 Status is the verifier's, never raised: its exit 0 is "succeeded" (exit 0), its
 exit 3 is "partial" (exit EXIT_PARTIAL: a budget stop, an unavailable anonymous

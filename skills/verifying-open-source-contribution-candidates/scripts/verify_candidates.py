@@ -746,6 +746,191 @@ def static_request_reserve(directory_count: int) -> int:
     return REPOSITORY_FACT_REQUESTS + 1 + directory_count + STATIC_MAX_FILES
 
 
+# Requests one used clue costs in discover: four issue/PR searches and one code search (R3.3, R3.4).
+SEARCH_REQUESTS_PER_CLUE = 5
+
+
+def _clue_count(pattern: Dict[str, object], max_clues: int) -> int:
+    clues = pattern.get("search_clues")
+    return min(len(clues), max_clues) if isinstance(clues, list) else 0
+
+
+def _plan_run(
+    repository: str,
+    patterns: Sequence[Dict[str, object]],
+    max_clues: int,
+    static_reads: str,
+    static_dirs: Sequence[str],
+    static_requests: int,
+) -> Dict[str, object]:
+    """One discover run of the split: its scope and the most requests it can take."""
+    searches = sum(_clue_count(pattern, max_clues) for pattern in patterns) * SEARCH_REQUESTS_PER_CLUE
+    run = {
+        "repository": repository,
+        "pattern_ids": [str(pattern["pattern_id"]) for pattern in patterns],
+        "max_clues_per_pattern": max_clues,
+        "static_reads": static_reads,
+        "static_dirs": list(static_dirs) if static_reads == "rest" else [],
+        "requests": REPOSITORY_FACT_REQUESTS + static_requests + searches,
+    }
+    return run
+
+
+def plan_discover(
+    patterns: Sequence[Dict[str, object]],
+    repositories: Sequence[str],
+    per_repo_cap: int,
+    total_cap: int,
+    max_clues: int,
+    request_budget: int,
+    static_reads: str = "none",
+    static_dirs: Sequence[str] = (),
+    rule_documents: Optional[int] = None,
+) -> Dict[str, object]:
+    """Count the requests a discover run can take before it runs, and split it when the budget is short.
+
+    The count is the most the fixed request order can take: the repository facts and
+    policy paths (REPOSITORY_FACT_REQUESTS, a fork and an owner's .github repository
+    included), in REST static mode README.md, one listing per directory and the rule
+    documents (``rule_documents`` when known, otherwise the STATIC_MAX_FILES cap), and
+    five searches per used clue of every selected combination. Retries are not counted:
+    they come on top, so a plan that fits exactly can still end short.
+
+    When the count passes the budget the plan proposes runs that each fit the budget and
+    together cover every selected combination once with its full clues: in REST mode one
+    run carries the static reads plus the patterns whose searches still fit beside them
+    (or one pattern with a smaller clue cap when none fits whole; that pattern is searched
+    again in full in a later run), and plain runs take the rest. The runs are adopted
+    together (adopt-discovery with several pairs of one repository). A split is per
+    repository because the candidate-reads entry reads one repository per run.
+    """
+    if static_reads not in STATIC_READS_MODES:
+        raise ValueError("static_reads must be one of %s" % ", ".join(STATIC_READS_MODES))
+    directories = list(static_dirs) if static_reads == "rest" else []
+    documents = STATIC_MAX_FILES if rule_documents is None else min(rule_documents, STATIC_MAX_FILES)
+    static_requests = (1 + len(directories) + documents) if static_reads == "rest" else 0
+    static_floor = len(repositories) * static_request_reserve(len(directories)) if static_reads == "rest" else 0
+    selected, skipped = _cap_combinations(repositories, patterns, per_repo_cap, total_cap)
+    by_repository = {}  # type: Dict[str, List[Dict[str, object]]]
+    for repository, pattern in selected:
+        by_repository.setdefault(repository, []).append(pattern)
+    used_clues = sum(_clue_count(pattern, max_clues) for _, pattern in selected)
+    searches = used_clues * SEARCH_REQUESTS_PER_CLUE
+    facts = len(repositories) * REPOSITORY_FACT_REQUESTS
+    static_total = len(repositories) * static_requests
+    total = facts + static_total + searches
+    issue_searches = used_clues * 4
+    plan = {
+        "request_budget": request_budget,
+        "static_reads": static_reads,
+        "static_dirs": directories,
+        "rule_documents": documents if static_reads == "rest" else None,
+        "rule_documents_assumed": static_reads == "rest" and rule_documents is None,
+        "requests": {
+            "repository_facts": facts,
+            "static_reads": static_total,
+            "searches": searches,
+            "total": total,
+        },
+        "static_floor": static_floor,
+        "static_floor_covered": request_budget >= static_floor,
+        "combinations": len(selected),
+        "skipped_by_cap": len(skipped),
+        "used_clues": used_clues,
+        "fits": total <= request_budget,
+        "shortfall": max(0, total - request_budget),
+        "search_floor_seconds": round(max(0, issue_searches - 1) * SEARCH_ISSUES_INTERVAL_SECONDS, 1),
+        "split": None,
+        "split_problem": None,
+    }
+    if plan["fits"]:
+        return plan
+    runs = []  # type: List[Dict[str, object]]
+    problems = []  # type: List[str]
+    for repository in repositories:
+        remaining = list(by_repository.get(repository, []))
+        if static_reads == "rest":
+            base = REPOSITORY_FACT_REQUESTS + static_requests
+            carried = []  # type: List[Dict[str, object]]
+            for pattern in list(remaining):
+                cost = _clue_count(pattern, max_clues) * SEARCH_REQUESTS_PER_CLUE
+                if base + sum(_clue_count(p, max_clues) for p in carried) * SEARCH_REQUESTS_PER_CLUE + cost <= request_budget:
+                    carried.append(pattern)
+                    remaining.remove(pattern)
+            if carried:
+                runs.append(_plan_run(repository, carried, max_clues, "rest", directories, static_requests))
+            elif remaining:
+                # No pattern's full search fits beside the reads: carry the first one with a
+                # smaller clue cap so the run stays a valid entry request; it is searched in
+                # full again below and the adoption keeps the fuller record.
+                reduced = (request_budget - base) // SEARCH_REQUESTS_PER_CLUE
+                if reduced >= 1:
+                    runs.append(_plan_run(repository, remaining[:1], reduced, "rest", directories, static_requests))
+                else:
+                    problems.append(
+                        "%s: the static reads alone take %d of %d requests, so no search can share "
+                        "their run; give the rule document count, read fewer directories or raise the budget"
+                        % (repository, base, request_budget)
+                    )
+            else:
+                runs.append(_plan_run(repository, [], max_clues, "rest", directories, static_requests))
+        while remaining:
+            batch = [remaining.pop(0)]
+            while remaining:
+                cost = sum(_clue_count(p, max_clues) for p in batch + remaining[:1]) * SEARCH_REQUESTS_PER_CLUE
+                if REPOSITORY_FACT_REQUESTS + cost > request_budget:
+                    break
+                batch.append(remaining.pop(0))
+            run = _plan_run(repository, batch, max_clues, "none", (), 0)
+            if run["requests"] > request_budget:
+                problems.append(
+                    "%s %s: one pattern's searches alone take %d of %d requests; lower the clue cap or raise the budget"
+                    % (repository, run["pattern_ids"][0], run["requests"], request_budget)
+                )
+            runs.append(run)
+    if problems:
+        plan["split_problem"] = "; ".join(problems)
+    else:
+        plan["split"] = runs
+    return plan
+
+
+def render_plan(plan: Dict[str, object]) -> List[str]:
+    """Plain lines a person reads before launching discover."""
+    requests = plan["requests"]
+    lines = [
+        "discover plan: at most %d requests (repository facts %d, static reads %d, searches %d for %d clues) "
+        "against a budget of %d; the searches take at least %.1f s"
+        % (requests["total"], requests["repository_facts"], requests["static_reads"], requests["searches"],
+           plan["used_clues"], plan["request_budget"], plan["search_floor_seconds"])
+    ]
+    if plan["static_reads"] == "rest":
+        lines.append(
+            "static reads: %s, %d rule documents%s; the static floor is %d (%s)"
+            % (", ".join(plan["static_dirs"]), plan["rule_documents"],
+               " assumed (the cap; give --rule-documents when known)" if plan["rule_documents_assumed"] else "",
+               plan["static_floor"], "covered" if plan["static_floor_covered"] else "NOT covered: discover refuses the run")
+        )
+    if plan["fits"]:
+        lines.append("fits: one run finishes the static reads and every search")
+        return lines
+    lines.append("does not fit: %d requests short; the searches would end in budget-exhausted" % plan["shortfall"])
+    if plan["split"] is None:
+        lines.append("no split found: " + str(plan["split_problem"]))
+        return lines
+    lines.append("split into %d runs, adopted together:" % len(plan["split"]))
+    for index, run in enumerate(plan["split"], 1):
+        lines.append(
+            "  run %d: %s --pattern %s --max-clues-per-pattern %d%s (at most %d requests)"
+            % (index, run["repository"], " --pattern ".join(run["pattern_ids"]) or "(none)",
+               run["max_clues_per_pattern"],
+               "".join(" --static-reads rest" + "".join(" --static-dir " + d for d in run["static_dirs"])
+                       for _ in [0] if run["static_reads"] == "rest"),
+               run["requests"])
+        )
+    return lines
+
+
 def _markdown_lines(text: str) -> List[Tuple[int, str, bool]]:
     """(line number, line, inside code) for every line; fences and front matter are code."""
     lines = text.splitlines()
@@ -1861,6 +2046,20 @@ def build_parser() -> argparse.ArgumentParser:
     discover.add_argument("--static-reads", choices=STATIC_READS_MODES, default="none")
     discover.add_argument("--static-dir", action="append", default=[])
 
+    # Offline: counts the requests a discover run can take and proposes a split (no request, no manifest run).
+    plan = subparsers.add_parser("plan")
+    plan.add_argument("--analysis", required=True)
+    plan.add_argument("--repo", action="append", required=True)
+    plan.add_argument("--pattern", action="append", default=[])
+    plan.add_argument("--max-candidates-per-repo", type=_positive_integer, default=5)
+    plan.add_argument("--max-candidates-total", type=_positive_integer, default=20)
+    plan.add_argument("--max-clues-per-pattern", type=_positive_integer, default=5)
+    plan.add_argument("--request-budget", type=_positive_integer, default=300)
+    plan.add_argument("--static-reads", choices=STATIC_READS_MODES, default="none")
+    plan.add_argument("--static-dir", action="append", default=[])
+    plan.add_argument("--rule-documents", type=_positive_integer, default=None)
+    plan.add_argument("--output")
+
     record = subparsers.add_parser("record")
     record.add_argument("--discovery", required=True)
     record.add_argument("--assessment", required=True)
@@ -1906,7 +2105,8 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _validate_discover_arguments(arguments: argparse.Namespace) -> None:
+def _validate_scope_arguments(arguments: argparse.Namespace) -> None:
+    """The repository, pattern and static directory checks discover and plan share."""
     repositories = arguments.repo
     for repository in repositories:
         if REPOSITORY_PATTERN.fullmatch(repository) is None:
@@ -1916,6 +2116,24 @@ def _validate_discover_arguments(arguments: argparse.Namespace) -> None:
     for pattern_id in arguments.pattern:
         if PATTERN_ID_PATTERN.fullmatch(pattern_id) is None:
             raise CliInputError("pattern must use PAT-<n> syntax: %s" % pattern_id)
+    if arguments.static_dir and arguments.static_reads != "rest":
+        raise CliInputError("static-dir requires --static-reads rest")
+    if arguments.static_reads == "rest":
+        directories = list(arguments.static_dir) or list(STATIC_DEFAULT_DIRS)
+        if len(directories) > STATIC_MAX_DIRS:
+            raise CliInputError("static-dir accepts at most %d directories" % STATIC_MAX_DIRS)
+        if len(directories) != len(set(directories)):
+            raise CliInputError("static-dir values must not contain duplicates")
+        for directory in directories:
+            problem = static_directory_problem(directory)
+            if problem is not None:
+                raise CliInputError("static-dir %s" % problem)
+        arguments.static_dir = directories
+
+
+def _validate_discover_arguments(arguments: argparse.Namespace) -> None:
+    _validate_scope_arguments(arguments)
+    repositories = arguments.repo
     if arguments.static_reads == "rest" and arguments.allow_clone:
         raise CliInputError("static-reads rest and allow-clone are separate static modes")
     if arguments.clone_root is not None and not arguments.allow_clone:
@@ -1939,26 +2157,49 @@ def _validate_discover_arguments(arguments: argparse.Namespace) -> None:
                 "clone-root must resolve below the temporary area %s" % temporary_root
             )
         arguments.clone_root = clone_root
-    if arguments.static_dir and arguments.static_reads != "rest":
-        raise CliInputError("static-dir requires --static-reads rest")
     if arguments.static_reads == "rest":
-        directories = list(arguments.static_dir) or list(STATIC_DEFAULT_DIRS)
-        if len(directories) > STATIC_MAX_DIRS:
-            raise CliInputError("static-dir accepts at most %d directories" % STATIC_MAX_DIRS)
-        if len(directories) != len(set(directories)):
-            raise CliInputError("static-dir values must not contain duplicates")
-        for directory in directories:
-            problem = static_directory_problem(directory)
-            if problem is not None:
-                raise CliInputError("static-dir %s" % problem)
-        needed = len(repositories) * static_request_reserve(len(directories))
+        needed = len(repositories) * static_request_reserve(len(arguments.static_dir))
         if arguments.request_budget < needed:
             raise CliInputError(
                 "request-budget must be at least %d for REST static reads "
                 "(repository facts, README.md, directory listings and %d files per repository)"
                 % (needed, STATIC_MAX_FILES)
             )
-        arguments.static_dir = directories
+
+
+def _plan_for_arguments(
+    arguments: argparse.Namespace, patterns: Sequence[Dict[str, object]], rule_documents: Optional[int] = None
+) -> Dict[str, object]:
+    return plan_discover(
+        patterns,
+        arguments.repo,
+        arguments.max_candidates_per_repo,
+        arguments.max_candidates_total,
+        arguments.max_clues_per_pattern,
+        arguments.request_budget,
+        arguments.static_reads,
+        arguments.static_dir if arguments.static_reads == "rest" else (),
+        rule_documents,
+    )
+
+
+def run_plan(arguments: argparse.Namespace, analysis: Dict[str, object]) -> int:
+    """Print the discover plan; nothing is requested and no manifest run is written."""
+    patterns = _selected_patterns(analysis, arguments.pattern)
+    plan = _plan_for_arguments(arguments, patterns, arguments.rule_documents)
+    plan["inputs"] = {
+        "analysis_sha256": _sha256_bytes(Path(arguments.analysis).read_bytes()),
+        "pattern_ids": [pattern["pattern_id"] for pattern in patterns],
+        "repositories": list(arguments.repo),
+        "max_candidates_per_repo": arguments.max_candidates_per_repo,
+        "max_candidates_total": arguments.max_candidates_total,
+        "max_clues_per_pattern": arguments.max_clues_per_pattern,
+    }
+    if arguments.output:
+        write_json_atomic(Path(arguments.output), plan)
+    for line in render_plan(plan):
+        print(line)
+    return 0
 
 
 def _read_analysis(path: str) -> Dict[str, object]:
@@ -2985,6 +3226,13 @@ def run_discover(
     combinations_by_repository = {}  # type: Dict[str, List[Dict[str, object]]]
     for repository, pattern in selected_combinations:
         combinations_by_repository.setdefault(repository, []).append(pattern)
+
+    # Before the first request: what the run can take against its budget. Said on stderr in
+    # REST static mode (where the reads leave the searches short near the floor, #266) and
+    # whenever the count passes the budget; a plain run that fits stays silent as before.
+    plan = _plan_for_arguments(arguments, patterns)
+    if arguments.static_reads == "rest" or not plan["fits"]:
+        _write_stderr(" | ".join(render_plan(plan)))
 
     repository_states = []  # type: List[Dict[str, object]]
     failed_scopes = []  # type: List[Dict[str, str]]
@@ -5684,6 +5932,11 @@ def main(
                 clock=clock,
                 opener=opener,
             )
+        elif arguments.command == "plan":
+            _validate_scope_arguments(arguments)
+            analysis = _read_analysis(arguments.analysis)
+            _validate_selected_patterns(analysis, arguments.pattern)
+            return run_plan(arguments, analysis)
         elif arguments.command == "locus-search":
             return run_locus_search(
                 arguments,
