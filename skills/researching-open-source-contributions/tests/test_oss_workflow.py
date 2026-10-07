@@ -1107,22 +1107,35 @@ class ReviewFindingTests(unittest.TestCase):
 class SourceResolutionTests(unittest.TestCase):
     """Static staging contract only: not proof that Claude or Codex installed or invoked the skill."""
 
-    def _stage_skill(self, home, sibling_parent):
-        skill = home / ".agents" / "skills" / wf.SKILL_NAME
-        (skill / "scripts").mkdir(parents=True)
-        shutil.copyfile(fx.SKILL_DIR / "scripts" / "oss_workflow.py", skill / "scripts" / "oss_workflow.py")
+    @staticmethod
+    def _stage_siblings(sibling_parent):
         for skill_name, script in wf.SIBLINGS.values():
             target = sibling_parent / skill_name / script
             target.parent.mkdir(parents=True)
             target.write_text("# staged placeholder\n", encoding="utf-8")
-        spec = __import__("importlib.util").util.spec_from_file_location("staged_oss_workflow_%d" % id(home), skill / "scripts" / "oss_workflow.py")
+
+    @staticmethod
+    def _load(script_path):
+        """Load the staged copy by the given path, resolved or not, so ``__file__`` is that path."""
+        spec = __import__("importlib.util").util.spec_from_file_location("staged_oss_workflow_%d" % id(script_path), script_path)
         module = __import__("importlib.util").util.module_from_spec(spec)
         spec.loader.exec_module(module)
         return module
 
-    def test_codex_install_layout_resolves_without_request_input(self):
+    def _stage_skill(self, home, sibling_parent, skill_parent=None):
+        skill = (skill_parent or home / ".agents" / "skills") / wf.SKILL_NAME
+        (skill / "scripts").mkdir(parents=True)
+        shutil.copyfile(fx.SKILL_DIR / "scripts" / "oss_workflow.py", skill / "scripts" / "oss_workflow.py")
+        self._stage_siblings(sibling_parent)
+        return self._load(skill / "scripts" / "oss_workflow.py")
+
+    def _home(self):
         home = Path(tempfile.mkdtemp(prefix="oss-workflow-home-"))
         self.addCleanup(shutil.rmtree, home, True)
+        return home
+
+    def test_codex_install_layout_resolves_without_request_input(self):
+        home = self._home()
         staged = self._stage_skill(home, home / ".codex" / "skills")
         resolution = staged.resolve_siblings(None, environ={}, home=home)
         self.assertEqual(("codex-install", str(home / ".codex" / "skills")), (resolution["source"], resolution["root"]))
@@ -1132,8 +1145,7 @@ class SourceResolutionTests(unittest.TestCase):
         self.assertEqual(staged.ROOT_ENVIRONMENT, via_env["source"])
 
     def test_shared_layout_wins_after_siblings_move_to_agents(self):
-        home = Path(tempfile.mkdtemp(prefix="oss-workflow-home-"))
-        self.addCleanup(shutil.rmtree, home, True)
+        home = self._home()
         staged = self._stage_skill(home, home / ".agents" / "skills")
         resolution = staged.resolve_siblings(None, environ={}, home=home)
         self.assertEqual("shared-skill-parent", resolution["source"])
@@ -1141,6 +1153,46 @@ class SourceResolutionTests(unittest.TestCase):
         self.addCleanup(shutil.rmtree, empty, True)
         with self.assertRaises(staged.WorkflowError):
             staged.resolve_siblings(str(empty), environ={}, home=home)
+
+    def test_user_agents_install_is_tried_before_codex_install(self):
+        """A project-scope copy with no siblings beside it falls back to ~/.agents/skills, then ~/.codex/skills."""
+        home = self._home()
+        project = home / "project" / ".agents" / "skills"
+        staged = self._stage_skill(home, home / ".codex" / "skills", skill_parent=project)
+        self.assertEqual("codex-install", staged.resolve_siblings(None, environ={}, home=home)["source"])
+        self._stage_siblings(home / ".agents" / "skills")
+        resolution = staged.resolve_siblings(None, environ={}, home=home)
+        self.assertEqual(("agents-install", str(home / ".agents" / "skills")), (resolution["source"], resolution["root"]))
+        labels = [label for label, _ in staged.candidate_roots(None, environ={}, home=home)]
+        self.assertEqual(["shared-skill-parent", "agents-install", "codex-install"], labels)
+
+    def test_symlinked_install_prefers_the_real_parent_then_the_link_parent(self):
+        """install.sh links the skill's items into <project>/.agents/skills; the siblings next to the real file win."""
+        home = self._home()
+        checkout = home / "checkout" / "skills"
+        real_skill = checkout / wf.SKILL_NAME
+        (real_skill / "scripts").mkdir(parents=True)
+        shutil.copyfile(fx.SKILL_DIR / "scripts" / "oss_workflow.py", real_skill / "scripts" / "oss_workflow.py")
+        linked_parent = home / "project" / ".agents" / "skills"
+        linked_skill = linked_parent / wf.SKILL_NAME
+        linked_skill.mkdir(parents=True)
+        (linked_skill / "scripts").symlink_to(real_skill / "scripts")
+        staged = self._load(linked_skill / "scripts" / "oss_workflow.py")
+        self.assertEqual(real_skill.resolve(), staged.SKILL_DIR)
+        self.assertEqual(linked_skill, staged.LINK_DIR)
+        with self.assertRaises(staged.WorkflowError):
+            staged.resolve_siblings(None, environ={}, home=home)
+        # Siblings only at the link location (each may itself be a link): the link parent is the fallback.
+        self._stage_siblings(linked_parent)
+        resolution = staged.resolve_siblings(None, environ={}, home=home)
+        self.assertEqual(("link-parent", str(linked_parent)), (resolution["source"], resolution["root"]))
+        # Siblings beside the real file win over every fallback, and are reported by realpath.
+        self._stage_siblings(checkout)
+        resolution = staged.resolve_siblings(None, environ={}, home=home)
+        self.assertEqual(("shared-skill-parent", str(checkout.resolve())), (resolution["source"], resolution["root"]))
+        self.assertEqual(os.path.realpath(checkout), resolution["realpath"])
+        labels = [label for label, _ in staged.candidate_roots(None, environ={}, home=home)]
+        self.assertEqual(["shared-skill-parent", "link-parent", "agents-install", "codex-install"], labels)
 
 
 if __name__ == "__main__":

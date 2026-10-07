@@ -4,11 +4,11 @@ dotfiles(`lee-kyu-hwan/dotfiles`) main `88f17d0`에서 이 저장소로 옮긴 �
 
 ## 규칙
 
-| dotfiles 경로 | 이 저장소 | 설치 위치(dotfiles chezmoi, 그대로) |
+| dotfiles 경로 | 이 저장소 | 설치 위치(`install.sh --project DIR`, hitchhikers-guide-to-oss#1) |
 |---|---|---|
-| `dot_agents/skills/researching-open-source-contributions/` | `skills/researching-open-source-contributions/` | `~/.agents/skills/researching-open-source-contributions/` (`analysis/`는 설치하지 않음) |
-| `dot_codex/skills/<스킬>/` (analyzing·verifying·collecting 5개) | `skills/<스킬>/` | `~/.codex/skills/<스킬>/` |
-| `dot_local/bin/executable_oss-research-<이름>` | `bin/oss-research-<이름>` (실행 비트) | `~/.local/bin/oss-research-<이름>` |
+| `dot_agents/skills/researching-open-source-contributions/` | `skills/researching-open-source-contributions/` | `DIR/.agents/skills/…`·`DIR/.claude/skills/…` 안의 항목 4개(`analysis/`는 설치하지 않음). `--user`면 `~/.agents/skills/…` |
+| `dot_codex/skills/<스킬>/` (analyzing·verifying·collecting 5개) | `skills/<스킬>/` | `DIR/.agents/skills/<스킬>`·`DIR/.claude/skills/<스킬>`. `--user`면 `~/.agents/skills/<스킬>`(`~/.codex/skills`에는 더 두지 않는다) |
+| `dot_local/bin/executable_oss-research-<이름>` | `bin/oss-research-<이름>` (실행 비트) | `${BIN_DIR:-~/.local/bin}/oss-research-<이름>` |
 | `dot_local/share/oss-research/` | `share/` | 설치하지 않음 |
 | `tests/test_oss_research_*.py`, `tests/fixtures/oss_research_*/` | 같은 경로 | — |
 | `docs/research/oss-research-{relay,worker,targets}.md` | `docs/oss-research-*.md` | — |

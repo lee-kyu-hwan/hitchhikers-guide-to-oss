@@ -66,3 +66,14 @@ git ls-files -z | COPYFILE_DISABLE=1 tar --no-xattrs --null -T - -cf - |
 dotfiles 저장소 시험 전체(904개, skip 55)와의 차이 248개·skip 15는 dotfiles에 남은 시험(orchestrator, secret-file-store, claude 프로필 등)이다.
 
 macOS(작성자 호스트, 같은 날)도 모듈별 시험 수·skip이 dotfiles 사본과 같다. 두 쪽에서 똑같이 실패한 3모듈은 환경 탓이다: `test_oss_research_candidate_reads`·`test_oss_research_collect_issues`의 각 1건은 시험 사본 경로(`/private/tmp/claude-…`)에 `claude`가 들어 있어 「읽기 경로에 claude가 없다」 단언이 걸린다(다른 경로에서는 통과). `analysis/test_continue_plan` 1건은 이 호스트의 증거 `a78-split-gate-fresh-…/ledger/continued-by.json`이 dotfiles#288 실행 뒤 생겨서다(CI에서는 skip).
+
+### 2026-10-07, install.sh와 형제 탐색 변경(hitchhikers-guide-to-oss#1)
+
+같은 Docker 방식(`python:3.14` linux/arm64, `--network none --cpuset-cpus=0,1`, 비root). 새 시험은 `tests/test_install.py` 15개(S1~S4, 임시 HOME·BIN_DIR·프로젝트)와 workflow 스킬의 형제 탐색 순서 시험 2개다.
+
+| 묶음 | Linux | macOS(작성자 호스트) |
+|---|---|---|
+| 저장소 시험 `tests/test_*.py` 19모듈 | 671개 OK (skip 40) | 모듈별 모두 OK(skip 39; `worker_runtime` 21·`worker_linux` 9·`worker_supervisor` 4·`offline_integration` 3·`worker_skills` 2) |
+| 분석 번들 `test_*.py` 12개 + `selftest_*.py` 3개 | 모두 OK(skip은 위와 같음), selftest failures=0 | `test_continue_plan` 1건 실패(위에 적은 이 호스트의 증거 `continued-by.json` 탓, 변경과 무관), 나머지 OK |
+| 스킬 시험 6묶음 | 624개 OK (researching 138, 나머지 위와 같음) | 같음 |
+| `__pycache__` | 0 | 0 |
