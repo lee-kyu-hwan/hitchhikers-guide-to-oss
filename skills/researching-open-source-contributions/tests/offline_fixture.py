@@ -15,8 +15,8 @@ Dependencies: python3 standard library, and the sibling skills
 collecting-recent-closed-prs, collecting-curated-contribution-prs,
 analyzing-open-source-pr-patterns, and
 verifying-open-source-contribution-candidates (scripts and tests). They are
-found through ``OSS_WORKFLOW_SKILLS_ROOT`` or the chezmoi source checkout
-(``dot_codex/skills`` next to ``dot_agents/skills``).
+found through ``OSS_WORKFLOW_SKILLS_ROOT`` or beside this skill's real
+directory (the checkout's ``skills/``).
 
 PAT-1, its quotes, and every assessment below are hand-written synthetic
 stand-ins. They are never a real pattern or contribution candidate.
@@ -93,10 +93,9 @@ SKILL_DIR = Path(__file__).resolve().parents[1]
 
 
 def skills_root() -> Path:
+    """The siblings beside this skill's real directory (the checkout's skills/), unless overridden."""
     if os.environ.get("OSS_WORKFLOW_SKILLS_ROOT"):
         return Path(os.environ["OSS_WORKFLOW_SKILLS_ROOT"])
-    if SKILL_DIR.parent.name == "skills" and SKILL_DIR.parent.parent.name == "dot_agents":
-        return SKILL_DIR.parent.parent.parent / "dot_codex" / "skills"
     return SKILL_DIR.parent
 
 

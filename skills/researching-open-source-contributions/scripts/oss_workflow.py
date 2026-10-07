@@ -41,6 +41,8 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 SCHEMA_VERSION = "1.0.0"
 SKILL_NAME = "researching-open-source-contributions"
 SKILL_DIR = Path(__file__).resolve().parents[1]
+# The skill directory as invoked, before following links (install.sh links scripts/ into a project).
+LINK_DIR = Path(os.path.abspath(__file__)).parents[1]
 REVISION_PATHS = (
     "SKILL.md",
     "references/workflow-contract.md",
@@ -184,19 +186,37 @@ def run_main(main, argv: Sequence[str], **kwargs) -> Tuple[int, str, str]:
 # ---------------------------------------------------------------------------
 
 
-def candidate_roots(explicit: Optional[str], environ=os.environ, home: Optional[Path] = None) -> List[Tuple[str, Path]]:
+def candidate_roots(explicit: Optional[str], environ=os.environ, home: Optional[Path] = None,
+                    link_dir: Optional[Path] = None) -> List[Tuple[str, Path]]:
     """Roots are taken only from the caller: flag, environment, or install layout.
 
-    Corpus, analysis, or remote text never supplies an import path.
+    Corpus, analysis, or remote text never supplies an import path. Without a
+    flag or environment, the order is:
+
+    1. ``shared-skill-parent``: the parent of this skill's real directory. An
+       install made by ``install.sh`` links this skill's items into a project or
+       user skills directory, so the real file is in the checkout whose
+       ``skills/`` holds every sibling at the same tag. Realpath comes first
+       because the siblings load their own siblings by realpath too (see
+       ``load_sibling`` in the collectors), so every module path agrees.
+    2. ``link-parent``: the parent of the directory this file was invoked
+       through, when that is not the real parent. A layout where only the link
+       location holds the siblings (each possibly a link itself) still works.
+    3. ``agents-install`` (``~/.agents/skills``) and ``codex-install``
+       (``~/.codex/skills``): user-scope locations, kept as fallbacks for a
+       skill copied without its siblings.
     """
     if explicit:
         return [("--skills-root", Path(explicit))]
     if environ.get(ROOT_ENVIRONMENT):
         return [(ROOT_ENVIRONMENT, Path(environ[ROOT_ENVIRONMENT]))]
     roots = [("shared-skill-parent", SKILL_DIR.parent)]
-    if SKILL_DIR.parent.name == "skills" and SKILL_DIR.parent.parent.name == "dot_agents":
-        roots.append(("chezmoi-source-checkout", SKILL_DIR.parent.parent.parent / "dot_codex" / "skills"))
-    roots.append(("codex-install", (home or Path.home()) / ".codex" / "skills"))
+    link_parent = (link_dir or LINK_DIR).parent
+    if os.path.realpath(link_parent) != os.path.realpath(SKILL_DIR.parent):
+        roots.append(("link-parent", link_parent))
+    home = home or Path.home()
+    roots.append(("agents-install", home / ".agents" / "skills"))
+    roots.append(("codex-install", home / ".codex" / "skills"))
     return roots
 
 
