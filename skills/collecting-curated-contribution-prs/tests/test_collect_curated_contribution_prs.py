@@ -44,7 +44,8 @@ EVAL = SKILL_DIR / "evals" / "behavioral-eval.md"
 # 이 검증을 아예 실행할 수 없었다(리뷰 CODE-002). 정규화된 문서 전체를 digest 로 고정해
 # 우발적 변경 탐지력을 유지하면서 머신 의존 경로를 제거한다.
 # 의도적으로 문서를 고쳤다면: shasum -a 256 evals/behavioral-eval.md 로 재생성하고 사유를 보고서에 남긴다.
-PORTABLE_EVAL_SHA256 = "42d7cbf280c4999b5a2506463cd25ee5c05f96ea5e7933b64ca65aff2f4763fc"
+# 2026-10-08(#9): 호출자 scratchpad 절대 경로 12곳을 `<scratchpad>` placeholder 로 바꾸고 digest 를 재생성했다.
+PORTABLE_EVAL_SHA256 = "639a805e07b98a26b92655210f6a94b7b786ed7e0d8e7706d0b652d03f1953c0"
 
 
 def assert_portable_eval(case):

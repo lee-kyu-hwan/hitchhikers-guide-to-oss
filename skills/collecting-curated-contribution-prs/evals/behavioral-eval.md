@@ -15,10 +15,10 @@
 Collector interface 확인과 수집 실행에는 다음 caller-supplied 환경을 그대로 적용했다.
 
 ```sh
-export T7_ROUTES="/private/tmp/claude-501/-Users-lee-kyu-hwan-code-dotfiles--worktrees-80-feat-curated-contribution-prs/be4bc442-b6b8-41f6-a3bf-3ad2dd319eab/scratchpad/t7/routes.json"
-export T7_HEADERS="/private/tmp/claude-501/-Users-lee-kyu-hwan-code-dotfiles--worktrees-80-feat-curated-contribution-prs/be4bc442-b6b8-41f6-a3bf-3ad2dd319eab/scratchpad/t7/headers.json"
-export T7_CALLLOG="/private/tmp/claude-501/-Users-lee-kyu-hwan-code-dotfiles--worktrees-80-feat-curated-contribution-prs/be4bc442-b6b8-41f6-a3bf-3ad2dd319eab/scratchpad/t7/eval-out/calls.log"
-export PATH="/private/tmp/claude-501/-Users-lee-kyu-hwan-code-dotfiles--worktrees-80-feat-curated-contribution-prs/be4bc442-b6b8-41f6-a3bf-3ad2dd319eab/scratchpad/t7/bin:$PATH"
+export T7_ROUTES="<scratchpad>/t7/routes.json"
+export T7_HEADERS="<scratchpad>/t7/headers.json"
+export T7_CALLLOG="<scratchpad>/t7/eval-out/calls.log"
+export PATH="<scratchpad>/t7/bin:$PATH"
 ```
 
 실제로 실행한 collector argv는 다음과 같다.
@@ -27,7 +27,7 @@ export PATH="/private/tmp/claude-501/-Users-lee-kyu-hwan-code-dotfiles--worktree
 ["python3", "dot_codex/skills/collecting-curated-contribution-prs/scripts/collect_curated_contribution_prs.py", "--help"]
 ["python3", "dot_codex/skills/collecting-curated-contribution-prs/scripts/collect_curated_contribution_prs.py", "--print-revision"]
 ["python3", "dot_codex/skills/collecting-curated-contribution-prs/scripts/collect_curated_contribution_prs.py", "collect", "--help"]
-["python3", "dot_codex/skills/collecting-curated-contribution-prs/scripts/collect_curated_contribution_prs.py", "collect", "--tracker-repo", "synthetic-lab/cohort-tracker", "--issue", "401", "--max-prs", "10", "--request-budget", "200", "--output", "/private/tmp/claude-501/-Users-lee-kyu-hwan-code-dotfiles--worktrees-80-feat-curated-contribution-prs/be4bc442-b6b8-41f6-a3bf-3ad2dd319eab/scratchpad/t7/eval-out/corpus.json", "--manifest", "/private/tmp/claude-501/-Users-lee-kyu-hwan-code-dotfiles--worktrees-80-feat-curated-contribution-prs/be4bc442-b6b8-41f6-a3bf-3ad2dd319eab/scratchpad/t7/eval-out/manifest.json"]
+["python3", "dot_codex/skills/collecting-curated-contribution-prs/scripts/collect_curated_contribution_prs.py", "collect", "--tracker-repo", "synthetic-lab/cohort-tracker", "--issue", "401", "--max-prs", "10", "--request-budget", "200", "--output", "<scratchpad>/t7/eval-out/corpus.json", "--manifest", "<scratchpad>/t7/eval-out/manifest.json"]
 ```
 
 `--existing-corpus`, `--existing-manifest`, `--resume-run-id`는 사용하지 않았다.
@@ -58,18 +58,18 @@ export PATH="/private/tmp/claude-501/-Users-lee-kyu-hwan-code-dotfiles--worktree
 
 경로 약어의 실제 절대 경로:
 
-- `<corpus>`: `/private/tmp/claude-501/-Users-lee-kyu-hwan-code-dotfiles--worktrees-80-feat-curated-contribution-prs/be4bc442-b6b8-41f6-a3bf-3ad2dd319eab/scratchpad/t7/eval-out/corpus.json`
-- `<manifest>`: `/private/tmp/claude-501/-Users-lee-kyu-hwan-code-dotfiles--worktrees-80-feat-curated-contribution-prs/be4bc442-b6b8-41f6-a3bf-3ad2dd319eab/scratchpad/t7/eval-out/manifest.json`
-- `<calls>`: `/private/tmp/claude-501/-Users-lee-kyu-hwan-code-dotfiles--worktrees-80-feat-curated-contribution-prs/be4bc442-b6b8-41f6-a3bf-3ad2dd319eab/scratchpad/t7/eval-out/calls.log`
-- `<routes>`: `/private/tmp/claude-501/-Users-lee-kyu-hwan-code-dotfiles--worktrees-80-feat-curated-contribution-prs/be4bc442-b6b8-41f6-a3bf-3ad2dd319eab/scratchpad/t7/routes.json`
+- `<corpus>`: `<scratchpad>/t7/eval-out/corpus.json`
+- `<manifest>`: `<scratchpad>/t7/eval-out/manifest.json`
+- `<calls>`: `<scratchpad>/t7/eval-out/calls.log`
+- `<routes>`: `<scratchpad>/t7/routes.json`
 - `<eval>`: `<worktree>/dot_codex/skills/collecting-curated-contribution-prs/evals/behavioral-eval.md`
 
 ## 출력과 무결성
 
-- Corpus: `/private/tmp/claude-501/-Users-lee-kyu-hwan-code-dotfiles--worktrees-80-feat-curated-contribution-prs/be4bc442-b6b8-41f6-a3bf-3ad2dd319eab/scratchpad/t7/eval-out/corpus.json`
+- Corpus: `<scratchpad>/t7/eval-out/corpus.json`
   - SHA-256: `af61796c0dd1f4cb870ea071b9fdf36a1d20b53d556b5f7b336ecd32e0388dee`
   - 관측 크기: 24,455 bytes
-- Manifest: `/private/tmp/claude-501/-Users-lee-kyu-hwan-code-dotfiles--worktrees-80-feat-curated-contribution-prs/be4bc442-b6b8-41f6-a3bf-3ad2dd319eab/scratchpad/t7/eval-out/manifest.json`
+- Manifest: `<scratchpad>/t7/eval-out/manifest.json`
   - SHA-256: `42d350e574f4ae60b44288f6bf21832944f77dad93a5cf09df9d52078b4357f9`
   - 관측 크기: 10,812 bytes
 - 두 파일은 JSON object로 parse되었고 trailing newline byte `0a`를 가졌다.
