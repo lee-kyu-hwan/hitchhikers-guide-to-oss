@@ -2106,7 +2106,11 @@ class CollectPickupTests(unittest.TestCase):
         return completed.returncode, json.loads(completed.stdout)
 
     def test_the_real_partial_run_of_2026_10_04_is_a_partial_pickup(self):
-        """eslint-markdown/eslint-markdown: the collector stopped partial (7 matched, 5 kept, 2 over the cap)."""
+        """eslint-markdown/eslint-markdown: the collector stopped partial (7 matched, 5 kept, 2 over the cap).
+
+        The fixture is that run's collect.tar with the commit authors' emails and one real name pseudonymized
+        (user1@example.invalid, user2@example.invalid; #9) and the envelope's bytes and sha256 of corpus.json and
+        collection-manifest.json recomputed; the tar headers (GNU, modes, root, mtime, order) are the original."""
         code, seen = self.verify_partial_fixture()
         self.assertEqual((code, seen["problems"], seen["records"], seen["authenticated"], seen["collection_status"]),
                          (3, [], 5, True, "partial"), seen)
@@ -3242,7 +3246,7 @@ class AnalysisCallLedgerTests(unittest.TestCase):
     unit, so each accepted call appends one token line to the ledger and nothing is picked up."""
 
     HARNESS = REPO / "skills/researching-open-source-contributions/analysis/harness/analysis_call.sh"
-    VM_ROOT = "W=${OSS_RESEARCH_VM_ROOT:-/Users/lee-kyu-hwan/.oss-research-vm}\n"
+    VM_ROOT = "W=${OSS_RESEARCH_VM_ROOT:-$HOME/.oss-research-vm}\n"
     FAKE_LIMACTL = """#!/bin/bash
 echo "$*" >> "$(dirname "$0")/../../calls.log"
 case "$*" in
@@ -3717,7 +3721,7 @@ exit 0
         self.assertEqual(self.limactl_calls(), before + 3)
 
     # The VM root as analysis/machine_settings.py resolves it (#290): OSS_RESEARCH_VM_ROOT, else the default.
-    EVIDENCE_R6 = (Path(os.environ.get("OSS_RESEARCH_VM_ROOT") or "/Users/lee-kyu-hwan/.oss-research-vm")
+    EVIDENCE_R6 = (Path(os.environ.get("OSS_RESEARCH_VM_ROOT") or Path.home() / ".oss-research-vm")
                    / "logs/a78-period-analysis-eslint-r6-20261005T043448Z")
 
     @unittest.skipUnless((EVIDENCE_R6 / "ledger-limit.json").is_file() and (EVIDENCE_R6 / "in-continue/stage.json").is_file(),

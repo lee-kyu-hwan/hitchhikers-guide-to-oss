@@ -1,8 +1,9 @@
-"""This machine's settings are read from the environment with the old values as defaults (#290).
+"""This machine's settings are read from the environment with HOME-based defaults (#290, #9).
 
 machine_settings.py (VM root, VM logs, dated run records) and harness/analysis_call.sh (VM root, Lima instance):
-unset or empty gives exactly the value used before the split, a set variable gives that value. The harness case
-runs as an unchanged copy against a fake limactl under a temporary VM root, so no VM, model or token is used.
+unset or empty gives the default (the VM root is ~/.oss-research-vm under HOME, so every case here runs with a
+fake HOME), a set variable gives that value. The harness case runs as an unchanged copy against a fake limactl
+under a temporary VM root, so no VM, model or token is used.
 
   /opt/homebrew/bin/python3 -B -m unittest skills/researching-open-source-contributions/analysis/test_machine_settings.py
 """
@@ -22,11 +23,14 @@ HERE = Path(__file__).resolve().parent
 REPO = HERE.parents[2]
 HARNESS = HERE / "harness/analysis_call.sh"
 VARIABLES = ("OSS_RESEARCH_VM_ROOT", "OSS_RESEARCH_VM_NAME", "OSS_RESEARCH_RECORDS_ROOT")
-# The defaults, written out here on purpose: the values used before #290, except the records root, which is this
-# repository's copy of the dotfiles records (tests/fixtures/dotfiles_records).
-OLD_VM_ROOT = "/Users/lee-kyu-hwan/.oss-research-vm"
+# The defaults, written out here on purpose. The VM root hangs off HOME (#9: no personal home path in the code),
+# so the cases run with this fake HOME; the records root is this repository's copy of the dotfiles records
+# (tests/fixtures/dotfiles_records). The harness's setting line is counted verbatim.
+FAKE_HOME = "/srv/home/runner"
+OLD_VM_ROOT = FAKE_HOME + "/.oss-research-vm"
 OLD_VM_NAME = "oss-research-debian"
 OLD_RECORDS_ROOT = str(REPO / "tests/fixtures/dotfiles_records")
+HARNESS_VM_ROOT_LINE = "W=${OSS_RESEARCH_VM_ROOT:-$HOME/.oss-research-vm}\n"
 FAKE_LIMACTL = """#!/bin/bash
 echo "$*" >> "$(dirname "$0")/../../calls.log"
 case "$*" in
@@ -39,6 +43,7 @@ exit 0
 
 def environment(**values):
     env = {key: value for key, value in os.environ.items() if key not in VARIABLES}
+    env["HOME"] = FAKE_HOME
     env.update(values)
     env["PYTHONDONTWRITEBYTECODE"] = "1"
     return env
@@ -71,6 +76,10 @@ class ModuleTests(unittest.TestCase):
         self.assertEqual(settings(OSS_RESEARCH_VM_ROOT="", OSS_RESEARCH_RECORDS_ROOT=""),
                          [OLD_VM_ROOT, OLD_VM_ROOT + "/logs", OLD_RECORDS_ROOT])
 
+    def test_the_default_follows_home(self):
+        self.assertEqual(settings(HOME="/home/other")[:2], ["/home/other/.oss-research-vm", "/home/other/.oss-research-vm/logs"])
+        self.assertEqual(harness_settings(HOME="/home/other"), ["/home/other/.oss-research-vm", OLD_VM_NAME])
+
     def test_set_values_are_used(self):
         self.assertEqual(settings(OSS_RESEARCH_VM_ROOT="/srv/vm", OSS_RESEARCH_RECORDS_ROOT="/srv/dotfiles/docs/research"),
                          ["/srv/vm", "/srv/vm/logs", "/srv/dotfiles/docs/research"])
@@ -94,7 +103,8 @@ class HarnessTests(unittest.TestCase):
     def test_the_instance_is_named_only_in_its_setting(self):
         text = HARNESS.read_text()
         self.assertEqual(text.count(OLD_VM_NAME), 1)
-        self.assertEqual(text.count(OLD_VM_ROOT), 1)
+        self.assertEqual(text.count(HARNESS_VM_ROOT_LINE), 1)
+        self.assertNotIn("/Users/", text)
         self.assertEqual(text.count('L shell --workdir / "$VM" --'), 4)
 
     def call(self, **values):

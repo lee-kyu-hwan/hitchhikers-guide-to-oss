@@ -23,7 +23,7 @@
 ## 실행
 
 - 저장소 체크아웃에서 쓴다. 형제 스킬(workflow `scripts/oss_workflow.py`, analyzer·verifier)과 격리 스택(`tests/fixtures/oss_research_worker/linux/`, `share/linux/`), 시험이 읽는 실행 기록 사본(`tests/fixtures/dotfiles_records/`)을 저장소 상대 경로로 읽기 때문이다. 그래서 이 `analysis/` 하위 트리는 $HOME에 설치하지 않는다(dotfiles 당시 `.chezmoiignore`로 뺐다. 스킬 본체 `SKILL.md`·`scripts/`·`references/`·`tests/`는 설치된다). 실행 기록 원본은 dotfiles `docs/research/`에 있다.
-- 머신 설정값(#290): `OSS_RESEARCH_VM_ROOT`(VM 작업 루트, 기본 `/Users/lee-kyu-hwan/.oss-research-vm`), `OSS_RESEARCH_VM_NAME`(Lima 인스턴스, 기본 `oss-research-debian`, 하네스만 읽음), `OSS_RESEARCH_RECORDS_ROOT`(날짜별 실행 기록, 기본 이 저장소의 사본 `tests/fixtures/dotfiles_records`; dotfiles 체크아웃의 `docs/research`를 주면 원본을 읽는다). 비었거나 지정하지 않으면 기본값이다(VM 두 값은 분리 전과 같다). 기본값 고정 시험은 `test_machine_settings.py`다.
+- 머신 설정값(#290): `OSS_RESEARCH_VM_ROOT`(VM 작업 루트, 기본 `~/.oss-research-vm`), `OSS_RESEARCH_VM_NAME`(Lima 인스턴스, 기본 `oss-research-debian`, 하네스만 읽음), `OSS_RESEARCH_RECORDS_ROOT`(날짜별 실행 기록, 기본 이 저장소의 사본 `tests/fixtures/dotfiles_records`; dotfiles 체크아웃의 `docs/research`를 주면 원본을 읽는다). 비었거나 지정하지 않으면 기본값이다(VM 두 값은 분리 전과 같다). 기본값 고정 시험은 `test_machine_settings.py`다.
 - 시험은 모듈마다 따로 돌린다(같은 프로세스에서 여러 모듈을 discover하면 offline guard가 하네스 시험의 하위 프로세스를 막는다). CI의 스킬 시험은 `<스킬>/tests`만 찾으므로 이 시험들은 CI 밖이다(옮기기 전과 같다).
 
 ```sh

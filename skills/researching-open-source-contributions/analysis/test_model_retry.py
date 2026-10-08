@@ -133,7 +133,7 @@ exit 0
 class RetryFixture(unittest.TestCase):
     """A repository copy holding the real harness, driver, retry policy and run limits, and the fakes."""
 
-    VM_ROOT = "W=${OSS_RESEARCH_VM_ROOT:-/Users/lee-kyu-hwan/.oss-research-vm}\n"
+    VM_ROOT = "W=${OSS_RESEARCH_VM_ROOT:-$HOME/.oss-research-vm}\n"
 
     def setUp(self):
         self.root = Path(tempfile.mkdtemp(prefix="osrl-retry-")).resolve()
