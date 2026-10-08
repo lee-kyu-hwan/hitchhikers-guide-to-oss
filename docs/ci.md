@@ -88,3 +88,16 @@ macOS(작성자 호스트, 같은 날)도 모듈별 시험 수·skip이 dotfiles
 | 분석 번들 `test_*.py` 12개 + `selftest_*.py` 3개 | 모두 OK(skip은 위와 같음), selftest failures=0 | `test_continue_plan` 1건 실패(위에 적은 이 호스트의 증거 `continued-by.json` 탓, 변경과 무관), 나머지 OK |
 | 스킬 시험 6묶음 | 637개 OK (researching 145, verifying 133, 나머지 위와 같음) | 같음 |
 | `__pycache__` | 0 | 0 |
+
+### 2026-10-08, 공개 전환 준비 — 개인 경로 기본값·fixture 가명화(hitchhikers-guide-to-oss#9)
+
+같은 Docker 방식(`python:3.14` linux/arm64, Python 3.14.8, `--network none --cpuset-cpus=0,1`, 비root). 변경은 실행 코드의 VM 루트 기본값을 `HOME` 기준(`~/.oss-research-vm`)으로 바꾼 것, `test_machine_settings.py`를 가짜 HOME으로 고정한 것(+1건: HOME을 따라가는 기본값), `pickup_partial/p4-eslint-markdown/collect.tar`의 커밋 작성자 이메일·실명 가명화(envelope의 bytes·sha256 재계산), curated 스킬 eval 문서의 scratchpad 절대 경로 placeholder화(고정 digest 갱신)다.
+
+| 묶음 | Linux | macOS(작성자 호스트) |
+|---|---|---|
+| 저장소 시험 `tests/test_*.py` 19모듈 | 671개 OK (skip 40) | 모듈별 모두 OK(skip 39; `worker_runtime` 21·`worker_linux` 9·`worker_supervisor` 4·`offline_integration` 3·`worker_skills` 2) |
+| 분석 번들 `test_*.py` 12개 + `selftest_*.py` 3개 | 모두 OK(skip: assess 1, assess_contract 1, continue_plan 8, dry_plan 3, model_retry 1, prompt_contract 3, reduce_inputs 1, search_clues 1, stage_inputs 2; machine_settings 9개 OK), selftest failures=0 | `test_continue_plan` 1건 실패(위에 적은 이 호스트의 증거 `continued-by.json` 탓, 변경과 무관), 나머지 OK |
+| 스킬 시험 6묶음 | 637개 OK (researching 145, analyzing 77, verifying 133, recent-closed 162, curated 53, issues 67) | 같음 |
+| `__pycache__` | 0 | 0 |
+
+컨테이너 안에서 `git grep -c lee-kyu-hwan -- skills bin tests install.sh`는 0건이다. `git grep -l "/Users/"`로는 4파일이 남는데 모두 「`/Users/`가 없어야 한다」는 가드 단언(curated·workflow·machine_settings 시험)과 호스트 공유 마운트를 흉내 내는 가짜 경로 `/Users/me`(worker_linux 시험)다.

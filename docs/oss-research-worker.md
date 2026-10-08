@@ -893,7 +893,7 @@ Linux 게스트(Lima/VZ)는 호스트 Mac이 잠자는 동안 **시스템 시계
 | staged 설정 보호 | PASS (실측, 비AI probe) | `StagedBoundaryTests` 2건. 상위 디렉터리 rename·삭제 포함 변경 거부, `output/` 쓰기 허용. denyWrite를 뺀 대조군은 실패 |
 | unit wrapper의 시계 검사 | PASS (오프라인 + 게스트 실측) | 시스템 시계를 과거로 돌리고 wrapper를 실행하면 재동기되고(record `resynced`), 재설정 프로그램을 쓸 수 없게 한 반례와 오차 과대에서는 Blocked로 아무것도 시작하지 않는다. 실행 도중의 호스트 잠자기는 막지 못한다(위 「시계 검사」). `2026-10-02-189-isolation-acceptance-matrix.md` 13절 |
 | 후보 verifier 읽기 entry(`candidate-reads`) | PASS (mock) / 실제 조회 미검증 | 호스트 offline 22건, 게스트 사례(`--egress none`, loopback mock): discover complete·partial, locus-search, 읽기 집합 항목 누락·verifier 누락·어댑터 의존 누락, 대상 route 없음, 무응답, 쓰기 메서드 거부, proxy 없는 직접 접속, 부모 EOF, 인자·입력 거부(relay 전), unit 밖 Blocked. 실제 GitHub 조회·익명 `/search/code`·모델과의 연결은 미검증. `docs/research/2026-10-02-189-isolation-acceptance-matrix.md` |
-| 문서 위주 수집 보완(#192 후속: `--docs-only`, `is:unmerged`, cap, 0건 회수, `credential_scope`, quota 헤더) | PASS (오프라인 + 게스트 mock 실측) / 실제 조회는 하지 않음 | 시험 먼저: 새 시험이 구현 전 실패(collector 시험 162건 중 failures 2·errors 40, relay·어댑터·entry·pickup 새 시험도 각각 구현 전 실패)한 뒤 통과. 호스트 offline(17개 모듈) **Ran 593 OK, skipped 39**(기준 556), collector 스킬 시험 PR 162·이슈 67 OK(기준 143·67). 게스트(`src-8972cd0`) `ossresearch` 묶음 **Ran 542 OK, skipped 11**, root `RealUnitWrapperTests` Ran 5 OK. 게스트 사례 `collect_docs_cases.sh`(`--egress none`, loopback mock): docs-only title/label(4건 중 1건 통과), cap 5(6건 중 5건), `is:unmerged`(검색에 부정 토큰 없음), 빈 검색(complete·records 0), quota(33/33 요청에 rate_limit), 닫힌 이슈(`state: closed`), cap 15 + 예산 70, 인자 거부 4건(cap 6, docs-only body, 이슈 예산 91, open+closed 날짜). 8개 산출물 모두 호스트 strict pickup rc 0(빈 검색 포함). sentinel `github_token_cases.sh` T1~T7·A·P·R·K·B `SUMMARY fails=0`, 값 0회. 증거 `/Users/lee-kyu-hwan/.oss-research-vm/logs/a192-collect-docs-20261003T104109Z/` |
+| 문서 위주 수집 보완(#192 후속: `--docs-only`, `is:unmerged`, cap, 0건 회수, `credential_scope`, quota 헤더) | PASS (오프라인 + 게스트 mock 실측) / 실제 조회는 하지 않음 | 시험 먼저: 새 시험이 구현 전 실패(collector 시험 162건 중 failures 2·errors 40, relay·어댑터·entry·pickup 새 시험도 각각 구현 전 실패)한 뒤 통과. 호스트 offline(17개 모듈) **Ran 593 OK, skipped 39**(기준 556), collector 스킬 시험 PR 162·이슈 67 OK(기준 143·67). 게스트(`src-8972cd0`) `ossresearch` 묶음 **Ran 542 OK, skipped 11**, root `RealUnitWrapperTests` Ran 5 OK. 게스트 사례 `collect_docs_cases.sh`(`--egress none`, loopback mock): docs-only title/label(4건 중 1건 통과), cap 5(6건 중 5건), `is:unmerged`(검색에 부정 토큰 없음), 빈 검색(complete·records 0), quota(33/33 요청에 rate_limit), 닫힌 이슈(`state: closed`), cap 15 + 예산 70, 인자 거부 4건(cap 6, docs-only body, 이슈 예산 91, open+closed 날짜). 8개 산출물 모두 호스트 strict pickup rc 0(빈 검색 포함). sentinel `github_token_cases.sh` T1~T7·A·P·R·K·B `SUMMARY fails=0`, 값 0회. 증거 `~/.oss-research-vm/logs/a192-collect-docs-20261003T104109Z/` |
 | 스킬·서브에이전트 호환성 | 미검증 | 구성기만 있다. Claude가 staged 스킬·워크플로를 로드해 실행하는지, 자식 경계는 live 필요 |
 | auto 모드 | **FAIL(1회 관찰) / OS gate INSUFFICIENT** | Linux 1회(관찰용 stream-json). init `permissionMode=auto`는 관찰했다. CLI가 refusal(cyber) 뒤 세션 전체를 `claude-opus-4-8`로 자동 전환했다(A-V4 FAIL). decoy 시도는 모두 Claude `--restricted` 층이 거부해 OS 증거가 없다(SKIP). 같은 문서 4절 |
 
@@ -952,7 +952,7 @@ Linux 게스트(Lima/VZ)는 호스트 Mac이 잠자는 동안 **시스템 시계
   격리한다. `failIfUnavailable`, `allowUnsandboxedCommands`는 내장 Bash
   sandbox의 `sandbox.*` 키라 쓰지 않았다.
 - profile2 개발 워커는 세션에서 승인된
-  `/Users/lee-kyu-hwan/.local/share/ai-account-profiles/claude/profile2`를 썼다.
+  `~/.local/share/ai-account-profiles/claude/profile2`를 썼다.
   구버전 실행기와 셸 함수에 남은 `~/.claude` fallback은 정리 대상이다. 이
   실행기는 부모 프로필 디렉터리를 쓰지 않는다.
 

@@ -201,9 +201,9 @@ PY
     echo "a continue-plan call plan needs its PARENT_LEDGER_DIR" >&2; exit 2
   fi
 fi
-# This machine's VM (#290; unset or empty keeps the default, as analysis/machine_settings.py does):
+# This machine's VM (#290; unset or empty keeps the default ~/.oss-research-vm, as analysis/machine_settings.py does):
 # OSS_RESEARCH_VM_ROOT is the host work root of the Lima VM, OSS_RESEARCH_VM_NAME its instance.
-W=${OSS_RESEARCH_VM_ROOT:-/Users/lee-kyu-hwan/.oss-research-vm}
+W=${OSS_RESEARCH_VM_ROOT:-$HOME/.oss-research-vm}
 VM=${OSS_RESEARCH_VM_NAME:-oss-research-debian}
 HARNESS_DIR=$(cd "$(dirname "$0")" && pwd)
 L() { env -i HOME="$W/home" LIMA_HOME="$W/lima" TMPDIR="$W/tmp" PATH="$W/tool/bin:/usr/bin:/bin:/usr/sbin:/sbin" "$W/tool/bin/limactl" "$@"; }
