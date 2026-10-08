@@ -2202,9 +2202,22 @@ def cmd_assemble(context: Context, args) -> dict:
 
 ASSESS_MAX_ASSESSMENTS = 10
 ASSESS_STEM = "assess"
-# The repository facts every discovery record of one repository repeats; the prompt carries them once.
+# The repository facts every discovery record of one repository repeats; the prompt carries them once. The static
+# reads are one of them (#11): the verifier reads the repository's static_dirs once at head_sha, and a discovery's
+# top-level static_reads must be every record's copy (static_reads_not_assessable), so 15 KB of file listings and
+# external links were in the prompt once per combination.
 REPOSITORY_FACT_KEYS = ("repository", "repository_node_id", "head_sha", "observed_at", "repository_checks",
-                        "upstream_checks")
+                        "upstream_checks", "static_search")
+# The duplicate search of a record as the prompt shows it (#11). The stored value is never changed; the prompt keeps
+# every query's q, total_count and incomplete_results, counts what the verifier received and what it shows, and lists
+# only the first ASSESS_SEARCH_ITEMS_PER_QUERY items of a query (GitHub's best-match order), each as one line. Why 3:
+# measured on the 2026-10-08 eslint/css discovery (two patterns of one repository, 20 queries each, 350 items from
+# the 100-item pages of the clues "http://" and ":::note"): with the static reads shown once, external links and
+# absent policy paths as lines and the instructions that explain this view, the prompt is 63,288 B at 3 items per
+# query, 64,596 B at 4 and 65,630 B at 5 against the 65,536-byte cap. One shown item costs about 175 bytes (its line
+# and its URL among the allowed links). Three shows the head of every list, keeps about 2 KB (a dozen rows) for longer
+# titles in another discovery of this shape, and every cut is marked truncated with the count it cut from.
+ASSESS_SEARCH_ITEMS_PER_QUERY = 3
 # What a prompt needs of a pattern to judge it; pattern_history and generated_by stay in analysis.json.
 ASSESS_PATTERN_KEYS = ("pattern_id", "description", "applicability", "counterconditions", "search_clues",
                        "expected_tests", "maintainer_judgment_required", "provenance_mode", "confidence",
@@ -2297,6 +2310,100 @@ def policy_table(vc, repository: str, policy_files: list, evidence: list) -> dic
     return table
 
 
+def assess_search_row(item) -> str:
+    """One duplicate search item as one line: its URL (the one link the answer may cite for it), its kind, state and
+    state reason, when it was closed, then after ``|`` its title as the untrusted remote text it is. One line costs a
+    third of the stored item rendered as JSON. The line holds spaces, so https_values never reads a URL out of it (a
+    URL inside a title is not an allowed link); cmd_assess_inputs allows the item's own html_url by name. The
+    digest and source_url of the stored title envelope stay in the discovery."""
+    if not isinstance(item, dict):
+        return json.dumps(item, ensure_ascii=False)
+    state = item.get("state") if isinstance(item.get("state"), str) else "?"
+    if isinstance(item.get("state_reason"), str) and item["state_reason"]:
+        state += ":" + item["state_reason"]
+    parts = [str(item.get("html_url")), "pr" if item.get("pull_request") is True else "issue", state]
+    if isinstance(item.get("closed_at"), str):
+        parts.append("closed_at=" + item["closed_at"])
+    title = item.get("title")
+    text, truncated = (title.get("text"), title.get("truncated")) if isinstance(title, dict) else (title, False)
+    text = text if isinstance(text, str) else json.dumps(text, ensure_ascii=False)
+    return " ".join(parts) + " | " + " ".join(text.split()) + (" …(제목 잘림)" if truncated is True else "")
+
+
+def assess_search_item_links(item, found: list) -> list:
+    """The one link a shown search item may be cited by: its html_url."""
+    if isinstance(item, dict) and isinstance(item.get("html_url"), str) and item["html_url"].startswith("https://") \
+            and not any(c.isspace() for c in item["html_url"]):
+        found.append(item["html_url"])
+    return found
+
+
+def assess_static_search(value):
+    """The ``static_search`` of a repository as the prompt shows it (#11): as stored, except that each external link
+    is one line ``path:line url`` instead of an object (a third of the bytes). The line holds a space, so the
+    external site's URL is no allowed link: it is not evidence about this repository, and the answer's links are
+    checked against what the prompt lists."""
+    if not isinstance(value, dict) or not isinstance(value.get("external_links"), list):
+        return deepcopy(value)
+    view = deepcopy(value)
+    view["external_links"] = ["%s:%d %s" % (entry["path"], entry["line"], entry["url"])
+                              if isinstance(entry, dict) and isinstance(entry.get("path"), str)
+                              and type(entry.get("line")) is int and isinstance(entry.get("url"), str)
+                              and not any(c.isspace() for c in entry["path"] + entry["url"])
+                              else entry for entry in view["external_links"]]
+    return view
+
+
+def assess_policy_files(value):
+    """The ``policy_files`` of a repository as the prompt shows it (#11): every observation that found something or
+    failed in full, and the absent paths by name (``source_repository:path``), since an absent observation holds
+    nothing else (every other field null, false or empty) and the policy table lists the same absences per key."""
+    if not isinstance(value, list):
+        return deepcopy(value)
+    observations, absent = [], []
+    for item in value:
+        if isinstance(item, dict) and item.get("status") == "absent" and item.get("found") is False \
+                and isinstance(item.get("source_repository"), str) and isinstance(item.get("path"), str):
+            absent.append(policy_source(item["source_repository"], item["path"]))
+        else:
+            observations.append(deepcopy(item))
+    return {"observations": observations, "absent": absent}
+
+
+def assess_duplicate_search(value, limit: int = ASSESS_SEARCH_ITEMS_PER_QUERY):
+    """The ``duplicate_search`` of a discovery record as the assess prompt shows it (#11).
+
+    Per query: ``q``, ``total_count`` and ``incomplete_results`` as stored, ``received`` (items the verifier stored),
+    ``shown`` (items here, each one line: assess_search_row) and ``truncated`` (the shown list is not the whole
+    result: the API page was shorter than total_count, the index answered incompletely, the query failed, or this
+    prompt cut it). A query that found nothing (total_count 0, no item, complete index) is named in
+    ``empty_queries`` instead. The counts of the whole (``queries_total``, ``items_received``, ``items_shown``,
+    ``items_per_query``) say what was left out. Anything not of the verifier's shape is copied as it is."""
+    if not isinstance(value, dict) or not isinstance(value.get("queries"), list):
+        return deepcopy(value)
+    view = {key: deepcopy(item) for key, item in value.items() if key != "queries"}
+    queries, empty, received_total, shown_total = [], [], 0, 0
+    for query in value["queries"]:
+        if not isinstance(query, dict):
+            queries.append(deepcopy(query))
+            continue
+        items = query["items"] if isinstance(query.get("items"), list) else []
+        total, incomplete = query.get("total_count"), query.get("incomplete_results")
+        if type(total) is int and total == 0 and not items and incomplete is False:
+            empty.append(deepcopy(query.get("q")))
+            continue
+        shown = items[:limit]
+        received_total += len(items)
+        shown_total += len(shown)
+        queries.append({"q": deepcopy(query.get("q")), "total_count": total, "incomplete_results": incomplete,
+                        "received": len(items), "shown": len(shown),
+                        "truncated": type(total) is not int or incomplete is not False or len(shown) < total,
+                        "items": [assess_search_row(item) for item in shown]})
+    view.update({"items_per_query": limit, "queries_total": len(value["queries"]), "items_received": received_total,
+                 "items_shown": shown_total, "empty_queries": empty, "queries": queries})
+    return view
+
+
 def assess_pattern(pattern: dict, urls: dict) -> dict:
     view = {key: deepcopy(pattern[key]) for key in ASSESS_PATTERN_KEYS if key in pattern}
     view["evidence_pr_urls"] = [urls[pr_id] for pr_id in pattern.get("evidence_pr_ids") or []
@@ -2379,13 +2486,14 @@ def cmd_assess_inputs(args) -> dict:
         evidence_sha = hashlib.sha256(read_bounded(Path(args.policy_evidence), ANSWER_MAX_BYTES,
                                                    "policy evidence")).hexdigest()
 
+    # The allowed links are the https values the prompt shows (#11: a search item the prompt leaves out cannot be
+    # cited), plus the repository, its head commit, the static hits at head and the pattern's evidence PRs.
     combinations, by_repository, links = [], {}, []
     for record in records:
         if record["pattern_id"] not in patterns:
             raise StageError("discovery names %s, which the analysis does not hold" % record["pattern_id"])
         combinations.append({"pattern_id": record["pattern_id"], "repository": record["repository"]})
         by_repository.setdefault(record["repository"], []).append(record)
-        https_values(record, links)
         links += assess_pattern(patterns[record["pattern_id"]], urls)["evidence_pr_urls"]
         base = "https://github.com/" + record["repository"]
         links.append(base)
@@ -2398,7 +2506,6 @@ def cmd_assess_inputs(args) -> dict:
     for entry in evidence:
         if isinstance(entry.get("source_url"), str) and entry["source_url"].startswith("https://"):
             links.append(entry["source_url"])
-    links = sorted(set(links))
 
     text = assess_instructions(vc)
     text += block("판정 단위", {"discovery_sha256": discovery_sha, "combinations": combinations,
@@ -2415,8 +2522,13 @@ def cmd_assess_inputs(args) -> dict:
         first = group[0]
         if any(record.get("policy_files") != first.get("policy_files") for record in group):
             raise StageError("the discovery records of %s hold different policy observations" % repository)
-        text += block("저장소 사실 " + repository, {key: first.get(key) for key in REPOSITORY_FACT_KEYS})
-        text += block("정책 관찰 " + repository, first.get("policy_files") or [])
+        facts = {key: first.get(key) for key in REPOSITORY_FACT_KEYS}
+        facts["static_search"] = assess_static_search(facts["static_search"])
+        text += block("저장소 사실 " + repository, facts)
+        https_values(facts, links)
+        policy_view = assess_policy_files(first.get("policy_files") or [])
+        text += block("정책 관찰 " + repository, policy_view)
+        https_values(policy_view, links)
         table = policy_table(vc, repository, first.get("policy_files") or [], evidence)
         text += block("정책 키별 허용 값 " + repository, table)
         for key in vc.REVIEWABLE_POLICY_KEYS:
@@ -2425,6 +2537,16 @@ def cmd_assess_inputs(args) -> dict:
         for record in group:
             view = {key: deepcopy(value) for key, value in record.items() if key != "policy_files"
                     and not (key in REPOSITORY_FACT_KEYS[1:] and value == first.get(key))}
+            if "static_search" in view:
+                view["static_search"] = assess_static_search(view["static_search"])
+            if "duplicate_search" in view:
+                view["duplicate_search"] = assess_duplicate_search(record["duplicate_search"])
+                search = record["duplicate_search"]
+                for query in (search.get("queries") if isinstance(search, dict) else None) or []:
+                    if isinstance(query, dict) and isinstance(query.get("items"), list):
+                        for item in query["items"][:ASSESS_SEARCH_ITEMS_PER_QUERY]:
+                            assess_search_item_links(item, links)
+            https_values(view, links)
             title = "discovery 관찰 %s × %s" % (record["pattern_id"], repository)
             observation = block(title, view)
             sizes[title] = len(observation.encode("utf-8"))
@@ -2433,6 +2555,7 @@ def cmd_assess_inputs(args) -> dict:
         text += block("손으로 확인한 정책 근거", [{key: entry[key] for key in ("repository", "policy_key", "path",
                                                                      "source_repository", "source_url", "sha256",
                                                                      "excerpt")} for entry in evidence])
+    links = sorted(set(links))
     text += block("허용 근거 링크", "\n".join(links))
     size = len(text.encode("utf-8"))
     if size > PROMPT_MAX_BYTES:

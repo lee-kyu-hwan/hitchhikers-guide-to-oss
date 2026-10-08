@@ -199,7 +199,7 @@ RULES = [
          ("조합마다 assessment 를 하나 이상 쓴다", "목록 밖 조합과 `not_assessable` 조합은 쓰지 마라"), True),
     Rule("assess links", ("assess",), "R5",
          r"assessments\[\d+\] (has \d+ link value\(s\) that are not strings|cites \d+ link\(s\) its input did not hold: .*)",
-         ("「허용 근거 링크」의 URL 만", "문장 안의 URL 도 링크로 검사한다"), True),
+         ("「허용 근거 링크」의 URL 만", "문장 안의 URL 도 링크로 검사한다", "보이지 않은 항목은 인용할 수 없다"), True),
     Rule("assess policy", ("assess",), "A2",
          r"assessments\[\d+\]\.policy_checks\.\S+ (names a source .*|names a digest; .*|names policy bytes .*)",
          ("`found: true` 이면 `source` 와 `sha256` 을", "`program_rules` 는 이번 입력에 없다"), True),
