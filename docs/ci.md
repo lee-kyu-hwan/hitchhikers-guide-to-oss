@@ -101,3 +101,16 @@ macOS(작성자 호스트, 같은 날)도 모듈별 시험 수·skip이 dotfiles
 | `__pycache__` | 0 | 0 |
 
 컨테이너 안에서 `git grep -c lee-kyu-hwan -- skills bin tests install.sh`는 0건이다. `git grep -l "/Users/"`로는 4파일이 남는데 모두 「`/Users/`가 없어야 한다」는 가드 단언(curated·workflow·machine_settings 시험)과 호스트 공유 마운트를 흉내 내는 가짜 경로 `/Users/me`(worker_linux 시험)다.
+
+### 2026-10-08, assess 입력의 검색 요약과 고정부 축소(hitchhikers-guide-to-oss#11)
+
+같은 Docker 방식(`python:3.14` linux/arm64, Python 3.14.8, `--network none --cpuset-cpus=0,1`, 비root). 변경은 `stage_inputs.py assess-inputs`의 prompt 렌더링(discovery 저장값은 그대로)과 그 지시문·동기화 표·시험이다. 새 시험은 `analysis/test_assess.py`의 7개(S1 `S1SearchSummary` 2개: 질의당 100건 레코드 2개가 상한 안에 들고 수치를 보존, 정적 읽기가 다른 레코드는 자기 값을 유지; S2 `S2RefusedAfterSummary` 1개: 요약 뒤에도 초과하면 기존 메시지로 거부; 뷰 함수 단위 `SearchSummaryViews` 4개)와 지시문 needle 추가다. S3(지시문↔strict 동기화)는 `test_prompt_contract.py`의 기존 시험이 새 문장(`보이지 않은 항목은 인용할 수 없다`)을 assess links 행으로 검사한다.
+
+| 묶음 | Linux | macOS(작성자 호스트) |
+|---|---|---|
+| 저장소 시험 `tests/test_*.py` 19모듈 | 671개 OK (skip 40) | 모듈별 모두 OK(skip 39; `worker_runtime` 21·`worker_linux` 9·`worker_supervisor` 4·`offline_integration` 3·`worker_skills` 2) |
+| 분석 번들 `test_*.py` 12개 + `selftest_*.py` 3개 | 모두 OK(skip은 위와 같음; `test_assess` 32개), selftest failures=0 | `test_continue_plan` 1건 실패(위에 적은 이 호스트의 증거 `continued-by.json` 탓, 변경과 무관), 나머지 OK |
+| 스킬 시험 6묶음 | 637개 OK (researching 145, analyzing 77, verifying 133, recent-closed 162, curated 53, issues 67) | 같음 |
+| `__pycache__` | 0 | 0 |
+
+S4(작성자 로컬, 읽기만, 모델 호출 0): `~/.oss-research-vm/logs/a3-css-discover-split-20261008T004910Z/wf-run/stages/discovery/gen-001/`의 합친 discovery(354,556 B, 조합 2)로 임시 디렉터리에서 오프라인 `assess-inputs`를 돌리면 prompt는 63,288 B(상한 65,536, 변경 전 292,478 B)다. discovery.json·manifest.json의 sha256은 실행 전후 같다.

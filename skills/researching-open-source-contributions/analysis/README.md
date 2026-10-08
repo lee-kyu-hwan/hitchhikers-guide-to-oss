@@ -82,6 +82,19 @@ strict가 답을 거부하는 이유는 모두 그 답의 지시문이 말한 �
 - `prompt_contract.py`(표)와 `test_prompt_contract.py`(시험): 표의 모든 줄이 그 kind의 모든 지시문에 있는지(S3), 변형한 답에서 strict가 내는 거부 문구가 모두 표에 있는지, 지시문대로 쓴 경계 답이 strict를 통과하는지(S4) 본다. strict에 거부를 더하면 표와 지시문도 함께 고쳐야 시험이 통과한다.
 - 분리 판정 새 실행 이어받기: `continue-plan`에 추출 stage와 run의 종합 답(`--synthesis-result .../synthesis.result.json`)을 주면, 그 stage에 묶인 원장에서 추출 답 15개와 종합 답을 바이트 그대로 결속하고 검증부터 계획한다. 검증 3 + 최종 1 + 재시도 몫 4 = 한도 8, 부모 22 + 8 = 30 ≤ 40. 검증 prompt는 `verify-inputs`가 새 지시문으로 다시 쓴다.
 
+## 판정 입력의 렌더링 (#11)
+
+`assess-inputs`는 discovery 저장값을 바꾸지 않고 판정 prompt의 블록만 판정용으로 줄여 보인다. 2026-10-08 eslint/css discovery(패턴 2 × 저장소 1, 질의당 100건 페이지를 돌려준 짧은 단서 `http://`·`:::note`, 검색 항목 350건)는 원본 그대로 넣으면 292,478 B로 65,536 B 상한을 넘었고, 항목 밖 고정부만 56,077 B였다.
+
+| 블록 | 렌더링 | 근거 |
+|---|---|---|
+| 「저장소 사실」 | `static_search`를 저장소 사실로 올려 조합마다 반복하지 않는다(`REPOSITORY_FACT_KEYS`). 조합의 값이 다르면 그 「discovery 관찰」에 남는다 | 정적 읽기는 저장소의 head_sha에서 한 번 읽은 것이고, 최상위 `static_reads`는 모든 레코드의 사본이어야 한다(`static_reads_not_assessable`) |
+| `static_search.external_links` | 항목마다 `경로:줄 URL` 한 줄(`assess_static_search`). 공백이 있어 `https_values`가 외부 URL을 허용 링크로 모으지 않는다 | 외부 사이트의 URL은 이 저장소에 대한 근거가 아니다 |
+| 「정책 관찰」 | `{"observations": [찾았거나 실패한 관찰 전체], "absent": ["source:path", …]}`(`assess_policy_files`) | 부재 관찰은 다른 필드가 모두 null·false·빈 값이고, 「정책 키별 허용 값」이 같은 부재를 키마다 적는다 |
+| `duplicate_search` | 질의마다 `q`·`total_count`·`incomplete_results` 보존 + `received`·`shown`·`truncated`. 항목은 앞 `ASSESS_SEARCH_ITEMS_PER_QUERY`(3)개만 `URL 종류 상태[:사유] [closed_at=…] \| 제목` 한 줄씩(`assess_duplicate_search`, `assess_search_row`). 0건 질의는 `empty_queries`. 전체 수는 `queries_total`·`items_received`·`items_shown` | N=3의 근거는 `stage_inputs.py`의 상수 주석(실측 3개 63,288 B, 4개 64,596 B, 5개 65,630 B). 보인 항목의 `html_url`만 허용 링크에 들어가므로 보이지 않은 항목은 인용할 수 없다(지시문·`prompt_contract` assess links 행) |
+
+줄여도 상한을 넘으면 전과 같이 쓰기 전에 거부한다(메시지의 관찰 블록 크기는 줄인 뒤의 크기다). 지시문은 잘린 목록으로 「중복 없음」을 단정하지 않도록 `truncated`를 적게 하고 미결(`unverified` / `insufficient-evidence`)을 정상 결과로 둔다. 시험은 `test_assess.py`의 `S1SearchSummary`(합성 질의당 100건 레코드 2개)·`S2RefusedAfterSummary`·`SearchSummaryViews`, 동기화는 `test_prompt_contract.py`다.
+
 ## 옛 경로 대응(#261)
 
 | 옛 경로 | 새 경로 |
