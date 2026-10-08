@@ -30,7 +30,7 @@
 ```sh
 git clone https://github.com/lee-kyu-hwan/hitchhikers-guide-to-oss.git ~/.local/share/hitchhikers-guide-to-oss
 cd ~/.local/share/hitchhikers-guide-to-oss
-git checkout v0.1.1
+git checkout v0.1.2
 ./install.sh --project ~/code/oss-learning-lab   # 경로는 lab 체크아웃
 ./install.sh --check --project ~/code/oss-learning-lab
 ```
