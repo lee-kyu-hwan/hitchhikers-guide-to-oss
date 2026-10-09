@@ -114,3 +114,16 @@ macOS(작성자 호스트, 같은 날)도 모듈별 시험 수·skip이 dotfiles
 | `__pycache__` | 0 | 0 |
 
 S4(작성자 로컬, 읽기만, 모델 호출 0): `~/.oss-research-vm/logs/a3-css-discover-split-20261008T004910Z/wf-run/stages/discovery/gen-001/`의 합친 discovery(354,556 B, 조합 2)로 임시 디렉터리에서 오프라인 `assess-inputs`를 돌리면 prompt는 63,288 B(상한 65,536, 변경 전 292,478 B)다. discovery.json·manifest.json의 sha256은 실행 전후 같다.
+
+### 2026-10-09, locus 단서에서 디렉터리 이름 제외(hitchhikers-guide-to-oss#13)
+
+같은 Docker 방식(`python:3.14` linux/arm64, Python 3.14.8, `--network none --cpuset-cpus=0,1`, 비root). 변경은 verifier `_locus_clues`가 locus의 파일 이름(마지막 경로 조각 + `#fragment`)에서만 단서를 내는 것과 그 계약 서술이다. `locus-search`의 질의 생성과 `record`의 판정이 같은 함수를 쓰므로 locus당 요청(4 × 단서 수)은 디렉터리 토큰만큼 줄고, 다른 영향은 없다. 새 시험은 verifier의 `LocusDirectoryClueTests` 3개(S1: `docs/rules/x-y.md`에서 `rules`·`x-y` 둘 다에 반환된 PR은 같은 locus가 아니라 undecided, `unverified` 후보는 불변, `locus-search`는 `x-y`만 질의)와 단서 함수 시험 1개·fixture 단서 수 시험 1개다. S2는 기존 `LocusDuplicateGateTests`의 판정이 모두 그대로다(fixture locus의 단서가 `example-boundary`·`ExampleBoundary` 둘이 되어 입력 구성만 인덱스 대신 `CLUES[:-1]`을 쓴다).
+
+| 묶음 | Linux | macOS(작성자 호스트) |
+|---|---|---|
+| 저장소 시험 `tests/test_*.py` 19모듈 | 671개 OK (skip 40) | 모듈별 모두 OK(skip 39; `worker_runtime` 21·`worker_linux` 9·`worker_supervisor` 4·`offline_integration` 3·`worker_skills` 2) |
+| 분석 번들 `test_*.py` 12개 + `selftest_*.py` 3개 | 모두 OK(skip은 위와 같음), selftest failures=0 | `test_continue_plan` 1건 실패(위에 적은 이 호스트의 증거 `continued-by.json` 탓, 변경과 무관), 나머지 OK |
+| 스킬 시험 6묶음 | 642개 OK (researching 145, analyzing 77, verifying 138, recent-closed 162, curated 53, issues 67) | 같음 |
+| `__pycache__` | 0 | 0 (시험 전 수동 `import`가 남긴 `scripts/__pycache__` 1개는 시험이 만든 것이 아니며 지웠다) |
+
+S3(작성자 로컬, 읽기만, 모델·GitHub 호출 0): `~/.oss-research-vm/logs/a3-css-assess-rerun-20261008T130416Z/`의 discovery·assessment·locus-search(sha256 `a17f01ad…`, `9dfebd57…`, `828ceeea…`)를 임시 디렉터리로 복사해 오프라인 `record`를 돌리면, 변경 전 코드(HEAD 사본)는 CAN-001을 `duplicate`/`duplicate-closed-other`로 두고 `locus-duplicate:` gap에 PR 6개(#565·#473·#202·#183·#171·#156)를 적는다. 변경 후에는 CAN-001이 `unverified`/`insufficient-evidence`로 남고 locus gap과 `matched_items`가 없다(옛 문서의 `rules` 단서는 판정에서 빠지고 `no-invalid-at-rule-placement` 하나로는 결정하지 않는다). CAN-002는 불변. 증거 디렉터리의 `SHA256SUMS` 157개는 실행 전후 모두 OK다.

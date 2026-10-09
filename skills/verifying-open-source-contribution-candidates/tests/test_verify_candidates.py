@@ -5656,7 +5656,7 @@ class VerifyCandidatesTests(unittest.TestCase):
 
     def test_locus_clues_come_from_the_assessed_locus(self):
         self.assertEqual(
-            ["rules", "example-boundary", "ExampleBoundary"],
+            ["example-boundary", "ExampleBoundary"],
             verify_candidates._locus_clues(
                 "lib/rules/example-boundary.js#ExampleBoundary"
             ),
@@ -5665,6 +5665,24 @@ class VerifyCandidatesTests(unittest.TestCase):
         self.assertEqual([], verify_candidates._locus_clues(None))
         self.assertEqual(
             ["needle"], verify_candidates._locus_clues('src/needle.js#a"b')
+        )
+
+    def test_locus_clues_skip_directory_names(self):
+        # hitchhikers-guide-to-oss#13: ``rules`` is shared by unrelated changes
+        self.assertEqual(["x-y"], verify_candidates._locus_clues("docs/rules/x-y.md"))
+        self.assertEqual(
+            ["no-invalid-at-rule-placement"],
+            verify_candidates._locus_clues("docs/rules/no-invalid-at-rule-placement.md"),
+        )
+        # a locus naming a directory keeps that directory's own name
+        self.assertEqual(["rules"], verify_candidates._locus_clues("docs/rules/"))
+        # a symbol path after ``#`` is part of the file name, not a directory
+        self.assertEqual(
+            ["alpha-one", "AlphaOne", "create"],
+            verify_candidates._locus_clues("lib/rules/alpha-one.js#AlphaOne.create"),
+        )
+        self.assertEqual(
+            ["validation", "boundary"], verify_candidates._locus_clues("validation boundary")
         )
 
     def locus_search_responses(self, repository, locus, matched=()):
@@ -7070,9 +7088,13 @@ class LocusDuplicateGateTests(unittest.TestCase):
         self.assertEqual(("duplicate", "duplicate-open"),
                          (candidate["status"], candidate["status_reason"]))
 
+    def test_the_fixture_locus_has_at_least_two_file_name_clues(self):
+        # the rule needs two clues; the fixture file name and symbol give them
+        self.assertEqual(["example-boundary", "ExampleBoundary"], self.CLUES)
+
     def test_a_pr_matching_only_some_locus_clues_keeps_the_ready_status(self):
         noise = locus_pr_item(283, title="fix: unrelated rule")
-        hits = {self.CLUES[0]: [("closed", noise)], self.CLUES[1]: [("closed", noise)]}
+        hits = {clue: [("closed", noise)] for clue in self.CLUES[:-1]}
         with tempfile.TemporaryDirectory() as temporary:
             candidate, _ = self.record_with_hits(temporary, hits)
         self.assertEqual(("issue-ready", "ready"),
@@ -7082,8 +7104,8 @@ class LocusDuplicateGateTests(unittest.TestCase):
 
     def test_a_truncated_listing_that_may_hide_the_missing_clue_needs_a_person(self):
         maybe = locus_pr_item(284)
-        hits = {self.CLUES[0]: [("closed", maybe)], self.CLUES[1]: [("closed", maybe)]}
-        truncated = {(self.CLUES[2], "closed"): 250}
+        hits = {clue: [("closed", maybe)] for clue in self.CLUES[:-1]}
+        truncated = {(self.CLUES[-1], "closed"): 250}
         with tempfile.TemporaryDirectory() as temporary:
             candidate, rendered = self.record_with_hits(temporary, hits, truncated)
         self.assertEqual(("policy-review", "none"),
@@ -7145,6 +7167,117 @@ class LocusDuplicateGateTests(unittest.TestCase):
         self.assertEqual("issue-ready", candidate["status"])
 
 
+def add_locus_clue(document, clue):
+    """Add a clue with four empty queries to every locus search.
+
+    This is the shape a search document has when an earlier revision derived
+    the clue from a directory name, or when an operator supplied it.
+    """
+    for search in document["searches"]:
+        if clue in search["clues"]:
+            continue
+        search["clues"].append(clue)
+        for kind in ("issue", "pr"):
+            for state in ("open", "closed"):
+                search["queries"].append({
+                    "q": 'repo:%s "%s" is:%s is:%s' % (search["repository"], clue, kind, state),
+                    "total_count": 0, "incomplete_results": False, "items": [],
+                })
+    return document
+
+
+class LocusDirectoryClueTests(unittest.TestCase):
+    """hitchhikers-guide-to-oss#13: a directory name in the locus path is not a clue.
+
+    S1: for ``docs/rules/x-y.md`` a pull request returned for both ``rules``
+    and ``x-y`` is not a same-locus match, because ``x-y`` is the only
+    locus-derived clue and one clue cannot decide.
+    """
+
+    run_main = VerifyCandidatesTests.run_main
+    write_record_inputs = VerifyCandidatesTests.write_record_inputs
+    locus_search_responses = VerifyCandidatesTests.locus_search_responses
+
+    LOCUS = "docs/rules/x-y.md"
+
+    def record_with_directory_hits(self, root, item, **assessment_changes):
+        record = discovery_record("example-org/example-repo")
+        assessments = [assessment_for(record, locus=self.LOCUS, **assessment_changes)]
+        discovery, assessment = self.write_record_inputs(root, [record], assessments)
+        locus_path = Path(root) / "locus-search.json"
+        document = json.loads(locus_path.read_text(encoding="utf-8"))
+        self.assertEqual(["x-y"], document["searches"][0]["clues"])
+        add_locus_clue(document, "rules")
+        place_locus_items(document, {"rules": [("closed", item)], "x-y": [("closed", item)]})
+        locus_path.write_text(json.dumps(document, indent=2) + "\n", encoding="utf-8")
+        output = Path(root) / "candidates.json"
+        code, _, stderr, _ = self.run_main([
+            "record", "--discovery", str(discovery), "--assessment", str(assessment),
+            "--locus-search", str(locus_path), "--output", str(output),
+            "--manifest", str(Path(root) / "manifest.json"),
+        ])
+        self.assertEqual(0, code, stderr)
+        validate = self.run_main(["validate", "--candidates", str(output)])
+        self.assertEqual(0, validate[0], validate[2])
+        return json.loads(output.read_text(encoding="utf-8"))["records"][0]
+
+    def test_s1_a_pr_sharing_only_the_directory_name_is_not_the_same_locus(self):
+        release = locus_pr_item(202, title="chore: release")
+        with tempfile.TemporaryDirectory() as temporary:
+            candidate = self.record_with_directory_hits(temporary, release)
+        self.assertEqual(("policy-review", "none"),
+                         (candidate["status"], candidate["status_reason"]))
+        self.assertFalse(any(gap.startswith("locus-duplicate:") for gap in candidate["blocking_gaps"]),
+                         candidate["blocking_gaps"])
+        self.assertTrue(any(
+            gap.startswith("locus-duplicate-undetermined:") and release["html_url"] in gap
+            for gap in candidate["blocking_gaps"]
+        ), candidate["blocking_gaps"])
+        verdict = candidate["verification_history"][-1]["evidence"]["duplicate_verdict"]
+        self.assertEqual([], verdict["matched_items"])
+        self.assertNotIn("locus-search", verdict["judgment"])
+        self.assertEqual(["x-y"], candidate["duplicate_search"]["locus_clues"][:1])
+
+    def test_s1_an_unverified_candidate_keeps_its_status_and_gains_no_locus_gap(self):
+        # the eslint/css CAN-001 shape: unverified before the locus search
+        release = locus_pr_item(202, title="chore: release")
+        with tempfile.TemporaryDirectory() as temporary:
+            candidate = self.record_with_directory_hits(
+                temporary, release, status="unverified", status_reason="insufficient-evidence"
+            )
+        self.assertEqual(("unverified", "insufficient-evidence"),
+                         (candidate["status"], candidate["status_reason"]))
+        self.assertFalse(any(gap.startswith("locus-duplicate") for gap in candidate["blocking_gaps"]),
+                         candidate["blocking_gaps"])
+        verdict = candidate["verification_history"][-1]["evidence"]["duplicate_verdict"]
+        self.assertEqual([], verdict["matched_items"])
+
+    def test_locus_search_queries_the_file_name_clue_only(self):
+        repository = "example-org/example-repo"
+        record = discovery_record(repository)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            discovery, assessment = self.write_record_inputs(
+                root / "inputs", [record], [assessment_for(record, locus=self.LOCUS)]
+            )
+            fixture = root / "fixture"
+            write_fixture(fixture, self.locus_search_responses(repository, self.LOCUS))
+            output = root / "locus-search.json"
+            code, stdout, stderr, _ = self.run_main([
+                "locus-search", "--discovery", str(discovery), "--assessment", str(assessment),
+                "--output", str(output), "--manifest", str(root / "manifest.json"),
+                "--fixture-dir", str(fixture),
+            ])
+            self.assertEqual(0, code, stderr)
+            self.assertTrue(stdout.startswith("complete"), stdout)
+            self.assertIn("locus-search plan: 1 loci, 4 search requests", stderr)
+            search = json.loads(output.read_text(encoding="utf-8"))["searches"][0]
+        self.assertEqual(["x-y"], search["clues"])
+        self.assertEqual(4, len(search["queries"]))
+        self.assertFalse(any('"rules"' in query["q"] for query in search["queries"]), search["queries"])
+        self.assertTrue(search["complete"])
+
+
 
 class FakeSearchQuota:
     """A fake clock and GitHub search quota: a request past the limit in any 60 s is a 403."""
@@ -7197,11 +7330,12 @@ class SearchPacingTests(unittest.TestCase):
 
     write_record_inputs = VerifyCandidatesTests.write_record_inputs
 
+    # three file-name clues each (the directory ``rules`` is not a clue, #13)
     LOCI = (
-        "lib/rules/alpha-one.js#AlphaOne",
-        "lib/rules/beta-two.js#BetaTwo",
-        "lib/rules/gamma-three.js#GammaThree",
-        "lib/rules/delta-four.js#DeltaFour",
+        "lib/rules/alpha-one.js#AlphaOne.create",
+        "lib/rules/beta-two.js#BetaTwo.create",
+        "lib/rules/gamma-three.js#GammaThree.create",
+        "lib/rules/delta-four.js#DeltaFour.create",
     )
 
     def client(self, quota, replies=None, calls=None):
