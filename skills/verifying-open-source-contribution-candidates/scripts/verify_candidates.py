@@ -4374,11 +4374,21 @@ def _policy_evidence_input(
 
 
 def _locus_clues(locus: object) -> List[str]:
-    """Derive deterministic search clues from an assessed locus."""
+    """Derive deterministic search clues from an assessed locus.
+
+    Only the file name, the last path segment of the locus together with any
+    ``#fragment``, yields clues. Directory names such as ``rules`` are shared
+    by unrelated changes, so a clue made from one would let the locus
+    duplicate rule over-match (hitchhikers-guide-to-oss#13). ``locus-search``
+    builds its queries and ``record`` judges pull requests with this same
+    function, so the two stages cannot disagree about what a locus clue is.
+    """
     if not isinstance(locus, str):
         return []
+    path, _, fragment = locus.partition("#")
+    file_name = path.rstrip("/").rsplit("/", 1)[-1]
     clues = []
-    for token in re.split(r"[^A-Za-z0-9_$-]+", locus):
+    for token in re.split(r"[^A-Za-z0-9_$-]+", file_name + " " + fragment):
         if not token or token.lower() in LOCUS_CLUE_STOPWORDS:
             continue
         if len(token) < 3:
@@ -4485,7 +4495,9 @@ def _locus_pr_matches(
     A pull request covers the locus when it is returned for every
     locus-derived clue and there are at least two such clues. It is undecided
     when it is missing only from listings that were cut short, or when fewer
-    than two locus-derived clues were searched.
+    than two locus-derived clues were searched. Clues the search document
+    carries that ``_locus_clues`` no longer derives (a directory name from an
+    earlier revision, or an operator clue) are left out of the judgment.
     """
     if not isinstance(search, dict):
         return [], []
