@@ -85,4 +85,4 @@ for d in skills/*/tests; do (cd "$(dirname "$d")" && python3 -m unittest discove
 
 ## 라이선스
 
-아직 정하지 않았다(공개 전에 정한다).
+MIT 라이선스다. 전문은 루트의 [LICENSE](LICENSE) 파일에 있다.
