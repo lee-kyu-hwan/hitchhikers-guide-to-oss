@@ -27,6 +27,7 @@ import argparse
 from contextlib import redirect_stderr, redirect_stdout
 import copy
 from datetime import datetime, timezone
+import fcntl
 import hashlib
 import importlib.util
 import io
@@ -63,17 +64,18 @@ UNSUPPORTED_SOURCE_KINDS = ("issues",)
 CURATED_METHOD = "tracker-issue-comments"
 CURATED_GENERATOR = "collecting-curated-contribution-prs"
 ORIGINS = ("ai", "synthetic-fixture")
-STAGES = ("collect", "digest", "analysis", "discovery", "locus-search", "record")
-CANDIDATE_STAGES = ("discovery", "locus-search", "record")
+STAGES = ("collect", "digest", "analysis", "discovery", "locus-search", "record", "recheck")
+CANDIDATE_STAGES = ("discovery", "locus-search", "record", "recheck")
 TARGET_UNSPECIFIED = ("no target repository was specified (request target is null); candidate verification "
-                      "(discovery, locus-search, record) is skipped")
+                      "(discovery, locus-search, record, recheck) is skipped")
 DOWNSTREAM = {
-    "collect": ("digest", "analysis", "discovery", "locus-search", "record"),
+    "collect": ("digest", "analysis", "discovery", "locus-search", "record", "recheck"),
     "digest": (),
-    "analysis": ("discovery", "locus-search", "record"),
-    "discovery": ("locus-search", "record"),
-    "locus-search": ("record",),
-    "record": (),
+    "analysis": ("discovery", "locus-search", "record", "recheck"),
+    "discovery": ("locus-search", "record", "recheck"),
+    "locus-search": ("record", "recheck"),
+    "record": ("recheck",),
+    "recheck": (),
 }
 USABLE = {
     "collect": ("complete", "partial"),
@@ -82,6 +84,7 @@ USABLE = {
     "discovery": ("complete", "partial"),
     "locus-search": ("complete", "partial"),
     "record": ("complete", "partial"),
+    "recheck": ("complete", "partial"),
 }
 ACTIONABLE_STATUSES = ("reproduced", "issue-ready", "pr-ready", "private-report-ready")
 DECISIVE_NON_ACTIONABLE = ("duplicate", "not-applicable", "stale")
@@ -105,6 +108,10 @@ EXIT = {"complete": 0, "partial": 3, "failed": 4, "blocked": 4}
 
 class WorkflowError(Exception):
     """A rejected command; nothing in the run directory changed."""
+
+
+class RunBusy(WorkflowError):
+    """Another command holds the run directory (contract: one command at a time). Nothing was read or changed."""
 
 
 # ---------------------------------------------------------------------------
@@ -438,6 +445,34 @@ class Run:
         self.revisions: Optional[Dict[str, str]] = None
         # The loaded siblings; set by main so plan data (status) can use the verifier's own counting.
         self.siblings: Optional["Siblings"] = None
+        self._lock_fd: Optional[int] = None
+
+    def acquire(self) -> None:
+        """Hold the run for one command (workflow contract, Concurrency: sequential only).
+
+        The hold is an exclusive advisory lock on the run marker, kept for the command's duration and
+        dropped when it ends or its process exits, so an interrupted command leaves nothing to clean
+        up. A missing or symlinked marker is left for ``load`` to report.
+        """
+        if self._lock_fd is not None:
+            return
+        try:
+            fd = os.open(str(self.path / RUN_MARKER), os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        except OSError:
+            return
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            os.close(fd)
+            raise RunBusy("run-busy: another workflow command holds %s; commands on one run directory run one "
+                          "at a time (workflow contract, Concurrency). Nothing was read or changed; run this "
+                          "command again when that one has ended" % self.path) from None
+        self._lock_fd = fd
+
+    def release(self) -> None:
+        if self._lock_fd is not None:
+            os.close(self._lock_fd)
+            self._lock_fd = None
 
     def _check_real(self) -> None:
         if self.path.is_symlink() or not self.path.is_dir():
@@ -487,7 +522,7 @@ class Run:
         outputs (policy content, verifier manifest inputs) valid after commit.
         A failed command removes the directory again.
         """
-        number = len(state["stages"][stage]["generations"]) + 1
+        number = len(stage_state(state, stage)["generations"]) + 1
         path = self.stage_dir(stage) / ("gen-%03d" % number)
         try:
             path.mkdir(mode=0o700)
@@ -510,11 +545,16 @@ def new_state(request_sha: str, run_id: str, resolution: dict, revisions: dict) 
     }
 
 
+def stage_state(state: dict, stage: str) -> dict:
+    """The stage's checkpoint list; a run written before the stage existed (recheck, #5) simply has none."""
+    return state["stages"].setdefault(stage, {"active": None, "generations": []})
+
+
 def active(state: dict, stage: str) -> Optional[dict]:
-    number = state["stages"][stage]["active"]
-    if number is None:
+    entry = stage_state(state, stage)
+    if entry["active"] is None:
         return None
-    return state["stages"][stage]["generations"][number - 1]
+    return entry["generations"][entry["active"] - 1]
 
 
 def gen_dir(run: Run, stage: str, generation: dict) -> Path:
@@ -590,10 +630,10 @@ def copy_input(source: str, destination: Path, label: str) -> Tuple[bytes, str]:
 
 def commit(run: Run, state: dict, stage: str, incoming: Path, generation: dict, replace: bool) -> dict:
     """Make a validated incoming directory the next active generation."""
-    stage_state = state["stages"][stage]
+    entry = stage_state(state, stage)
     previous = active(state, stage)
     guard_replace(state, stage, replace)
-    generation["generation"] = len(stage_state["generations"]) + 1
+    generation["generation"] = len(entry["generations"]) + 1
     generation["recorded_at"] = utc_now()
     generation["request_sha256"] = state["request_sha256"]
     generation["outputs"] = output_hashes(incoming)
@@ -601,13 +641,13 @@ def commit(run: Run, state: dict, stage: str, incoming: Path, generation: dict, 
         raise WorkflowError("generation directory does not match the reserved checkpoint number")
     if previous is not None:
         previous["superseded_by"] = generation["generation"]
-    stage_state["generations"].append(generation)
-    stage_state["active"] = generation["generation"]
+    entry["generations"].append(generation)
+    entry["active"] = generation["generation"]
     for downstream in DOWNSTREAM[stage]:
         old = active(state, downstream)
         if old is not None:
             old["invalidated"] = "%s replaced by gen-%03d" % (stage, generation["generation"])
-            state["stages"][downstream]["active"] = None
+            stage_state(state, downstream)["active"] = None
     return generation
 
 
@@ -714,7 +754,11 @@ def cmd_init(args, siblings: Siblings) -> dict:
     request_sha = sha256_bytes(data)
     if run.path.exists():
         if (run.path / RUN_MARKER).exists():
-            _, state = run.load()
+            run.acquire()
+            try:
+                _, state = run.load()
+            finally:
+                run.release()
             if state["request_sha256"] != request_sha:
                 raise WorkflowError("scope-conflict: %s belongs to request %s; use a new run directory"
                                     % (run.path, state["request_sha256"]))
@@ -738,7 +782,9 @@ def cmd_init(args, siblings: Siblings) -> dict:
 
 def _require_supported(request: dict) -> None:
     if request["source"]["kind"] not in SUPPORTED_SOURCE_KINDS:
-        raise WorkflowError("pending-unsupported: source.kind %s is not connected" % request["source"]["kind"])
+        raise WorkflowError("pending-unsupported: source.kind %s is not connected: the Issue corpus is not a pull "
+                            "request corpus (no digest or analysis contract exists for it, and its collector forbids "
+                            "the analyzer handoff); nothing was adopted" % request["source"]["kind"])
 
 
 def _require_target(request: dict, command: str) -> dict:
@@ -2520,6 +2566,116 @@ def _record_per_repository(args, siblings: Siblings, request: dict, state: dict,
 # ---------------------------------------------------------------------------
 
 
+def _candidates_of(run: Run, stage: str, generation: dict) -> List[dict]:
+    """The candidate records of a record or recheck generation (both stages write ``candidates.json``)."""
+    return json.loads((gen_dir(run, stage, generation) / "candidates.json").read_text(encoding="utf-8"))["records"]
+
+
+def _current_candidates(run: Run, state: dict, record: dict) -> List[dict]:
+    """After a recheck its candidates are the current ones (a stale or unverified recheck result counts)."""
+    recheck = active(state, "recheck")
+    return _candidates_of(run, "recheck", recheck) if recheck is not None else _candidates_of(run, "record", record)
+
+
+def _recheck_snapshot_of(record: dict, prior_length: int) -> Optional[dict]:
+    history = record.get("verification_history")
+    if not isinstance(history, list) or len(history) != prior_length + 1:
+        return None
+    latest = history[-1]
+    if not isinstance(latest, dict) or not isinstance(latest.get("inputs"), dict) or latest["inputs"].get("kind") != "recheck":
+        return None
+    return latest
+
+
+def cmd_adopt_recheck(args, siblings: Siblings, request: dict, state: dict, run: Run) -> dict:
+    """Adopt the verifier's recheck of the active record (contract rule 10; hitchhikers-guide-to-oss#5 M6).
+
+    The rechecked candidates must continue the active record's candidates (the verifier's own
+    ``validate --existing`` chain check), name exactly its candidates, and carry one new recheck
+    snapshot per candidate the manifest's recheck run names. Nothing here sends a request; the
+    recheck itself is the isolated process's network step.
+    """
+    target = _require_target(request, "adopt-recheck")
+    record, reason = usable(run, state, "record")
+    if record is None:
+        raise WorkflowError("recheck needs a usable record: " + reason)
+    revisions = siblings.revisions()
+    incoming = run.incoming("recheck", state)
+    try:
+        data, candidates_sha = copy_input(args.candidates, incoming / "candidates.json", "rechecked candidates")
+        manifest_bytes, manifest_sha = copy_input(args.manifest, incoming / "manifest.json", "verifier manifest")
+        record_path = "stages/record/gen-%03d/candidates.json" % record["generation"]
+        inputs = {"candidates": {"sha256": candidates_sha, "source_path": os.path.abspath(args.candidates)},
+                  "manifest": {"sha256": manifest_sha, "source_path": os.path.abspath(args.manifest)},
+                  "record": {"sha256": record["outputs"]["candidates.json"], "source_path": record_path}}
+        reused = reuse_if_same(run, state, "recheck", {k: v["sha256"] for k, v in inputs.items()}, revisions)
+        if reused is not None:
+            event(state, "adopt-recheck", "reused", "gen-%03d" % reused["generation"])
+            return reused
+        guard_replace(state, "recheck", args.replace)
+        existing_path = gen_dir(run, "record", record) / "candidates.json"
+        code, _, stderr = run_main(siblings.verifier.main, ["validate", "--candidates", str(incoming / "candidates.json"),
+                                                            "--existing", str(existing_path)], opener=_refuse_http)
+        if code != 0:
+            raise WorkflowError("scope-conflict: rechecked candidates do not continue the active record (%s): %s"
+                                % (record_path, stderr.strip()))
+        document = read_json_bytes(data, "rechecked candidates")
+        manifest = read_json_bytes(manifest_bytes, "verifier manifest")
+        before = {c["candidate_id"]: c for c in _candidates_of(run, "record", record)}
+        after = {c["candidate_id"]: c for c in document["records"]}
+        if set(after) != set(before):
+            raise WorkflowError("scope-conflict: rechecked candidates must name exactly the active record's candidates "
+                                "(%s); got %s" % (sorted(before), sorted(after)))
+        rechecked = sorted(cid for cid, c in after.items()
+                           if _recheck_snapshot_of(c, len(before[cid]["verification_history"])) is not None)
+        unchanged = sorted(cid for cid in after if cid not in rechecked
+                           and after[cid]["verification_history"] != before[cid]["verification_history"])
+        if not rechecked or unchanged:
+            raise WorkflowError("scope-conflict: a rechecked candidate carries exactly one new recheck snapshot "
+                                "(rechecked %s, other history changes %s)" % (rechecked, unchanged))
+        run_entry = _manifest_run(manifest if isinstance(manifest, dict) else {}, "recheck",
+                                  lambda r: isinstance(r.get("inputs"), dict)
+                                  and sorted(r["inputs"].get("candidate_ids") or []) == rechecked)
+        if run_entry is None:
+            raise WorkflowError("verifier manifest has no recheck run for the rechecked candidates %s" % rechecked)
+        limit = (run_entry.get("budget") or {}).get("request_limit")
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit > request["budget"]["total_api_requests"]:
+            raise WorkflowError("scope-conflict: the recheck run's request limit %r exceeds budget.total_api_requests %d"
+                                % (limit, request["budget"]["total_api_requests"]))
+        if run_entry.get("status") not in ("complete", "partial"):
+            raise WorkflowError("unsupported recheck run status %r" % (run_entry.get("status"),))
+        changes = []
+        for cid in sorted(after):
+            old, new = before[cid], after[cid]
+            changes.append({"candidate_id": cid, "before": old["status"], "after": new["status"],
+                            "status_reason": new["status_reason"], "rechecked": cid in rechecked,
+                            "next_recheck_required": new.get("next_recheck_required"),
+                            "verified_at": new.get("verified_at"), "verified_base_sha": new.get("verified_base_sha"),
+                            "new_gaps": [g for g in new.get("blocking_gaps", []) if g not in old.get("blocking_gaps", [])]})
+        reasons = ["%s: %s -> %s (%s)" % (c["candidate_id"], c["before"], c["after"], c["status_reason"])
+                   for c in changes if c["before"] != c["after"]]
+        warnings = run_entry.get("warnings") if isinstance(run_entry.get("warnings"), list) else []
+        if warnings:
+            reasons.append("recheck warnings: " + ", ".join(str(w) for w in warnings))
+        if run_entry["status"] == "partial":
+            reasons.append("recheck run partial (verifier status): a warning, an incomplete duplicate search or an "
+                           "unobserved candidate; see the verifier manifest")
+        generation = {"status": run_entry["status"], "reasons": reasons, "inputs": inputs, "tool_revisions": revisions,
+                      "details": {"rechecked": changes, "run_id": run_entry.get("run_id"),
+                                  "request_limit": limit, "target_repositories": list(target["repositories"])}}
+        added, total = record_ledger(state, "recheck", _verifier_ledger(request, manifest))
+        violations = budget_violations(request, state)
+        if violations:
+            generation["status"], generation["reasons"] = "blocked", reasons + violations
+        commit(run, state, "recheck", incoming, generation, args.replace)
+        incoming = None
+        event(state, "adopt-recheck", generation["status"], "gen-%03d ledger+%d total=%d" % (generation["generation"], added, total))
+        return generation
+    finally:
+        if incoming is not None and incoming.exists():
+            shutil.rmtree(incoming)
+
+
 def next_steps(run: Run, request: dict, state: dict) -> List[dict]:
     """Plan data only; nothing here is executed or implies a passed launcher gate."""
     plan_note = ("plan data; executed=false. The argv shows the scope of the step, not the isolated command. "
@@ -2621,8 +2777,24 @@ def next_steps(run: Run, request: dict, state: dict) -> List[dict]:
                           "--request-budget", str(target["locus_request_budget"])],
                  "then": "adopt-locus-search --locus-search ... --manifest ..."},
                 record_step]
-    if active(state, "record") is None:
+    record = active(state, "record")
+    if record is None:
         return [record_step]
+    if active(state, "recheck") is None:
+        actionable = [c["candidate_id"] for c in _candidates_of(run, "record", record) if c["status"] in ACTIONABLE_STATUSES]
+        if actionable:
+            # The verifier's rule: recheck immediately before any external proposal; a previous state is not enough.
+            record_dir = "stages/record/gen-%03d" % record["generation"]
+            return [{"stage": "recheck", "kind": "external-network-step", "executed": False, "note": unverified_note,
+                     "argv": ["verify_candidates.py", "recheck", "--candidates", record_dir + "/candidates.json",
+                              "--output", "<ISOLATED_OUTPUT>/candidates.json",
+                              "--manifest", "<copy of %s/manifest.json>" % record_dir,
+                              "--request-budget", str(target["locus_request_budget"])],
+                     "detail": "%d actionable candidate(s) (%s): the verifier's recheck runs immediately before any "
+                               "external proposal; a previous ready or reproduced state is not sufficient"
+                               % (len(actionable), ", ".join(actionable)),
+                     "then": "adopt-recheck --candidates ... --manifest ... (the rechecked candidates must continue "
+                             "the active record's candidates)"}]
     return []
 
 
@@ -2797,7 +2969,7 @@ def overall(run: Run, request: dict, state: dict) -> Tuple[str, str]:
         return "insufficient", completeness
     if record is None:
         return "awaiting-input", completeness
-    candidates = json.loads((gen_dir(run, "record", record) / "candidates.json").read_text(encoding="utf-8"))["records"]
+    candidates = _current_candidates(run, state, record)
     if any(c["status"] in ACTIONABLE_STATUSES for c in candidates):
         return "candidates", completeness
     if candidates and all(c["status"] in DECISIVE_NON_ACTIONABLE for c in candidates):
@@ -2810,7 +2982,7 @@ def status_document(run: Run, request: dict, state: dict) -> dict:
     stages = {}
     for stage in STAGES:
         generation = active(state, stage)
-        history = state["stages"][stage]["generations"]
+        history = stage_state(state, stage)["generations"]
         skipped = generation is None and stage in CANDIDATE_STAGES and request["target"] is None
         stages[stage] = {
             "active": None if generation is None else "gen-%03d" % generation["generation"],
@@ -2938,7 +3110,7 @@ def render_report(run: Run, request: dict, state: dict) -> str:
     if status["integrity_failures"]:
         lines += ["", "## Candidates", "", "Not rendered: blocked checkpoints are not read. Re-adopt them first.", ""]
     else:
-        lines += [""] + _candidate_sections(run, state, request) + _case_section(run, state)
+        lines += [""] + _candidate_sections(run, state, request) + _recheck_section(state) + _case_section(run, state)
     lines += ["## Remaining judgment and next steps", ""]
     for step in status["next"]:
         lines.append("- `%s` (%s, executed=%s): %s" % (step["stage"], step["kind"], step["executed"],
@@ -2995,9 +3167,14 @@ def _candidate_sections(run: Run, state: dict, request: dict) -> List[str]:
         return ["## Candidates", "", "No candidate record yet.", ""]
     synthetic = record["provenance"]["origin"] == "synthetic-fixture" or (
         active(state, "analysis") is not None and active(state, "analysis")["provenance"]["origin"] == "synthetic-fixture")
-    candidates = json.loads((gen_dir(run, "record", record) / "candidates.json").read_text(encoding="utf-8"))["records"]
+    recheck = active(state, "recheck")
+    candidates = _current_candidates(run, state, record)
     title = "## Synthetic fixture candidates (not contribution candidates)" if synthetic else "## Candidates (assessment origin claimed: ai)"
     lines = [title, "", "Verifier Markdown: `stages/record/gen-%03d/candidates.md`" % record["generation"], ""]
+    if recheck is not None:
+        lines[-2:] = ["Statuses are the ones after recheck gen-%03d (`stages/recheck/gen-%03d/candidates.json`); the "
+                      "record's own are in `stages/record/gen-%03d/candidates.md`."
+                      % (recheck["generation"], recheck["generation"], record["generation"]), ""]
     if not candidates:
         lines += ["No candidate records.", ""]
     for candidate in candidates:
@@ -3012,6 +3189,23 @@ def _candidate_sections(run: Run, state: dict, request: dict) -> List[str]:
                   "- Blocking gaps: %s" % (", ".join(candidate["blocking_gaps"]) or "none"),
                   "- Remaining judgment (unconfirmed readiness): %s" % (", ".join(unconfirmed) or "none"), ""]
     return lines
+
+
+def _recheck_section(state: dict) -> List[str]:
+    recheck = active(state, "recheck")
+    if recheck is None:
+        return []
+    details = recheck["details"]
+    lines = ["## Recheck", "",
+             "Recheck gen-%03d (verifier run `%s`, status `%s`): the verifier observed the head, repeated the duplicate "
+             "search and re-read the policy files for each candidate. A status is current only at its `verified_at`; "
+             "the next external proposal needs a recheck of its own." % (recheck["generation"], details.get("run_id"), recheck["status"]), "",
+             "| Candidate | Before | After / reason | Rechecked | Base SHA | Verified at | New gaps |", "| --- | --- | --- | --- | --- | --- | --- |"]
+    for c in details["rechecked"]:
+        lines.append("| %s | %s | %s / %s | %s | `%s` | %s | %s |" % (
+            c["candidate_id"], c["before"], c["after"], c["status_reason"], "yes" if c["rechecked"] else "no",
+            c.get("verified_base_sha"), c.get("verified_at"), ", ".join(c.get("new_gaps") or []) or "none"))
+    return lines + [""]
 
 
 def _case_section(run: Run, state: dict) -> List[str]:
@@ -3092,6 +3286,10 @@ def build_parser() -> argparse.ArgumentParser:
     record.add_argument("--origin", choices=ORIGINS, required=True)
     record.add_argument("--model")
     record.add_argument("--effort")
+    recheck = command("adopt-recheck")
+    recheck.add_argument("--candidates", required=True)
+    recheck.add_argument("--manifest", required=True)
+    recheck.add_argument("--replace", action="store_true")
     command("status")
     command("report")
     return parser
@@ -3104,6 +3302,7 @@ HANDLERS = {
     "adopt-discovery": cmd_adopt_discovery,
     "adopt-locus-search": cmd_adopt_locus,
     "record": cmd_record,
+    "adopt-recheck": cmd_adopt_recheck,
 }
 
 
@@ -3121,27 +3320,35 @@ def main(argv: Optional[Sequence[str]] = None, *, environ=os.environ) -> int:
             print(json.dumps(cmd_init(args, siblings), ensure_ascii=False, sort_keys=True))
             return 0
         run = Run(args.run_dir)
-        request, state = run.load()
-        run.revisions = siblings.revisions()
-        run.siblings = siblings
-        if args.command == "status":
-            print(json.dumps(status_document(run, request, state), ensure_ascii=False, indent=2, sort_keys=True))
-            return 0
-        if args.command == "report":
-            print(str(run.write_report(render_report(run, request, state))))
-            return 0
+        # One command at a time per run directory (contract, Concurrency); a held run is refused before any read.
+        run.acquire()
         try:
-            generation = HANDLERS[args.command](args, siblings, request, state, run)
-        except WorkflowError as error:
-            # A rejection changes nothing but the event log: reload the saved state.
-            _, saved = run.load()
-            event(saved, args.command, "rejected", str(error))
-            run.save(saved)
-            raise
-        run.save(state)
-        print(json.dumps({"stage": args.command, "generation": generation["generation"], "status": generation["status"],
-                          "reasons": generation["reasons"]}, ensure_ascii=False, sort_keys=True))
-        return EXIT.get(generation["status"], 3)
+            request, state = run.load()
+            run.revisions = siblings.revisions()
+            run.siblings = siblings
+            if args.command == "status":
+                print(json.dumps(status_document(run, request, state), ensure_ascii=False, indent=2, sort_keys=True))
+                return 0
+            if args.command == "report":
+                print(str(run.write_report(render_report(run, request, state))))
+                return 0
+            try:
+                # An unsupported source kind (issues) is refused by every stage command with the same reason.
+                _require_supported(request)
+                generation = HANDLERS[args.command](args, siblings, request, state, run)
+            except WorkflowError as error:
+                # A rejection changes nothing but the event log: reload the saved state.
+                _, saved = run.load()
+                event(saved, args.command, "rejected", str(error))
+                run.save(saved)
+                raise
+            run.save(state)
+            print(json.dumps({"stage": args.command, "generation": generation["generation"],
+                              "status": generation["status"], "reasons": generation["reasons"]},
+                             ensure_ascii=False, sort_keys=True))
+            return EXIT.get(generation["status"], 3)
+        finally:
+            run.release()
     except (WorkflowError, OSError) as error:
         print("error: %s" % error, file=sys.stderr)
         return 2

@@ -213,7 +213,7 @@ class GateTextTests(unittest.TestCase):
                  if line.startswith("| ")) if len(cells) == 2}
         expected = {
             "`auto`": "closed", "staged runs (deep-research, Agent, search)": "closed", "model run with a relay": "closed",
-            "macOS, every launch": "closed", "candidate reads (discover, locus-search)": "no isolated entry",
+            "macOS, every launch": "closed", "candidate reads (discover, locus-search, recheck)": "no isolated entry",
             "curated tracker collection": "no isolated entry", "assessment from an isolated model": "no run",
         }
         for path, state in expected.items():
@@ -254,8 +254,8 @@ class EndToEndTests(unittest.TestCase):
         flow.full()
         state = flow.state()
         self.assertEqual({"collect": "complete", "digest": "complete", "analysis": "complete", "discovery": "complete",
-                          "locus-search": "complete", "record": "complete"},
-                         {stage: wf.active(state, stage)["status"] for stage in wf.STAGES})
+                          "locus-search": "complete", "record": "complete", "recheck": None},
+                         {stage: (wf.active(state, stage) or {}).get("status") for stage in wf.STAGES})
         status = flow.status()
         # The synthetic candidate stays unverified, so the honest outcome is insufficient.
         self.assertEqual(("insufficient", "complete", []), (status["outcome"], status["completeness"], status["next"]))
@@ -309,7 +309,9 @@ class EndToEndTests(unittest.TestCase):
         flow, assessment = self._through_locus_search(status="reproduced", status_reason="none", static_reproduction=True)
         flow.ok("record", "--assessment", str(assessment), "--origin", "synthetic-fixture")
         status = flow.status()
-        self.assertEqual(("candidates", "complete", []), (status["outcome"], status["completeness"], status["next"]))
+        # An actionable candidate leaves one step: the verifier's recheck before any proposal (contract rule 10).
+        self.assertEqual(("candidates", "complete", ["recheck"]),
+                         (status["outcome"], status["completeness"], [s["stage"] for s in status["next"]]))
         candidates = fx.read_json(flow.gen("record", "candidates.json"))["records"]
         self.assertEqual([("reproduced", "static", "confirmed")],
                          [(c["status"], c["reproduction"]["method"], c["readiness_checks"]["reproduction_evidence"]["result"])
@@ -699,7 +701,7 @@ class NullTargetTests(unittest.TestCase):
             self.assertEqual(2, result[0], argv)
             self.assertIn("target-unspecified", result[2], argv)
         state = flow.state()
-        self.assertEqual([None, None, None], [state["stages"][s]["active"] for s in wf.CANDIDATE_STAGES])
+        self.assertEqual([None] * len(wf.CANDIDATE_STAGES), [state["stages"][s]["active"] for s in wf.CANDIDATE_STAGES])
         report = self._report(flow)
         self.assertIn("Outcome: `analysis-only`", report)
         self.assertNotIn("## Synthetic fixture candidates", report)
@@ -744,7 +746,9 @@ class CuratedTrackerTests(unittest.TestCase):
         flow.ok("record", "--assessment", str(assessment), "--origin", "synthetic-fixture")
         flow.ok("report")
         state = flow.state()
-        self.assertEqual(["complete"] * len(wf.STAGES), [wf.active(state, stage)["status"] for stage in wf.STAGES])
+        adopted = [stage for stage in wf.STAGES if stage != "recheck"]  # recheck follows only an actionable candidate
+        self.assertEqual(["complete"] * len(adopted), [wf.active(state, stage)["status"] for stage in adopted])
+        self.assertIsNone(wf.active(state, "recheck"))
         status = flow.status()
         self.assertEqual(("insufficient", "complete", []), (status["outcome"], status["completeness"], status["next"]))
         self.assertEqual(flow.collector_requests + len(flow.verifier.calls), status["budget"]["producer_reported_requests"])

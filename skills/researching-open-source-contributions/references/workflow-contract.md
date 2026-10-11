@@ -89,9 +89,36 @@ RUN/report.md              report command output
 ```
 
 The stages are `collect`, `digest`, `analysis`, `discovery`, `locus-search`,
-and `record`. Every generation records its status, reasons, input SHA-256 and
+`record`, and `recheck`. Every generation records its status, reasons, input SHA-256 and
 source path, output SHA-256 values, the request hash, the sibling and workflow
 revisions, and, for AI stages, the claimed provenance.
+
+## Concurrency
+
+Sequential only. One run directory takes one command at a time, `status`,
+`report`, and the re-entry of `init` included. There is no parallel execution
+inside a run: `state.json` is one document that every command rewrites whole,
+and a generation number is reserved from the length of that document, so two
+commands on one run would race on both.
+
+- Every command holds the run while it works: an exclusive advisory lock on
+  `workflow-run.json`, taken before the first read, kept for the command's
+  duration, and dropped when the command ends or its process exits. An
+  interrupted command therefore leaves no lock to clean up (an uncommitted
+  `gen-NNN` directory is the separate case of checkpoint rule 1).
+- A command that finds the run held is refused as `run-busy`: it reads and
+  changes nothing, appends no event (the event log belongs to the command that
+  holds the run), prints nothing on stdout, and exits 2. There is no queue and
+  no wait; the caller runs it again when the other command has ended.
+- Two adoptions meant for one run are run one after the other. The second one
+  then is the ordinary case: the same bytes are `reused`, different bytes need
+  `--replace` (checkpoint rules 2 and 3). Output ownership never moves: a stage
+  generation is written only by the command that reserved it, and a refused
+  command owns nothing.
+- Parallel work goes in parallel run directories. One request is one run
+  directory; `init` re-enters only a directory of the same request bytes, and
+  two directories of the same request are two independent runs that do not
+  share checkpoints or a ledger. Nothing is ever merged across run directories.
 
 ## Checkpoint rules
 
@@ -360,6 +387,66 @@ revisions, and, for AI stages, the claimed provenance.
    search and record follow the single-document steps on it; the checkpoint's
    `details.split_runs` lists the runs and there are no per-repository bundles.
 
+10. Recheck (hitchhikers-guide-to-oss#5, M6). The verifier's rule is that a
+    recheck runs immediately before any external proposal and that a previous
+    ready or reproduced state is not sufficient. The recheck is a network step
+    of the isolated process (`verify_candidates.py recheck --candidates
+    stages/record/gen-NNN/candidates.json --output ... --manifest <copy of that
+    generation's manifest.json> --request-budget N`; `status` plans it with
+    `target.locus_request_budget` as `N` whenever the active record holds an
+    actionable candidate and no recheck is adopted yet; like discovery and the
+    locus search it has no isolated entry verified against real data). Its
+    output is adopted with `adopt-recheck --candidates R --manifest M` into the
+    `recheck` stage, downstream of `record`, only when all of these hold, and
+    anything else is a `scope-conflict` that changes nothing:
+    - the rechecked candidates continue the active record's candidates by the
+      verifier's own chain check (`validate --candidates R --existing
+      stages/record/gen-NNN/candidates.json`: every record candidate present,
+      the same `candidate_key`, its verification history unchanged as a prefix);
+    - they name exactly the record's candidates (no extra, no missing);
+    - every candidate the manifest's recheck run names carries exactly one new
+      snapshot whose `inputs.kind` is `recheck`, and no other candidate's
+      history changed;
+    - the manifest holds a `recheck` run whose `inputs.candidate_ids` are those
+      candidates, with a `request_limit` of at most `budget.total_api_requests`;
+      its runs enter the ledger once (the copied discover, locus-search and
+      record runs are already there and are not counted again).
+
+    The checkpoint's status is the verifier run's (`complete` or `partial`; a
+    warning such as `policy-source-absent`, an incomplete duplicate search or an
+    unobserved candidate makes it partial, with the warnings as reasons), and a
+    status change per candidate is a reason (`CAN-001: unverified -> stale
+    (base-moved)`). While a recheck is active, the run outcome, the report's
+    candidate section and the next steps read its candidates, not the record's:
+    a candidate that went `stale` or `unverified` is no longer actionable, and a
+    run whose candidates are all decisive non-actionable after recheck is
+    `no-candidates`. The record generation itself is never rewritten. A new
+    record invalidates the recheck; a second recheck of the same record needs
+    `--replace`, and the same bytes are `reused`. A `null` target skips the
+    stage with the other candidate stages.
+
+## Re-judgment after the locus search
+
+The assessment is made before the locus search, so its `duplicate_verdict` can
+only see what discovery searched. No model re-assessment stage follows the locus
+search, and none is needed for duplicates: `record` hands the adopted locus
+search to the verifier's record gate (`--locus-search`), which re-judges the
+duplicate question mechanically from the search result, with no model call. A
+pull request returned for every locus-derived clue makes the candidate
+`duplicate` (`duplicate-open` when one is open, else `duplicate-closed-other`)
+when its assessed status is ready, `reproduced`, `policy-review` or
+`unverified`, appends a `locus-duplicate` blocking gap naming the pull request
+and the clues, and adds it to the snapshot's `duplicate_verdict.matched_items`;
+a pull request returned for some clues, or behind a truncated query, keeps a
+ready claim out of a ready status as `locus-duplicate-undetermined` for a person
+to check. The workflow never rewrites an assessment: the adopted assessment
+bytes stay what the model answered, and the re-judgment lives in the verifier's
+record output (`candidates.json`) and in the run outcome (`no-candidates` when
+every candidate is decisive non-actionable). A model re-assessment on the locus
+result would be one more paid call that could only restate what the search
+returned; the design memo of dotfiles `docs/research/2026-10-05-candidate-discovery`
+asked for either that or an automatic reflection, and this is the reflection.
+
 ## Digest shard size
 
 `digest [--max-bytes N]` passes N to the analyzer's digest builder: the largest
@@ -407,6 +494,8 @@ itself always sends zero external requests.
 | `no-patterns` / `no-candidates` | Normal insufficient result |
 | `skipped` | Candidate stage not run because `target` is `null` (status only; never a generation) |
 
+The `recheck` stage uses `complete` and `partial` as the verifier's recheck run reports them.
+
 The run outcome is one of `candidates`, `no-candidates` (decisive
 non-actionable verdicts only), `insufficient`, `analysis-only` (patterns were
 adopted but `target` is `null`, so nothing was verified), `failed`, `blocked`,
@@ -419,11 +508,11 @@ stays `insufficient`. Its completeness is `complete` or
 | Step | Kind | Owner |
 | --- | --- | --- |
 | collect (recent-closed) | network research | isolated research launcher only, through its non-AI collection entry; printed here as plan data |
-| collect (curated tracker), discover, locus-search | network research | isolated research launcher only, and it has no entry verified against real data for these yet; printed here as plan data |
+| collect (curated tracker), discover, locus-search, recheck | network research | isolated research launcher only, and it has no entry verified against real data for these yet; printed here as plan data |
 | pattern extraction, synthesis | AI research | isolated research launcher only, in its one measured read-only launch, following the sibling contracts |
 | assessment | AI research | isolated research launcher only, in its one measured read-only launch, on the analysis bundle's assess input and its strict check (#259); not run against real data yet |
 | anything that needs Agent, agy, sub-agents, or deep-research | AI research | isolated research launcher only, and no such path is open or verified yet |
-| corpus validation, digest, prompts, output gate, record, validate, report | mechanical, offline | this workflow calling the sibling scripts in the development session |
+| corpus validation, digest, prompts, output gate, record, recheck adoption, validate, report | mechanical, offline | this workflow calling the sibling scripts in the development session |
 
 ## Isolation gate
 
@@ -446,7 +535,7 @@ instruction.
 | staged runs (deep-research, Agent, search) | closed; never run with a model |
 | model run with a relay | closed |
 | macOS, every launch | closed; a setsid-escaped descendant survives cleanup and Keychain isolation is unverified |
-| candidate reads (discover, locus-search) | no isolated entry verified against real data |
+| candidate reads (discover, locus-search, recheck) | no isolated entry verified against real data |
 | curated tracker collection | no isolated entry |
 | assessment from an isolated model | no run: the analysis bundle's assess input, prompt and strict check exist (#259), and no model has answered one |
 
