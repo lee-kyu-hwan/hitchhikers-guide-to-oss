@@ -14,7 +14,7 @@
 | 2 | staged 프로필 `corpus-extract`·`deep-research` 실제 1회씩 | S2 | **측정 안 함(이 과업)**. HEAD에는 staged를 실제 모델로 돌릴 harness가 없고 제품 gate가 닫는다 → #6에 harness 변경 요청, 반영 뒤 새 Dispatch로 측정 | 결정 + 변경 요청 (3절, 8.2) |
 | 3 | relay를 붙인 모델 run(모델 child의 허용 자료 조회) | S3 | **설계상 없음 → gate 닫힘 유지, 기존 시험으로 고정** | 결정 (4절) |
 | 4 | `git push`·clone 쓰기 차단, 만료·잘못된 토큰의 실패 동작 | S4 | **PASS**(git: relay 거부 403/405/404, upstream 0; Claude 가짜 토큰: 401 명시 실패, 비용 0; GitHub 가짜 토큰: 401 `Bad credentials`, 값 노출 0) | 측정 (5절) |
-| 5 | macOS 경로 유지/폐기 | S5 | **사용자 결정 대기**. 두 안의 근거를 6절에 적었다 | 결정 초안 (6절) |
+| 5 | macOS 경로 유지/폐기 | S5 | **결정(사용자, 2026-10-11): 닫힌 채 유지(폐기 보류)**. 코드 삭제 없음 | 결정 (6절) |
 
 판정 어휘는 원문 행렬과 같다: PASS/FAIL은 측정 결과, INSUFFICIENT는 측정했으나 증거가 부족함, 「결정」은 측정 대신 정한 것이다.
 
@@ -95,7 +95,7 @@ sentinel 자격·claude를 PATH에서 뺀 채 unit wrapper `--entry worker`로 H
 - 결과: `git clone http://127.0.0.1:<port>/v1/rest/repos/octo/demo` rc 128 `The requested URL returned error: 403`; `/octo/demo.git` rc 128 `not found`; `git push … HEAD:main` 둘 다 rc 128 같은 사유, clone 디렉터리 생성 0, ref push 0. git이 보내는 첫 요청을 직접 재현하면 `GET …/info/refs?service=git-receive-pack|git-upload-pack` → 403 `endpoint_not_allowed`, `POST …/git-receive-pack|git-upload-pack` → 405 `method_not_allowed`, `/octo/demo.git/…` → 404 `not_found`. relay 로그에 upstream 이벤트 0(거부는 `check_rest`·`do_POST`가 `call()`보다 먼저 결정한다).
 - 판정: **PASS**(relay 경유) — Git 스마트 HTTP의 읽기·쓰기 경로 모두 relay 허용 목록 밖이라 upstream에 닿지 않는다. srt 단독으로는 허용 목적지 쓰기를 못 막는다는 원문 M8 FAIL은 그대로이며, 그래서 허용 목적지는 relay port뿐이다(원문 7절 M8, 설계 문서 「검증 상태」).
 
-## 6. 항목 5 — macOS 경로 유지/폐기 (S5) — 사용자 결정 대기
+## 6. 항목 5 — macOS 경로 유지/폐기 (S5)
 
 ### 6.1 사실
 
@@ -111,7 +111,9 @@ sentinel 자격·claude를 PATH에서 뺀 채 unit wrapper `--entry worker`로 H
 | **유지(닫힌 채, 폐기 보류)** — 작성자 초안 | 코드 변경 0. 문서에 「macOS는 측정 launch 후보가 아니다. 다시 열려면 전용 계정(A) + setsid·Keychain 재측정이 선행」으로 고정 | 변경·위험 0. 2026-09-27 macOS 실측(파일·환경·소켓·네트워크 경계)은 srt 회귀 대조에 쓸 수 있다. A를 선택할 길이 남는다 | darwin 분기와 skip되는 시험이 남아 읽는 사람이 「macOS도 지원」으로 오해할 수 있다(문서로 막는다) |
 | **폐기** | `darwin` 분기·`SYSTEM_READ`·macOS 실 srt 시험을 제거하고 `main`이 Linux unit wrapper 밖에서는 입력 단계에서 거부하게 한다(#6 코드 변경) | 코드·시험 축소, 「Linux VM 전용」이 코드로 고정 | #6 변경량이 늘고, A 경로를 다시 열려면 복구 비용이 든다. 이득은 코드 축소뿐이다 |
 
-결정 자리: **사용자 결정 대기**(조정자가 사용자에게 문의 중). 결정이 오면 이 절에 결정과 날짜를 적고, 폐기면 8절에 diff 제안을 더한다.
+### 6.3 결정
+
+**닫힌 채 유지(폐기 보류)** — 사용자 결정, 2026-10-11(조정자 경유). 코드 삭제 없음. 고정 문구: **macOS는 측정 launch 후보가 아니다. 다시 열려면 전용 계정(A) + setsid·Keychain 재측정이 선행돼야 한다.** `MEASURED_LAUNCHES`에 darwin이 없어 `main`은 macOS에서 계속 exit 3이며, 이 상태가 결정의 코드상 고정이다(원문 M-G). 설계 문서(`docs/oss-research-worker.md`)에 같은 문구를 적는 것은 8.3절과 함께 #6에 제안한다.
 
 ## 7. 증거 디렉터리 (모두 `~/.oss-research-vm/logs/`, 0700, `SHA256SUMS`로 봉인, 기존 디렉터리 수정 0)
 
@@ -256,7 +258,7 @@ sentinel 자격·claude를 PATH에서 뺀 채 unit wrapper `--entry worker`로 H
 
 ### 8.3 문서 보완 제안 (항목 3)
 
-`docs/oss-research-worker.md` 「남은 실제 시험 게이트」 4·5에 한 줄: 「모델 child가 relay를 조회하는 구성은 없다. 도구 표면(read-only `Read,Glob,Grep`; deep-research의 WebFetch는 `--web-domain`이 IP·localhost를 거부)상 불가능하며, 허용 자료 조회는 비AI entry(`collect`·`collect-issues`·`candidate-reads`)가 한다. 원문 6.1 #1의 해당 조건은 이 설계의 목표가 아니다.」 코드·시험 변경은 없다.
+`docs/oss-research-worker.md` 「남은 실제 시험 게이트」 3(Keychain)·「제한: setsid 탈출」 끝에 항목 5의 결정 문구(6.3)를 한 줄 적고, 4·5에 한 줄: 「모델 child가 relay를 조회하는 구성은 없다. 도구 표면(read-only `Read,Glob,Grep`; deep-research의 WebFetch는 `--web-domain`이 IP·localhost를 거부)상 불가능하며, 허용 자료 조회는 비AI entry(`collect`·`collect-issues`·`candidate-reads`)가 한다. 원문 6.1 #1의 해당 조건은 이 설계의 목표가 아니다.」 코드·시험 변경은 없다.
 
 ## 9. 로컬 Linux CI (docs/ci.md 방식)
 
@@ -271,6 +273,5 @@ sentinel 자격·claude를 PATH에서 뺀 채 unit wrapper `--entry worker`로 H
 
 ## 10. 남은 것
 
-- 항목 5의 사용자 결정(6절 결정 자리).
 - #6: 8.1(auto 차단)·8.2(staged harness) 반영. 8.2 병합 뒤 staged 2회 측정은 새 Dispatch.
 - 원문 X12b(후보 verifier와 모델·분석 단계의 연결)는 이 이슈 범위 밖이다.
