@@ -12,7 +12,9 @@ This skill connects existing skills. It does not replace them:
 [the workflow contract](references/workflow-contract.md) and each stage
 skill's own SKILL.md before starting. Resolve `SKILL_DIR` to this directory.
 `scripts/oss_workflow.py` is the only glue: it validates, checkpoints, and
-reports. It never opens a network connection or starts a process.
+reports. It never opens a network connection or starts a process. One run
+directory takes one command at a time (a held run refuses the next command as
+`run-busy`, changing nothing); parallel work goes in parallel run directories.
 
 ## Who does what
 
@@ -24,7 +26,7 @@ reports. It never opens a network connection or starts a process.
   this host.
 - **Mechanical, here.** The development worker or parent session prepares the
   request, runs the mechanical offline steps (`init`, `adopt-*`, `digest`,
-  `record`, `status`, `report`), validates and collects results, and reports
+  `record`, `adopt-recheck`, `status`, `report`), validates and collects results, and reports
   its own Orca Dispatch. Only the development worker sends its `worker_done`.
   The research process never gets the Orca socket or Dispatch capability.
 - **Offline only, here.** This workflow and the development session do two
@@ -100,10 +102,23 @@ reports. It never opens a network connection or starts a process.
    `--discovery/--manifest`, `--locus-search/--manifest`, and `--assessment`
    once per repository; assessment, locus search, and record run per
    repository and the workflow merges them (workflow contract, rule 7). When the caller names no target, write
-   `"target": null`: the run collects and analyzes only, the three candidate
-   stages are `skipped`, and their commands are refused. Never borrow a source
+   `"target": null`: the run collects and analyzes only, the four candidate
+   stages (discovery, locus-search, record, recheck) are `skipped`, and their
+   commands are refused. Never borrow a source
    repository as a placeholder target.
-6. Run `report --run-dir RUN`. It writes `RUN/report.md` for nvim. State the
+6. Recheck before any external proposal. When the record holds an actionable
+   candidate, `status` plans the verifier's `recheck` on
+   `stages/record/gen-NNN/candidates.json` (a network step of the isolated
+   process, no isolated entry verified yet). Adopt its output with
+   `adopt-recheck --candidates R --manifest M`: it must continue the record's
+   candidates (the verifier's chain check) and carry one recheck snapshot per
+   rechecked candidate. After that, the outcome and the report read the
+   rechecked statuses (`stale`, `unverified`, or unchanged). A previous ready or
+   reproduced state is not sufficient for a proposal (workflow contract, rule
+   10). Duplicates the locus search found are already reflected by `record`
+   through the verifier's gate; no model re-assessment follows the locus search
+   (contract, Re-judgment after the locus search).
+7. Run `report --run-dir RUN`. It writes `RUN/report.md` for nvim. State the
    outcome word exactly: `candidates`, `no-candidates`, `insufficient`,
    `analysis-only`, `failed`, `blocked`, `awaiting-input`, or
    `pending-unsupported`. Also state

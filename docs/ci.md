@@ -127,3 +127,16 @@ S4(작성자 로컬, 읽기만, 모델 호출 0): `~/.oss-research-vm/logs/a3-cs
 | `__pycache__` | 0 | 0 (시험 전 수동 `import`가 남긴 `scripts/__pycache__` 1개는 시험이 만든 것이 아니며 지웠다) |
 
 S3(작성자 로컬, 읽기만, 모델·GitHub 호출 0): `~/.oss-research-vm/logs/a3-css-assess-rerun-20261008T130416Z/`의 discovery·assessment·locus-search(sha256 `a17f01ad…`, `9dfebd57…`, `828ceeea…`)를 임시 디렉터리로 복사해 오프라인 `record`를 돌리면, 변경 전 코드(HEAD 사본)는 CAN-001을 `duplicate`/`duplicate-closed-other`로 두고 `locus-duplicate:` gap에 PR 6개(#565·#473·#202·#183·#171·#156)를 적는다. 변경 후에는 CAN-001이 `unverified`/`insufficient-evidence`로 남고 locus gap과 `matched_items`가 없다(옛 문서의 `rules` 단서는 판정에서 빠지고 `no-invalid-at-rule-placement` 하나로는 결정하지 않는다). CAN-002는 불변. 증거 디렉터리의 `SHA256SUMS` 157개는 실행 전후 모두 OK다.
+
+### 2026-10-11, 병렬 계약·recheck 단계·locus 재판정·evals(hitchhikers-guide-to-oss#5)
+
+같은 Docker 방식(`python:3.14` linux/arm64, Python 3.14.8, `--network none --cpuset-cpus=0,1`, 비root). 변경은 통합 스킬 `researching-open-source-contributions`에 한정된다: run 디렉터리 lock(`workflow-run.json`에 `flock`, 잡힌 run은 `run-busy`로 거부; 계약 「Concurrency」), 새 stage `recheck`와 `adopt-recheck`(계약 규칙 10; actionable 후보가 있으면 `status`가 recheck를 계획), locus-search 뒤 verifier record gate의 중복 재판정을 계약·시험으로 고정(「Re-judgment after the locus search」), 이슈 corpus 경계 시험, 모든 stage 명령의 `pending-unsupported` 거부, `evals/behavioral-eval.md`. 새 시험은 `test_run_lock.py` 4개(S1), `test_recheck.py` 8개(M6), `test_locus_rejudgment.py` 3개(M2), `test_issue_corpus.py` 2개(M4 경계)이고, 기존 `test_oss_workflow.py`의 단언 5곳이 recheck stage에 맞춰 바뀌었다(STAGES 7개, actionable 뒤 다음 단계 `recheck`, gate 표 행 이름).
+
+| 묶음 | Linux | macOS(작성자 호스트) |
+|---|---|---|
+| 저장소 시험 `tests/test_*.py` 19모듈 | 671개 OK (skip 40) | 모듈별 모두 OK(skip 39; `worker_runtime` 21·`worker_linux` 9·`worker_supervisor` 4·`offline_integration` 3·`worker_skills` 2) |
+| 분석 번들 `test_*.py` 12개 + `selftest_*.py` 3개 | 모두 OK(skip: assess 1, assess_contract 1, continue_plan 8, dry_plan 3, model_retry 1, prompt_contract 3, reduce_inputs 1, search_clues 1, stage_inputs 2), selftest failures=0 | `test_continue_plan` 1건 실패(위에 적은 이 호스트의 증거 `continued-by.json` 탓, 변경과 무관), 나머지 OK |
+| 스킬 시험 6묶음 | 659개 OK (researching 162, analyzing 77, verifying 138, recent-closed 162, curated 53, issues 67) | 같음 |
+| `__pycache__` | 0 | 0 |
+
+S2(통합 스킬 evals 1회)와 S3(설치본 호출 검증, Claude Code·Codex 각 1회)의 기록은 `skills/researching-open-source-contributions/evals/behavioral-eval.md`와 `docs/development/2026-10-11-5-workflow-acceptance-remaining/README.md`에 있다(모델 호출 3회, 모두 구독 사용량, 네트워크 읽기·GitHub 쓰기 0).
