@@ -384,13 +384,16 @@ class ContractTests(Fixture):
             with self.assertRaisesRegex(ValueError, "permission mode"):
                 worker.build_command(["/opt/srt"], policy, "/opt/claude", "prompt", mode)
 
-    def test_cli_accepts_only_the_two_modes_and_auto_is_still_blocked(self):
-        for mode in ("bypassPermissions", "default", "plan"):
+    def test_cli_accepts_only_dont_ask_and_auto_is_refused_as_input(self):
+        # #4 item 1 (2026-10-11): auto is refused at the CLI (exit 2), while
+        # build_command keeps both modes for the measurement harness.
+        for mode in ("bypassPermissions", "default", "plan", "auto"):
             result = self.launch(self.bin, extra=("--permission-mode", mode))
             self.assertEqual(result.returncode, 2, mode)
             self.assertIn("--permission-mode", result.stderr)
             self.assertFalse(self.run_dir.exists())
-        result = self.launch(self.bin, extra=("--permission-mode", "auto"))
+        self.assertFalse(self.capture.exists())
+        result = self.launch(self.bin, extra=("--permission-mode", "dontAsk"))
         self.assertEqual(result.returncode, worker.EXIT_BLOCKED, result.stderr)
         self.assertFalse(self.capture.exists())
         self.assertFalse(self.run_dir.exists())

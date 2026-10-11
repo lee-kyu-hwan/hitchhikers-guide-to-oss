@@ -676,7 +676,7 @@ class MeasuredLaunchGateTests(Fixture):
         scope = worker.MEASURED_LAUNCHES["linux"]
         self.scope = scope._replace(
             node_sha256=hashlib.sha256(b"fake node").hexdigest(),
-            claude_sha256=hashlib.sha256(b"fake claude").hexdigest())
+            cli_sha256=hashlib.sha256(b"fake claude").hexdigest())
 
     def credential(self, profile="claude-profile2"):
         directory = self.root / "credentials" / profile
@@ -738,7 +738,7 @@ class MeasuredLaunchGateTests(Fixture):
             "no credential": dict(credential=None),
             "other machine": dict(machine="x86_64"),
             "other node": dict(scope=self.scope_with(node_sha256="0" * 64)),
-            "other claude": dict(scope=self.scope_with(claude_sha256="0" * 64)),
+            "other claude": dict(scope=self.scope_with(cli_sha256="0" * 64)),
             "other os": dict(scope=self.scope_with(os_version="12")),
             "macOS": dict(platform="darwin"),
         }
@@ -810,8 +810,10 @@ class MeasuredLaunchGateTests(Fixture):
                 "--model", "claude-opus-5-5", "--effort", "medium"]
         outside = self.GOOD._replace(unit_problems=(
             "not started by the unit wrapper (no unit marker)",))
+        # --permission-mode auto is refused by the CLI itself (exit 2, #4 item 1),
+        # so it never reaches the gate; see the SystemExit check below.
         for extra, expected in (([], outside),
-                                (["--permission-mode", "auto"], outside._replace(permission_mode="auto")),
+                                (["--permission-mode", "dontAsk"], outside),
                                 (["--relay-repo", "octo/demo"], outside._replace(relay=True)),
                                 (["--execution-profile", "corpus-extract"],
                                  outside._replace(execution_profile="corpus-extract"))):
@@ -830,6 +832,15 @@ class MeasuredLaunchGateTests(Fixture):
                 relay.assert_not_called()
                 research.assert_not_called()
                 self.assertFalse(self.run_dir.exists())
+        seen.clear()
+        with mock.patch.object(sys, "argv", base + ["--permission-mode", "auto"]), \
+                mock.patch.object(worker, "require_runtime", side_effect=gate), \
+                mock.patch.object(sys, "stderr"):
+            with self.assertRaises(SystemExit) as refused:
+                worker.main()
+        self.assertEqual(refused.exception.code, 2)
+        self.assertEqual(seen, {})
+        self.assertFalse(self.run_dir.exists())
 
 
 class ProcScanTests(unittest.TestCase):
@@ -1179,12 +1190,15 @@ with open(here / "calls.jsonl", "a") as log:
     log.write(json.dumps(sys.argv[1:]) + "\n")
 step = behavior[sys.argv[1]]
 run_id = sys.argv[sys.argv.index("--run-id") + 1] if "--run-id" in sys.argv else None
+backend = sys.argv[sys.argv.index("--backend") + 1] if "--backend" in sys.argv else None
 if "raw" in step:
     sys.stdout.write(step["raw"])
 else:
     out = dict(step["out"])
     if out.get("run_id") == "ECHO":
         out["run_id"] = run_id
+    if sys.argv[1] == "apply":
+        out.setdefault("backend", backend)  # the real tool names the backend it pinned
     print(json.dumps(out))
 sys.exit(step["exit"])
 """
@@ -1252,8 +1266,9 @@ class EgressPinTests(unittest.TestCase):
         self.assertEqual(self.calls(), ["apply", "verify"])
         argv = json.loads((self.root / "calls.jsonl").read_text().splitlines()[0])
         self.assertEqual(argv, ["apply", "--run-id", self.UNIT, "--ttl", "140",
-                                "--resolver", "127.0.0.53"])
+                                "--resolver", "127.0.0.53", "--backend", "claude"])
         self.assertEqual(record["apply"]["exit"], 0)
+        self.assertEqual(record["backend"], "claude")
 
     def test_every_disagreement_is_refused(self):
         other = dict(status="pinned", run_id="oss-research-ffffffffffffffff",

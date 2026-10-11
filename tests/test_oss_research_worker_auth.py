@@ -199,7 +199,10 @@ class ClosedGateTests(Fixture):
     def test_main_blocks_with_a_good_credential_and_starts_nothing(self):
         prefix = self.fake_prefix()
         credential = self.write_credential()
-        for mode in worker.PERMISSION_MODES:
+        # The CLI takes dontAsk only (#4 item 1, 2026-10-11): auto is refused as
+        # input (SystemExit 2) before the gate; dontAsk reaches the closed gate (3).
+        for mode, expected in ((worker.DEFAULT_PERMISSION_MODE, worker.EXIT_BLOCKED),
+                               ("auto", worker.EXIT_BAD_INPUT)):
             argv = ["worker", "--profile", "claude-profile1",
                     "--input-dir", str(self.input),
                     "--prompt-file", str(self.input / "task.txt"),
@@ -208,9 +211,14 @@ class ClosedGateTests(Fixture):
             with mock.patch.object(worker, "load_credential") as load, \
                     mock.patch.object(worker, "run_research") as research, \
                     mock.patch.object(worker.subprocess, "Popen") as popen, \
-                    mock.patch.object(sys, "argv", argv), \
+                    mock.patch.object(sys, "argv", argv), mock.patch.object(sys, "stderr"), \
                     mock.patch.dict(os.environ, {worker.CREDENTIAL_VARIABLE: PARENT_TOKEN}):
-                self.assertEqual(worker.main(), worker.EXIT_BLOCKED)
+                if expected == worker.EXIT_BAD_INPUT:
+                    with self.assertRaises(SystemExit) as refused:
+                        worker.main()
+                    self.assertEqual(refused.exception.code, expected)
+                else:
+                    self.assertEqual(worker.main(), expected)
             load.assert_not_called()
             research.assert_not_called()
             popen.assert_not_called()
@@ -220,7 +228,8 @@ class ClosedGateTests(Fixture):
         source = SCRIPT.read_text(encoding="utf-8")
         options = set(worker.re.findall(r'add_argument\("(--[a-z-]+)"', source))
         self.assertEqual(options, {
-            "--profile", "--input-dir", "--prompt-file", "--run-dir", "--runtime-prefix",
+            "--profile", "--backend", "--input-dir", "--prompt-file", "--run-dir",
+            "--runtime-prefix",
             "--credential-file", "--model", "--effort", "--permission-mode",
             "--execution-profile",
             "--web-domain", "--timeout", "--relay-repo",

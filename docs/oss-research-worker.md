@@ -39,6 +39,10 @@ python3 bin/oss-research-worker \
   --permission-mode dontAsk
 ```
 
+- `--backend claude|codex|agy`: 조사 프로세스로 띄울 모델 CLI. 기본 `claude`.
+  측정 launch가 있는 백엔드는 `claude`뿐이라 `codex`·`agy`는 게이트에서 종료 코드
+  3이다(자격 파일을 읽지 않고 run 디렉터리도 만들지 않는다). 다른 값은 종료 코드
+  2. 자세한 것은 「백엔드」.
 - `--input-dir`: 조사 입력 전용 디렉터리. symlink가 하나라도 있으면 거부한다.
   부모 `HOME`을 포함하는 경로(`/`, `/Users` 등)도 거부한다.
 - `--prompt-file`: 입력 디렉터리 안의 일반 파일, 64 KiB 이하 UTF-8.
@@ -49,11 +53,12 @@ python3 bin/oss-research-worker \
   뿐이다). 게이트는 프로필 전용 토큰 파일의 메타데이터만 검사한다(「인증」
   참고). 없으면 "no credential binding"으로 막는다. 인증 방식 자체는 아직 정하지
   않았다.
-- `--permission-mode dontAsk|auto`: 조사 프로세스 Claude의 권한 모드. 기본
-  `dontAsk`. 다른 값(`default`·`bypassPermissions`·`plan` 등)은 종료 코드 2로
-  거부한다. 도구 표면(`Read,Glob,Grep`, 거부 목록, `--safe-mode` 등)은 두 모드가
-  같다. `auto`는 CLI 인자 준비일 뿐이고, auto로 AI를 실행한 적이 없으므로 auto의
-  차단 동작 증거가 아니다. 게이트가 닫혀 있어 어느 값이든 종료 코드 3이다.
+- `--permission-mode dontAsk`: 조사 프로세스 Claude의 권한 모드. `dontAsk`만
+  받는다(기본). `auto`는 2026-09-28(2회)·2026-10-11 세 번의 측정에서 OS 증거 없이
+  refusal로 끝나(#4 항목 1 결정) 다른 값(`default`·`bypassPermissions`·`plan` 등)과
+  같이 종료 코드 2로 거부한다. `build_command`의 `PERMISSION_MODES`(`dontAsk`·
+  `auto`)는 측정 하네스(`unit_inner.py model-auto`)를 위해 남아 있고, 게이트 수준의
+  auto 반례 시험도 그대로다(심층 방어). `dontAsk`도 게이트가 닫혀 있어 종료 코드 3이다.
 - `--timeout`: 기본 1800초. 양의 유한한 값만 받는다. relay와 조사 프로세스
   전체에 거는 벽시계 상한 하나다(「supervisor」). 넘기면 두 프로세스 그룹을
   모두 종료하고 실패 처리한다.
@@ -170,7 +175,8 @@ WebSearch 실행 위치. 인자 생성 성공은 스킬 실행 성공이 아니�
    프로세스의 쓰기 영역은 `home/`·`tmp/`·`output/`뿐이다. 정책 파일은
    `policy/srt-settings.json`(0400)이다.
 4. `node <prefix>/…/dist/cli.js --settings <정책> -- <claude 실제 경로> --print
-   --output-format json …`. Claude 인자는 기존 도구 표면을 그대로 쓴다.
+   --output-format json …`(백엔드 `claude`의 argv. 다른 백엔드의 argv는 아직
+   없다, 「백엔드」). Claude 인자는 기존 도구 표면을 그대로 쓴다.
    `Read,Glob,Grep`만 제공하고
    `--safe-mode --restricted --strict-mcp-config`,
    `--permission-mode <dontAsk|auto>`·`--permission-prompts none`을 쓴다.
@@ -234,6 +240,8 @@ probe가 fork한 자손이 `os.setsid()`에 **성공**했다. 그 자손은 stdo
 있었다**(시험이 직접 종료). 그 자손은 srt 안에서 시작했으므로 같은 Seatbelt
 프로파일 아래에 있을 것으로 보지만, 이것은 확인하지 않았다. 완전한 정리를
 보장하지 못하므로 게이트는 닫힌 채 둔다. sudo나 다른 권한 우회는 쓰지 않았다.
+결정(2026-10-11, #4 항목 5): macOS는 측정 launch 후보가 아니다. 다시 열려면 전용
+계정(A) + setsid·Keychain 재측정이 선행돼야 한다(「남은 실제 시험 게이트」 3).
 
 Linux(bubblewrap)에서는 이 자손이 srt의 PID namespace와 함께 죽을 것으로
 예상한다(「Linux (bubblewrap) 대응」). **미측정**이다. macOS의 FAIL은 그대로다.
@@ -743,6 +751,50 @@ Linux 게스트 안의 별도 로그인(`.credentials.json`), API key·`apiKeyHe
 - 기록: manifest의 `requested_model`·`requested_effort`는 요청값일 뿐이다. 실제 모델 성공을 뜻하지 않는다. 결과 JSON에 `modelUsage`가 있을 때만 `observed_models`를 따로 남긴다.
 - 값은 사용자가 나중에 준다. 전용 oauth-token 미확인 blocker는 그대로다.
 
+## 백엔드 (#6 1단계: 어댑터 분리, Claude 동작 불변)
+
+실행기가 모델 CLI에 대해 아는 것은 전부 `Backend`(NamedTuple) 하나에 모았다. 이슈
+#6이 세어 둔 Claude 의존 7가지가 그 필드와 백엔드별 분기다.
+
+| 의존 | `Backend` 필드 / 분기 | Claude 값 |
+|---|---|---|
+| 실행 인자 | `build_command`·`build_staged_command`(`require_measured_argv`: `claude`만 만든다) | 기존 argv 그대로 |
+| 설정 격리 | `config_variable`·`config_subdir`(`build_environment`) | `CLAUDE_CONFIG_DIR` = `run/home/.claude` |
+| 인증 | `credential_name`·`credential_variable` | `oauth-token`·`CLAUDE_CODE_OAUTH_TOKEN` |
+| 허용 목적지 | `allowed_domains`·`allowed_domains_linux`(`build_policy`), `pinned_names` | `api.anthropic.com`(Linux `:443`) |
+| 결과 해석 | `result_problems`·`observed_models`(`claude`만 파싱) | result 객체·`modelUsage` |
+| 측정 launch | `MeasuredLaunch.backend`(기본 `claude`), `cli_sha256`(이전 이름 `claude_sha256`) | Linux launch 1건, `backend="claude"` |
+| 판정·회수 | manifest `backend` 키; 게스트 판정기(`share/linux/model_once*`, `unit_inner.py`)는 Claude 측정 하네스로 그대로 둔다 | `"backend": "claude"` |
+
+- `BACKENDS = {claude, codex, agy}`, 기본 `claude`. `codex`·`agy`는 이름과 실행
+  파일 이름만 있고 나머지 필드는 `None`이다. `None` 필드가 필요한 함수는
+  `Backend.require`로 `Blocked`다(환경·정책·argv·결과 파서 모두 fail closed).
+  측정은 2·3단계에서 한다(설치 버전 `--help`, run 전용 설정 홈, 인증 형태, 실제
+  접속 대상 실측).
+- 게이트: `LaunchRequest.backend`(기본 `claude`)가 `MEASURED_LAUNCHES`의
+  `backend`와 다르면 `measured_launch_problems`가 "backend codex is not the
+  measured claude"를 내고, Linux에서는 자격 파일 메타데이터도 보기 전에 Blocked다.
+  요청의 백엔드와 어댑터가 다르면("names backend codex, not claude") 그것도
+  Blocked. `main`은 `--backend`를 `LaunchRequest`와 `require_runtime`·`run_research`
+  양쪽에 넘긴다.
+- Claude 경로 불변: `--backend claude`(기본)에서 `build_command`·
+  `build_staged_command`·`build_policy`·`build_environment`의 결과는 main `74e49d6`과
+  바이트 단위로 같다. `tests/test_oss_research_worker_backends.py`가 그때 계산한
+  sha256을 상수로 들고 비교한다(`ClaudePathUnchangedTests`). 모듈 상수
+  (`ALLOWED_DOMAINS`, `CREDENTIAL_VARIABLE` 등)는 Claude 백엔드의 값으로 그대로
+  남아 있고 `CLAUDE`가 그것을 참조한다.
+- egress pin: `bin/oss-research-egress-pin apply … --backend claude|codex|agy|none`
+  (기본 `claude`). `api.github.com`에 백엔드의 측정된 모델 endpoint를 더해 해석한다.
+  `codex`·`agy`는 measured 이름이 없어 아무것도 바꾸기 전에 거부(exit 2)하고,
+  `none`은 GitHub만 핀한다. manifest는 `backend` 키를 갖고(schema 1.1.0) `verify`가
+  `pins`를 그 백엔드의 이름 집합과 대조한다. unit wrapper는 `--entry worker`의
+  인자에서 `--backend`를 읽어 넘기고(`worker_backend`), 비AI entry(`collect`·
+  `collect-issues`·`candidate-reads`·`verify`)는 `none`으로 핀한다. 즉 비AI run은
+  이제 `api.anthropic.com`을 열지 않는다(이전에는 고정으로 열렸다; 그 run들의
+  srt 정책은 원래 `model=False`라 모델 endpoint를 허용하지 않았다).
+- 기록: `docs/development/2026-10-11-6-research-backends/README.md`(0단계 agy 조사,
+  1단계 해시·시험 수치).
+
 ## 비AI 수집 entry (`oss-research-collect`)
 
 조사 worker(`oss-research-worker`의 `main`)와 수집 entry는 역할이 다른 별개 프로그램이다. unit wrapper에서는 `--entry worker|collect|verify`로 고른다.
@@ -859,8 +911,9 @@ Linux 게스트(Lima/VZ)는 호스트 Mac이 잠자는 동안 **시스템 시계
 |---|---|---|---|
 | 스킬·Agent(deep-research) | **닫힌 게이트 뒤 구성기**. `read-only`는 그대로다. `corpus-extract`·`deep-research` 프로필이 도구 표면, 검토된 원본 staging(hash pin, manifest), staged 경로 `denyWrite`, 수거 때 변경 검사를 만든다(「조사 스킬 실행 구성」) | 없음. staged 변경 거부는 실제 srt 비AI probe만 | ① 도구 목록 확정(계약 문서). ② 구성기 완료(오프라인 + srt probe). ③ live에서 staged 로드·자식 경계(계약 §3.2, R1~R5)를 판정한다. ④ WebFetch 도메인과 relay 후보는 사용자·조정자 결정이다 |
 | 인증 sentinel 바인딩 | **닫힌 게이트 뒤 최소 준비**. 게이트는 메타데이터만 검사. 게이트 뒤 `load_credential`(1회 읽기)·자식 환경 전달·시작 전 argv/relay 거부·수거 노출 검사가 있고 가짜 sentinel 오프라인 시험만 있다(`test_oss_research_worker_auth.py`) | 없음(sentinel 파일만) | ① 완료(오프라인). ② 가짜 토큰으로 실제 Claude가 명시적 인증 실패를 내는지 실측한다. 모델 도메인 접속이 필요하므로 조정자 승인 후에 한다. ③ 사용자가 발급한 실제 토큰으로 1회 호출하는 것은 사용자 단계다 |
-| auto CLI 선택 | **CLI 준비만**. `--permission-mode dontAsk|auto`(기본 `dontAsk`)를 `build_command`에 넘긴다. 도구 표면은 같다 | Linux 1회: mode 적용은 관찰했지만 모델 자동 전환으로 FAIL이다. OS 차단 증거는 없다(`2026-09-28-189-linux-model-evidence.md`) | ① 완료(오프라인). ② auto에서 위 차단 시험을 Claude 도구 경로로 반복한다. OS 경계는 srt가 맡으므로 auto에서도 같아야 하지만 실측 전에는 주장하지 않는다 |
+| auto CLI 선택 | **닫음(측정 종료, 2026-10-11)**. CLI는 `--permission-mode dontAsk`만 받고 `auto`는 입력 거부(exit 2)다. `build_command`의 `PERMISSION_MODES`와 하네스 `model-auto`는 측정 전용으로 남는다 | Linux 3회(2026-09-28 ×2, 2026-10-11): mode 적용은 관찰했지만 모두 refusal·모델 자동 전환으로 끝나 OS 차단 증거가 없다(`2026-09-28-189-linux-model-evidence.md`, #4 기록 `docs/development/2026-10-11-4-isolation-acceptance-remaining/README.md`) | 없음. 다시 열려면 OS 수준 거부 증거가 먼저 필요하다 |
 | Claude 바이너리 기동 | 정책에 필요한 읽기 경로 반영 | `--version`·`--help`만 | 모델 요청 경로의 추가 읽기·네트워크 요구는 인증 단계에서 측정한다 |
+| Codex·agy 백엔드(#6) | **이름만**. `--backend codex|agy`는 게이트에서 exit 3, 어댑터 필드 `None`, egress pin 거부(「백엔드」) | 없음 | 2단계(Codex): `codex exec` 플래그를 설치 버전 `--help`로 확정, run 전용 `CODEX_HOME`, Landlock과 bwrap 중첩 확인, 출력 JSONL 모델 파서, VM 설치(sha 고정), 읽기 집합 ablation, 측정 launch 등록, 실제 호출 1회. 3단계(agy): 같은 절차(0단계 기록은 `docs/development/2026-10-11-6-research-backends/README.md`) |
 
 ## 검증 상태
 
@@ -883,7 +936,7 @@ Linux 게스트(Lima/VZ)는 호스트 Mac이 잠자는 동안 **시스템 시계
 | 인증 파일 형태 검사 | PASS (오프라인, sentinel) | `CredentialTests` 7건. 실제 토큰·바인딩 미검증 |
 | 닫힌 게이트의 토큰 비읽기 | PASS (오프라인) | `ClosedGateTests`(auth): `os.read`·`load_credential` 없이 Blocked, 두 모드 모두 `main` exit 3·프로세스 없음 |
 | 게이트 뒤 인증 전달·노출 검사 | PASS (오프라인, sentinel·fake 자식) | `test_oss_research_worker_auth.py` 29건. 다른 프로필 credential은 시작 전 Blocked, 목록 불가 디렉터리는 검사 미완료 실패, 자식 환경에만 전달, argv·relay 거부, stdout·JSON escape·보고서·stderr·relay log·영역 파일·이름 노출 시 실패와 결과 미저장, 검사 상한 fail closed. 인코딩된 값은 못 찾는 한계 있음. 실제 Claude 인증 미검증 |
-| permission mode 선택 | PASS (오프라인) | `dontAsk`/`auto`만 허용, 기본 `dontAsk`, 도구 표면 불변. auto 동작은 미검증 |
+| permission mode 선택 | PASS (오프라인) | CLI는 `dontAsk`만(auto 포함 다른 값은 exit 2, 2026-10-11), `build_command`는 `dontAsk`/`auto`(하네스용), 도구 표면 불변 |
 | 시스템 읽기 최소화 | PASS (실측) | `SYSTEM_READ` 3개. 양성: Claude 기동·`localhost` 해석·hosts. 음성: `/etc/passwd` 등 6건 |
 | lock 재현 | PASS (실측, 오프라인 캐시) | 커밋한 lock으로 `npm ci` → 같은 트리. node·OS·Claude 바이너리 무결성은 미검증 |
 | Keychain | **미검증(부분 관찰)** | 파일형 fixture는 파일 deny로만 막힘. srt 0.0.77 README 키에 mach-lookup 거부가 없고, 이 머신에서 시험한 중첩 두 방향은 EPERM. 로그인·XPC 경로 미증명. 계정 분리·VM은 시험하지 않은 별도 경로 |
@@ -919,6 +972,9 @@ Linux 게스트(Lima/VZ)는 호스트 Mac이 잠자는 동안 **시스템 시계
    검토한 대안은 (a) 로그인 Keychain이 없는 전용 macOS 사용자 계정으로
    조사 프로세스 실행(관리자 설정 필요), (b) Keychain이 없는 Linux VM·컨테이너(현재
    docker daemon 미실행)다. 선택은 사용자 결정이다. 그 전까지 게이트는 닫혀 있다.
+   결정(2026-10-11, #4 항목 5, 사용자): **macOS는 측정 launch 후보가 아니다. 다시
+   열려면 전용 계정(A) + setsid·Keychain 재측정이 선행돼야 한다.** 코드 삭제는 없다.
+   `MEASURED_LAUNCHES`에 darwin이 없어 `main`은 macOS에서 계속 exit 3이다.
 4. **조회 중계(#192, 별도 writer)**: 조정자 결정. 부모 소유 loopback 포트, srt
    `allowedDomains`에 정확한 `127.0.0.1:<port>`만, `allowLocalBinding: false`.
    조사 프로세스의 GitHub 직접 접속 금지. 범용 프록시·임의 URL 전달 금지. 공개
@@ -927,13 +983,19 @@ Linux 게스트(Lima/VZ)는 호스트 Mac이 잠자는 동안 **시스템 시계
    목록에 더한다(「supervisor」). REST POST 405는 제품 supervisor 경로에서도
    확인했다. mutation·push 음성 시험은 #82 통합 시험 결과를 따른다.
    남은 것: setsid 탈출 자손의 정리(「제한: setsid 탈출」).
+   모델 child가 relay를 조회하는 구성은 없다(#4 항목 3 결정, 2026-10-11). 도구
+   표면(read-only `Read,Glob,Grep`; deep-research의 WebFetch는 `--web-domain`이
+   IP·localhost를 거부)상 불가능하며, 허용 자료 조회는 비AI entry(`collect`·
+   `collect-issues`·`candidate-reads`)가 한다. 원문 6.1 #1의 해당 조건은 이 설계의
+   목표가 아니다.
 5. **스킬·Agent 호환성**: deep-research가 요구하는 도구 표면을 격리 안에서 실제로
-   수행한다. 도구를 꺼서 성공 판정하지 않는다.
-6. **auto**: `--permission-mode auto` 인자는 준비됐다. Linux 1회 실행에서 폴백을
-   관찰했다. CLI가 refusal 뒤 `claude-opus-4-8`로 세션 전체를 전환했다. 이 전환을
-   막을 방법이 정해지기 전에는 auto를 쓰지 않는다. decoy 시도는 Claude `--restricted`
-   층에서 먼저 거부됐다. OS 경계는 기존 비AI 증거로 판단한다
-   (`2026-09-28-189-linux-model-evidence.md`).
+   수행한다. 도구를 꺼서 성공 판정하지 않는다. (위 4의 결정이 여기에도 적용된다:
+   relay 조회는 모델 child의 도구 표면에 없다.)
+6. **auto**: **닫음(측정 종료, 2026-10-11, #4 항목 1)**. Linux 세 번(2026-09-28 ×2,
+   2026-10-11)의 measurement에서 CLI는 refusal 뒤 세션을 다른 모델로 전환하거나 도구를
+   시도하지 않아 OS 수준 거부 증거가 나오지 않았다. 그래서 `--permission-mode auto`는
+   CLI 입력에서 거부한다(exit 2). decoy 시도는 Claude `--restricted` 층에서 먼저
+   거부됐다. OS 경계는 기존 비AI 증거로 판단한다(`2026-09-28-189-linux-model-evidence.md`).
 7. **알 수 없는 정책 키**: srt가 무시하므로 실행기가 만든 정책의 키 집합을
    문서화된 키로 고정한다(오프라인 계약 시험). 상위 버전으로 올릴 때 재실측한다.
 

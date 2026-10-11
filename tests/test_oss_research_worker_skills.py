@@ -497,7 +497,7 @@ class CliTests(Fixture):
                       ("--execution-profile", "corpus-extract"),
                       ("--execution-profile", "deep-research"),
                       ("--execution-profile", "deep-research", "--web-domain",
-                       "docs.python.org", "--permission-mode", "auto")):
+                       "docs.python.org", "--permission-mode", "dontAsk")):
             with self.subTest(extra):
                 with mock.patch.object(worker, "run_research") as research:
                     result = self.cli(*extra)
