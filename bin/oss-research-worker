@@ -1363,8 +1363,13 @@ def build_staged_command(runtime: list[str], policy: Path, cli: str, prompt: str
     """The argv of a corpus-extract or deep-research run (the Claude backend's).
 
     It is build_command's argv without the profile's dropped flags, plus the
-    parent-written settings (and agents) files and the profile's tools and
-    rules. --restricted, --strict-mcp-config and --setting-sources "" stay.
+    parent-written settings file, the profile's agents as one inline JSON
+    object (corpus-extract) and the profile's tools and rules. --restricted,
+    --strict-mcp-config and --setting-sources "" stay. The agents go inline
+    because run/policy, where the parent also writes and records them
+    (stage_research_config), is unreadable to the child by design
+    (build_policy): a path there is "--agents file not found" to the CLI
+    (measured 2026-10-13, Claude 2.1.283, before any model call).
     Building it says nothing about what Claude then loads or exposes.
     """
     require_measured_argv(backend)
@@ -1380,7 +1385,9 @@ def build_staged_command(runtime: list[str], policy: Path, cli: str, prompt: str
     head = head[:at] + head[at + 2:]
     extra = ["--settings", str(run_dir / "home/.claude/settings.json")]
     if spec.agents is not None:
-        extra += ["--agents", str(run_dir / "policy/claude-agents.json")]
+        # The same object stage_research_config writes to run/policy/claude-agents.json
+        # (recorded as agents_sha256); inline, since the child cannot read run/policy.
+        extra += ["--agents", json.dumps(spec.agents)]
     if spec.writes_output:
         extra += ["--add-dir", str(run_dir / "output")]
     return [*head, *extra,

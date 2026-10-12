@@ -285,3 +285,109 @@ claude는 PATH에 없고, 모두 `--egress none`. 모델 호출 0, 토큰 0, 비
   staged launch를 더할지는 별도 결정.
 - `output/` 산출물을 결과 묶음에 넣을지(지금은 inner 요약의 `output_files`로만 관찰).
 - 2단계 Codex·3단계 agy(위 0·1단계 절), 분석 번들 M4 자격 변수 표.
+
+## 후속 (b) — staged 실제 측정 (2026-10-13)
+
+PR #23 병합 뒤 `origin/main` `5952d82`에서 새 브랜치 `lee-kyu-hwan/6-staged-measure`. 「후속 (a)」의 「남은 항목」 첫째,
+8.2 계획표의 staged 실측 2회(`corpus-extract`·`deep-research`)를 했다. 모델 호출은 조정자 `ask` 승인 뒤 회차마다 1회,
+사용자 상한 2.5 USD. 1회차가 제품 결함으로 FAIL이어서(아래) 조정자 결정으로 결함을 고친 커밋 `3d345f1`에서 1회차를 다시
+돌렸다(모델 호출 3회, **누적 0.1641218 USD**). `MEASURED_LAUNCHES`에 staged launch를 더하는 것은 이번에 하지 않았다(권고만, 아래).
+
+### 실행 전 기록
+
+| 항목 | 값 |
+|---|---|
+| 게스트 | `oss-research-debian`(Debian 13 aarch64, Lima), srt 0.0.77, node v24.20.0, Claude 2.1.283. 시계 호스트와 동일(offset 0.09 s, 재동기 없음) |
+| 배포 | `git archive 5952d82` → root 소유 `/opt/oss-research/src-5952d82`(새로 배포, `files_not_root 0 group_other_write 0`), 파일 sha256 목록이 커밋의 추적 파일과 같음(`tree-diff.txt` 빔). 재시도용 `src-3d345f1`도 같은 방식·같은 결과 |
+| 하네스 명령 | `bash <src>/share/linux/model_once.sh token <src> /opt/oss-research/srt-0.0.77 /opt/oss-research/node-v24.20.0-linux-arm64/bin pin normal 330 300 staged-corpus\|staged-deep /root/a6b/prompt-<corpus\|deep>.txt < <호스트 자격 파일>`(자격은 셸 리다이렉트만; 호스트는 `stat`만 봤다) |
+| 계약 | `claude-profile2`, `claude-opus-5-5`·medium, inner 300 s, wrapper 330 s, `--egress pin`, `--backend claude`(PR #23) |
+| PROMPT | `prompt-corpus.txt` 2048 B sha256 `0dc4358d5a1650789eaba9f1eeb3d889acfad5a304141db6fe97e83841386803`: 가짜 PR 레코드 3건이 든 자기완결 과제. 메인이 `Agent(corpus-extractor)` 1회 → 서브에이전트가 `task.txt`의 EXTRACTION PROMPT에 JSON으로 답 → 메인이 Write로 `output/extract-01.json` 1개 → 한 줄 답. `prompt-deep.txt` 656 B sha256 `bd58157aa8c32891cf6a3f9bc77cdd5792953775cf3b53dce829642736513baf`: Skill 도구로 `deep-research`를 불러 Node.js Active LTS 버전·EOL 월을 묻는 짧은 질문(`--web-domain` 없음), 도구가 거부·실패하면 한 문장으로 알리고 멈추라고 지시. 둘 다 호스트에서 `checked_input`·`checked_staged_input`을 미리 통과시켰고 게스트 복사본 sha가 같다 |
+| 예산 | 1회차 ≤ 0.3, 2회차 ≤ 2, 재시도 ≤ 0.3 USD(각 회차 `ask`로 승인) |
+
+### 회차별 결과
+
+| 회차 | 트리 | 하네스 | judge(11) | pickup `--staged` | 자식 | 비용(USD) | 관찰 모델 |
+|---|---|---|---|---|---|---|---|
+| 1 `staged-corpus` | `src-5952d82` | `SUMMARY fails=2` | 8 PASS / **3 FAIL**(V1·V3·V4; R1~R5·S1·S2·V5 PASS) | FAIL(`missing: report.md`) | exit 1, 0 s, API 호출 없음 | **0** | 없음 |
+| 2 `staged-deep` | `src-5952d82` | `fails=0` | **11 PASS** | PASS(기본 계약도 PASS) | exit 0, 4.1 s, 2턴, `permission_denials []` | **0.0759696** | `claude-opus-5-5`만, webSearchRequests 0 |
+| 1 재시도 `staged-corpus` | `src-3d345f1` | `fails=0` | **11 PASS** | PASS(기본 계약도 PASS) | exit 0, 9.5 s, 3턴, `permission_denials []` | **0.0881522** | `claude-opus-5-5`만 |
+
+세 회차 모두 자격 scan `clean`, `exact_value_check clean`, pin apply/verify/clear 0, 정리 사실(Z) 전부 PASS, 전후 units 0·procs 0·creds 0,
+`/tmp/osr-m-*` 0. 비용은 CLI 추정(`costBasis list`)이고 청구서가 아니다.
+
+**1회차(FAIL, 제품 결함).** 자식 Claude가 모델 호출 전에 끝났다. `stderr.log`: `Error: --agents file not found:
+/tmp/osr-m-out-9kgY/run/policy/claude-agents.json (a value that is not a JSON object is read as a file path)`. 원인(호스트 오프라인 재현
+`repro-agents-path.py`, 커밋된 worker만으로): `build_policy`는 Linux에서 `run/policy`·`run/result`를 자식에게 읽기 불가로 둔다(`denyRead "/"`,
+`allowRead`에 run 디렉터리 없음, 코드 주석에 의도 명시). 그런데 `build_staged_command`는 corpus-extract에 `--agents <run>/policy/claude-agents.json`
+경로를 넘겼다 → 샌드박스 안 CLI에는 없는 파일. deep-research는 `--agents`가 없고 staged 파일·`settings.json`은 읽기 가능한
+`run/home/.claude` 아래라 영향이 없다. 오프라인 시험은 파일 존재·0400·내용만 봤고 자식의 가독성은 보지 않았다(srt probe
+`StagedBoundaryTests`도 그 경로를 읽지 않는다). staged 기록(S1)·프로필 결속(S2)은 이 실패 run에서도 PASS여서 하네스는 설계대로 동작했다.
+
+**수정(커밋 `3d345f1`, 조정자 결정 ③·소유권 확장).** `build_staged_command`가 `--agents`에 같은 객체를 `json.dumps(spec.agents)` 인라인으로
+넘긴다(CLI 오류문이 말하는 방식). `run/policy`를 자식에게 읽기 불가로 두는 설계, 파일 `run/policy/claude-agents.json`(0400)과
+`agents_sha256` 기록(`stage_research_config`), collect의 `staged-changed: agents file` 검사는 그대로다. deep-research argv는 바뀌지 않았다.
+시험: `ClaudePathUnchangedTests`의 FROZEN `argv_corpus-extract` **`9241254294db549b22407052d4176d3ff546e0da63cdab5a79dd82af9a1e893b` →
+`33e3a977a59a8904bc040992e04a5055d6d4c3a2d5b788da425c542f8296d84f`**(결함 수정이므로 기대값을 바꿨다; 주석에 이전 값과 이유),
+`test_corpus_extract_argv`는 `--agents`를 JSON으로 대조, 새 `test_staged_argv_paths_are_readable_to_the_child`는 두 프로필의 staged argv에서
+Claude에 넘기는 절대 경로 인자가 darwin·linux 두 `build_policy`의 `allowRead`+`allowWrite` 안에 있고 `run/policy`·`run/result` 아래가 아님을
+고정한다(같은 검사를 `5952d82` 코드에 돌리면 `<run>/policy/claude-agents.json` UNREADABLE로 실패, 수정 코드는 통과 — 증거 `retry/`·보고서).
+`docs/oss-research-worker.md`의 `--agents` 설명 두 줄(프로필 표, staging 3항)을 인라인으로 고쳤다(그 밖의 줄은 Codex 2단계 워커 소유).
+
+**2회차(PASS, 그러나 스킬은 호출되지 않았다).** 하네스·판정·회수는 전부 PASS: staged 파일 3개(`skills/deep-research/SKILL.md`
+`a330b11e…`, `workflows/deep-research.js` `4d7392eb…`, `settings.json`)가 pin과 같고 변경 0, `execution_profile deep-research`. 그러나 모델의 답
+(`report.md` 238 B, sha `bd7c1346…`): *The Skill tool failed to load "deep-research" with the error: "Skill deep-research cannot be used with
+Skill tool due to disable-model-invocation. Ask the user to run /deep-research themselves — it cannot be invoked via the Skill tool."* 즉
+Claude 2.1.283은 staged 스킬을 **모델 호출 불가(disable-model-invocation)** 로 취급했고 `Workflow(deep-research)`·`WebSearch`에 이르지 못했다
+(`subagent_stats spawned 0`, webSearchRequests 0, 2턴). WebFetch 거부·300 s 초과 같은 예상 위험은 발생하지 않았다(그 단계 전에 멈췄다).
+X8(계약 §3.2 "staged 로드·자식 경계")의 판정: **로드는 됨(S1), 모델이 Skill 도구로 쓸 수는 없음** → deep-research 프로필은 지금 설계(모델이
+`Skill(deep-research)`를 부름)로는 동작하지 않는다. 원인 후보는 아직 확인하지 않았다(아래 「남은 질문」).
+
+**1회차 재시도(PASS).** `Agent(corpus-extractor)` 1회(`subagent_stats`: spawned 1, completed 1, `by_type {"corpus-extractor": 1}`, 깊이 1),
+`output/extract-01.json` 1개(204 B; `output/`은 묶음에 없어 inner 요약의 `output_files`로만 봤다), 답 `{"written": "extract-01.json"}`(`report.md`
+sha `13b90fbf…`), `permission_denials []`, 모델 전환 0(`modelUsage` opus만 — 서브에이전트도 부모 모델을 썼다), staged 변경 0, `agents_sha256`
+`23e216fe…`. 8.2 계획표의 기대 관찰(init tools·Agent 1회·output 1개·denials 0·staged 변경 0·모델 전환 0)을 init 도구 목록(json 출력에는 없음)만
+빼고 모두 확인했다.
+
+### 증거
+
+`~/.oss-research-vm/logs/a6-staged-20261012T225608Z/`(0700, `SHA256SUMS` 105 entries, `shasum -a 256 -c` 전부 OK). 하위 `corpus/`(1회차),
+`deep/`(2회차), `retry/`(재배포 `src-3d345f1` + `retry/corpus/`). 각 run에 `harness.log`, `record.json`, `result.tar`, `host-judge.txt`,
+`pickup.json`, `pickup-default.json`, `result-summary.txt`, `unpacked/`(PASS run), 전후 게스트 상태. 핵심 sha256: `SHA256SUMS`
+`c17310b1c04a508f7533fe3caa4c7e77e7de552d89ea8a1baefb7745e5d9a58a`, `README.txt` `8c67dd91033d4b94512747b094d03b795958ff5ae83edf5d174b18d014aff964`,
+`corpus/harness.log` `b3f7a817fc8e27d513f46441581fce23eb80ff5493ea86b33dce320f55a32b15`, `deep/harness.log`
+`326eb446d45c455ec9e462fc3a65b3c82cc5a7eea5506a146bc69fa725a0957e`, `retry/corpus/harness.log` `f846f469650b7386d3ad2ce56263a1a10419a6a128d0840df53ac9f0c3ce3ed1`,
+`deep/result.tar` `4a6bd28f85bec31533d4874c1644dcc650d4cf57f8881171a947e5fa715b08f3`, `retry/corpus/result.tar`
+`61287ffe03cecf81c0d650413010a7446e2b447b6f407347f1bc0f66f67e847e`. 게스트 원본(root 전용) `/var/lib/oss-research-evidence/oss-research-5a11bf1e28da130a`·
+`…-e84e8d6d8b2e734b`·`…-54ebc1cad1b68ff0`. 게스트 helper `/root/a6b`는 끝에 지웠고 배포 트리는 선례대로 남겼다. 기존 증거 디렉터리는 건드리지 않았다.
+
+### 로컬 Linux CI
+
+`docs/ci.md` 방식(Docker `python:3.14` linux/arm64, Python 3.14.8, `--network none --cpuset-cpus=0,1`, 비root `runner`), 2026-10-12T23:13Z, 한 번에
+하나만 실행(시작 전 `docker ps` 빔). CI 트리 = 커밋 `3d345f1` + `docs/oss-research-worker.md`의 두 줄 수정; 이 README 절은 CI 뒤에 썼다(시험에
+영향 없는 문서). main `5952d82`(708 OK skip 40 / 번들 OK / 스킬 659 / pycache 0)과 비교해 저장소 시험 **+1**(새 `test_staged_argv_paths_are_readable_to_the_child`).
+
+| 묶음 | Linux | macOS(작성자 호스트) |
+|---|---|---|
+| 저장소 시험 `tests/test_*.py` 21모듈 | **709개 OK (skip 40)**; 모듈별 모두 OK(`worker_skills` 40(+1), `worker_backends` 24, `worker` 43, `worker_staged_harness` 13, `worker_linux` 174, `relay` 57 — 알려진 flake `ConnectionCapTests`는 단독 실행이라 재현되지 않음) | 바뀐 3모듈(`worker_skills`·`worker_backends`·`worker`) 107 OK(skip 2) |
+| 분석 번들 `test_*.py` 12개 + `selftest_*.py` 3개 | 모두 OK(skip: assess 1, assess_contract 1, continue_plan 8, dry_plan 3, model_retry 1, prompt_contract 3, reduce_inputs 1, search_clues 1, stage_inputs 2), selftest failures=0 / 129 cases 0 / 19 cases 0 | 돌리지 않음(미변경) |
+| 스킬 시험 6묶음 | **659개 OK** (researching 162, analyzing 77, verifying 138, recent-closed 162, curated 53, issues 67) | 돌리지 않음(미변경) |
+| `__pycache__` | 0 | 0 |
+
+### 결론과 권고
+
+- **corpus-extract**: 결함 수정 뒤 1회 PASS(판정 11·회수·기대 관찰). `MEASURED_LAUNCHES`에 더할 후보지만 **이번에는 더하지 않는다**. 권고: 더하기 전에
+  (1) 같은 커밋에서 분석 번들이 만든 실제 추출 prompt(≈60 KB, `Agent` 여러 번)로 1회 더 재어 `--max-turns 20`·300 s 안에 끝나는지 보고,
+  (2) `output/` 산출물을 결과 묶음에 넣을지(지금은 inner 요약으로만 관찰) 정한 뒤, (3) staged launch 필드(profile·web_domains·agents sha)를
+  `MEASURED_LAUNCHES` 표에 어떻게 적을지 정한다.
+- **deep-research**: 하네스는 PASS지만 스킬이 모델 호출 불가로 거부돼 **측정 목적(Workflow 로드·자식 경계)은 미달**. `MEASURED_LAUNCHES`에 더하지
+  않는다. 설계(모델이 `Skill(deep-research)`를 부름)가 Claude 2.1.283의 `--print` 자식에서 성립하는지부터 확인해야 한다.
+- 결함의 교훈: argv의 경로 인자는 정책의 읽기 집합과 함께 시험해야 한다(`test_staged_argv_paths_are_readable_to_the_child`). 1단계의 Claude 경로
+  해시 시험은 "불변"을 고정하는 것이라 이런 결함을 잡지 못한다.
+
+### 남은 질문
+
+- `disable-model-invocation`의 출처: SKILL.md 머리말에는 그 필드가 없다. `--restricted`·`--print`·`--setting-sources ""`·`--permission-mode dontAsk`
+  중 무엇이 staged 스킬을 사용자 전용으로 만드는지, 혹은 CLI 2.1.283이 `~/.claude/skills`의 스킬을 기본 사용자 전용으로 보는지 — CLI 문서·
+  옵션 확인이 필요하다(다음 측정 전, 모델 호출 없이 `claude --help`·설정 조사로 가능할 수도 있다).
+- deep-research의 `Workflow` 도구가 `--restricted` 자식에 존재하는지는 아직 관찰되지 않았다(Skill 단계에서 멈춤).
+- 2단계 Codex·3단계 agy(0·1단계 절), 분석 번들 M4 자격 변수 표, `output/` 묶음 포함 여부.
