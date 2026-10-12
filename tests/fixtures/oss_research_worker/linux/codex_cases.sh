@@ -2,7 +2,7 @@
 # #6 2단계 S3: Codex 비AI 사례(게스트, 관리 계정 vmadmin이 실행, 안에서 sudo). 모델 호출·자격 없음.
 #
 #   bash codex_cases.sh install TARBALL     # root가 sha 고정 Codex를 /opt/oss-research/codex-0.162.1/codex 로 설치
-#   bash codex_cases.sh cases COMMIT        # 배포된 src-COMMIT 의 unit_inner.py codex-probe 사례 전부
+#   bash codex_cases.sh cases COMMIT [CASE...]   # 배포된 src-COMMIT 의 unit_inner.py codex-probe 사례(기본 전부)
 #
 # install: TARBALL(호스트가 받은 릴리스 자산 codex-aarch64-unknown-linux-musl.tar.gz)의 sha256이 릴리스
 # digest와 같고, 안의 단일 파일 codex-aarch64-unknown-linux-musl의 sha256이 고정값과 같을 때만 root 소유
@@ -45,10 +45,11 @@ install_codex() {
 }
 
 run_cases() {
-  local c=$1 s=/opt/oss-research/src-$1 o case
+  local c=$1 s=/opt/oss-research/src-$1 o case list
+  shift; list=("$@"); [ ${#list[@]} = 0 ] && list=(version help prompt-input login-status escape ablation doctor)
   local wrap=(sudo env -i PATH=$NODE:$CODEX_DIR:/usr/bin:/bin LANG=C.UTF-8 OSS_RESEARCH_SRT_PREFIX=$PREFIX
               OSS_RESEARCH_EGRESS_RESOLVER=$RESOLVER PYTHONDONTWRITEBYTECODE=1 python3 -I -B $s/bin/oss-research-linux-run)
-  for case in version help prompt-input login-status escape ablation doctor; do
+  for case in "${list[@]}"; do
     o=$(sudo mktemp -d /tmp/osr-c-XXXX); sudo chown ossresearch:ossresearch "$o"
     if [ "$case" = doctor ]; then
       echo "== $case (--egress pin --backend codex)"
@@ -65,6 +66,6 @@ run_cases() {
 
 case "${1:-}" in
   install) install_codex "${2:?tarball}";;
-  cases) run_cases "${2:?commit}";;
+  cases) shift; run_cases "${1:?commit}" "${@:2}";;
   *) echo "usage: codex_cases.sh install TARBALL | cases COMMIT"; exit 2;;
 esac
