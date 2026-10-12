@@ -751,7 +751,7 @@ Linux 게스트 안의 별도 로그인(`.credentials.json`), API key·`apiKeyHe
 - 기록: manifest의 `requested_model`·`requested_effort`는 요청값일 뿐이다. 실제 모델 성공을 뜻하지 않는다. 결과 JSON에 `modelUsage`가 있을 때만 `observed_models`를 따로 남긴다.
 - 값은 사용자가 나중에 준다. 전용 oauth-token 미확인 blocker는 그대로다.
 
-## 백엔드 (#6 1단계: 어댑터 분리, Claude 동작 불변)
+## 백엔드 (#6 1단계: 어댑터 분리, Claude 동작 불변; 2단계: Codex)
 
 실행기가 모델 CLI에 대해 아는 것은 전부 `Backend`(NamedTuple) 하나에 모았다. 이슈
 #6이 세어 둔 Claude 의존 7가지가 그 필드와 백엔드별 분기다.
@@ -760,17 +760,36 @@ Linux 게스트 안의 별도 로그인(`.credentials.json`), API key·`apiKeyHe
 |---|---|---|
 | 실행 인자 | `build_command`·`build_staged_command`(`require_measured_argv`: `claude`만 만든다) | 기존 argv 그대로 |
 | 설정 격리 | `config_variable`·`config_subdir`(`build_environment`) | `CLAUDE_CONFIG_DIR` = `run/home/.claude` |
-| 인증 | `credential_name`·`credential_variable` | `oauth-token`·`CLAUDE_CODE_OAUTH_TOKEN` |
+| 인증 | `credential_name`·`credential_variable`(또는 `credential_file`: Codex), `profiles` | `oauth-token`·`CLAUDE_CODE_OAUTH_TOKEN` |
 | 허용 목적지 | `allowed_domains`·`allowed_domains_linux`(`build_policy`), `pinned_names` | `api.anthropic.com`(Linux `:443`) |
 | 결과 해석 | `result_problems`·`observed_models`(`claude`만 파싱) | result 객체·`modelUsage` |
 | 측정 launch | `MeasuredLaunch.backend`(기본 `claude`), `cli_sha256`(이전 이름 `claude_sha256`) | Linux launch 1건, `backend="claude"` |
 | 판정·회수 | manifest `backend` 키; 게스트 판정기(`share/linux/model_once*`, `unit_inner.py`)는 Claude 측정 하네스로 그대로 둔다. 2026-10-12에 staged 측정 모드(`unit_inner.py model-staged`, `model_once.sh staged-corpus|staged-deep`, 판정 `S1-staged-unchanged`·`S2-profile-requested`, `verify_pickup.py --staged PROFILE`)가 더해졌다(#4 8.2; 측정 자체는 별도 승인) | `"backend": "claude"` |
 
-- `BACKENDS = {claude, codex, agy}`, 기본 `claude`. `codex`·`agy`는 이름과 실행
+- `BACKENDS = {claude, codex, agy}`, 기본 `claude`. `agy`는 이름과 실행
   파일 이름만 있고 나머지 필드는 `None`이다. `None` 필드가 필요한 함수는
   `Backend.require`로 `Blocked`다(환경·정책·argv·결과 파서 모두 fail closed).
-  측정은 2·3단계에서 한다(설치 버전 `--help`, run 전용 설정 홈, 인증 형태, 실제
+  측정은 3단계에서 한다(설치 버전 `--help`, run 전용 설정 홈, 인증 형태, 실제
   접속 대상 실측).
+- Codex(2단계, `docs/development/2026-10-13-6-codex-backend/README.md`): Codex CLI 0.162.1
+  (Linux arm64 릴리스 바이너리, 게스트 `/opt/oss-research/codex-0.162.1/codex`, sha 고정)을
+  **도구 없는 텍스트 모드**로만 띄운다. `codex --disable …(CODEX_DISABLED_FEATURES) exec --json
+  --ephemeral --skip-git-repo-check --ignore-rules --ignore-user-config --sandbox read-only
+  --color never -c …(CODEX_CONFIG) --model M -c model_reasoning_effort="E" -- PROMPT`, 환경
+  `CODEX_EXEC_SERVER_URL=none`(실행 도구 자체가 없음), `CODEX_HOME`=run/`home/.codex`,
+  `SSL_CERT_FILE`(정책은 그 CA 파일 하나만 더 연다), `RUST_LOG`(서버 모델 줄). 실행기 입력은
+  `--backend codex --profile codex-profile1`(프로필·백엔드 짝이 안 맞으면 exit 2), dontAsk만, 모델·effort
+  필수. Linux만(`allowed_domains`(macOS) 없음 → Blocked), 허용 목적지 `chatgpt.com:443`, egress pin
+  `chatgpt.com`. 인증은 ChatGPT 구독 로그인 파일 `<dir>/codex-profile1/auth.json`(0600, 200..65536 B,
+  API key·PAT·agent identity·Bedrock 거부)이고 부모가 run의 `home/.codex/auth.json`(srt denyWrite)에
+  쓰고 run 뒤 바뀌지 않았는지 확인하고 지운다(바뀌면 `credential-file-changed`). run 안에서 토큰 갱신이
+  필요하면(access 만료 또는 last_refresh 8일) 시작 전에 Blocked다(`auth.openai.com`은 열지 않는다).
+  노출 검사는 세 토큰 각각의 정확값을 찾는다. `CODEX_HOME/tmp`는 부모가 만들고 쓰기 금지(Codex의
+  arg0 symlink가 쓰기 영역에 생기지 않게). 결과는 JSONL(`codex_events`: 한 스레드, 완료된 턴 하나,
+  텍스트 item만, 마지막 agent_message가 보고서; WebSocket fallback·Code Mode unavailable 알림은
+  비치명), 관찰 모델은 stderr의 `server reported model X` 줄(없으면 관찰 모델 없음). staged 프로필은
+  Codex에 없다(Blocked). 측정 launch는 `MEASURED_BACKEND_LAUNCHES`에 실제 호출(S4) 통과 뒤 등록한다;
+  그 전에는 Claude launch와 비교돼 첫 필드에서 닫힌다.
 - 게이트: `LaunchRequest.backend`(기본 `claude`)가 `MEASURED_LAUNCHES`의
   `backend`와 다르면 `measured_launch_problems`가 "backend codex is not the
   measured claude"를 내고, Linux에서는 자격 파일 메타데이터도 보기 전에 Blocked다.
@@ -785,7 +804,7 @@ Linux 게스트 안의 별도 로그인(`.credentials.json`), API key·`apiKeyHe
   남아 있고 `CLAUDE`가 그것을 참조한다.
 - egress pin: `bin/oss-research-egress-pin apply … --backend claude|codex|agy|none`
   (기본 `claude`). `api.github.com`에 백엔드의 측정된 모델 endpoint를 더해 해석한다.
-  `codex`·`agy`는 measured 이름이 없어 아무것도 바꾸기 전에 거부(exit 2)하고,
+  `codex`는 `chatgpt.com`(2단계), `agy`는 measured 이름이 없어 아무것도 바꾸기 전에 거부(exit 2)하고,
   `none`은 GitHub만 핀한다. manifest는 `backend` 키를 갖고(schema 1.1.0) `verify`가
   `pins`를 그 백엔드의 이름 집합과 대조한다. unit wrapper는 `--entry worker`의
   인자에서 `--backend`를 읽어 넘기고(`worker_backend`), 비AI entry(`collect`·
@@ -919,7 +938,8 @@ Linux 게스트(Lima/VZ)는 호스트 Mac이 잠자는 동안 **시스템 시계
 | 인증 sentinel 바인딩 | **닫힌 게이트 뒤 최소 준비**. 게이트는 메타데이터만 검사. 게이트 뒤 `load_credential`(1회 읽기)·자식 환경 전달·시작 전 argv/relay 거부·수거 노출 검사가 있고 가짜 sentinel 오프라인 시험만 있다(`test_oss_research_worker_auth.py`) | 없음(sentinel 파일만) | ① 완료(오프라인). ② 가짜 토큰으로 실제 Claude가 명시적 인증 실패를 내는지 실측한다. 모델 도메인 접속이 필요하므로 조정자 승인 후에 한다. ③ 사용자가 발급한 실제 토큰으로 1회 호출하는 것은 사용자 단계다 |
 | auto CLI 선택 | **닫음(측정 종료, 2026-10-11)**. CLI는 `--permission-mode dontAsk`만 받고 `auto`는 입력 거부(exit 2)다. `build_command`의 `PERMISSION_MODES`와 하네스 `model-auto`는 측정 전용으로 남는다 | Linux 3회(2026-09-28 ×2, 2026-10-11): mode 적용은 관찰했지만 모두 refusal·모델 자동 전환으로 끝나 OS 차단 증거가 없다(`2026-09-28-189-linux-model-evidence.md`, #4 기록 `docs/development/2026-10-11-4-isolation-acceptance-remaining/README.md`) | 없음. 다시 열려면 OS 수준 거부 증거가 먼저 필요하다 |
 | Claude 바이너리 기동 | 정책에 필요한 읽기 경로 반영 | `--version`·`--help`만 | 모델 요청 경로의 추가 읽기·네트워크 요구는 인증 단계에서 측정한다 |
-| Codex·agy 백엔드(#6) | **이름만**. `--backend codex|agy`는 게이트에서 exit 3, 어댑터 필드 `None`, egress pin 거부(「백엔드」) | 없음 | 2단계(Codex): `codex exec` 플래그를 설치 버전 `--help`로 확정, run 전용 `CODEX_HOME`, Landlock과 bwrap 중첩 확인, 출력 JSONL 모델 파서, VM 설치(sha 고정), 읽기 집합 ablation, 측정 launch 등록, 실제 호출 1회. 3단계(agy): 같은 절차(0단계 기록은 `docs/development/2026-10-11-6-research-backends/README.md`) |
+| Codex 백엔드(#6 2단계) | 어댑터·하네스 구현, 오프라인 시험, 게스트 비AI 사례(S3, 설치·도구 없는 입력·범위 밖 비노출·읽기 집합·chatgpt.com TLS 도달) | `--backend codex`는 측정 launch가 없어 게이트에서 exit 3 | 실제 호출 S4(OK 1회)·S5(분석 extract 1회) 뒤 `MEASURED_BACKEND_LAUNCHES` 등록(`docs/development/2026-10-13-6-codex-backend/README.md`) |
+| agy 백엔드(#6 3단계) | **이름만**. `--backend agy`는 게이트에서 exit 3, 어댑터 필드 `None`, egress pin 거부(「백엔드」) | 없음 | 2단계(Codex)와 같은 절차(0단계 기록은 `docs/development/2026-10-11-6-research-backends/README.md`) |
 
 ## 검증 상태
 
