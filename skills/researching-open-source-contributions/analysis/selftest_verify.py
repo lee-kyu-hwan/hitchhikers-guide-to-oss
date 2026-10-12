@@ -80,6 +80,13 @@ CASES = {
     "effort missing": (dict(manifest_edit=lambda m: m.pop("requested_effort")), 1, {"M2": "FAIL"}),
     "credential exposed": (dict(manifest_edit=lambda m: m.update(credential={"variable": "CLAUDE_CODE_OAUTH_TOKEN", "exact_value_check": "failed"})), 1, {"M4": "FAIL"}),
     "failed run": (dict(manifest_edit=lambda m: m.update(status="failed", exit_code=4)), 1, {"M1": "FAIL"}),
+    # M4 by backend (#6 stage 2): Claude's form for no backend or claude, Codex's file form for codex only.
+    "claude backend named": (dict(manifest_edit=lambda m: m.update(backend="claude")), 0, {"M4": "PASS"}),
+    "codex credential": (dict(manifest_edit=lambda m: m.update(backend="codex", credential={"file": "home/.codex/auth.json", "exact_value_check": "clean"})), 0, {"M4": "PASS"}),
+    "codex form on a claude manifest": (dict(manifest_edit=lambda m: m.update(credential={"file": "home/.codex/auth.json", "exact_value_check": "clean"})), 1, {"M4": "FAIL"}),
+    "claude form on a codex manifest": (dict(manifest_edit=lambda m: m.update(backend="codex")), 1, {"M4": "FAIL"}),
+    "codex credential exposed": (dict(manifest_edit=lambda m: m.update(backend="codex", credential={"file": "home/.codex/auth.json", "exact_value_check": "failed"})), 1, {"M4": "FAIL"}),
+    "other backend": (dict(manifest_edit=lambda m: m.update(backend="agy", credential={"file": "home/.codex/auth.json", "exact_value_check": "clean"})), 1, {"M4": "FAIL"}),
     "prompt leaks path": (dict(prompt="read /x/.oss-research-credentials/claude-profile2/oauth-token\n"), 1, {"P2": "FAIL"}),
     "not json": (dict(report_text="Here is my answer: {}"), 1, {"R2": "FAIL", "R3": "BLOCKED", "Q1": "BLOCKED"}),
     "reworded quote": (dict(answer={**GOOD_ANSWER, "observations": [{"pr": "npm-eslint-markdown#677", "note": "x", "quote": "Updates editorconfig-checker from 6.1.1 to version 6.2.0"}]}), 1, {"Q1": "FAIL"}),

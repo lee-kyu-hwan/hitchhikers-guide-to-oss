@@ -103,6 +103,9 @@ REPO = HERE.parents[2]
 ANALYZER = REPO / "skills/analyzing-open-source-pr-patterns/scripts"
 CHECK = ANALYZER / "check_extraction.py"
 CREDENTIAL_VARIABLE = "CLAUDE_CODE_OAUTH_TOKEN"
+# A Codex run (manifest backend "codex", #6 stage 2) hands its login to the child as a
+# file the worker writes into the run and removes before the exposure scan.
+CODEX_CREDENTIAL = {"file": "home/.codex/auth.json", "exact_value_check": "clean"}
 # Strings that must never reach the model prompt or come back in the report.
 SECRET_MARKERS = ("oss-research-credentials", "oauth-token", CREDENTIAL_VARIABLE)
 MANIFEST_MAX_BYTES = 1 << 20
@@ -787,8 +790,11 @@ def verify(run_dir: Path, corpus: Path, prompt: Path, limits: dict, kind: str = 
         ok = manifest.get("execution_profile") == worker["execution_profile"] and isinstance(manifest.get("staged"), dict)
         v.add("M3-execution-profile", "PASS" if ok else "FAIL", str(manifest.get("execution_profile")))
     credential = manifest.get("credential")
+    # The credential's form is the backend's; a Claude manifest (no backend key, or claude) keeps its own.
+    clean = CODEX_CREDENTIAL if manifest.get("backend") == "codex" else \
+        {"variable": CREDENTIAL_VARIABLE, "exact_value_check": "clean"}
     v.add("M4-credential-exposure-clean",
-          "PASS" if credential == {"variable": CREDENTIAL_VARIABLE, "exact_value_check": "clean"} else "FAIL",
+          "PASS" if credential == clean else "FAIL",
           json.dumps(credential))
     # M5: which model the result says answered. Strict (live) limits require exactly the requested
     # model; a missing modelUsage is unknown, not success. Only explicit legacy limits keep it INFO.
