@@ -110,19 +110,20 @@ class BackendTableTests(unittest.TestCase):
         self.assertEqual(claude.pinned_names, ("api.anthropic.com",))
         self.assertEqual(claude.profiles, worker.PROFILES)
         # Claude takes its token in a variable, no fixed variable, no extra read.
-        self.assertEqual((claude.credential_file, claude.environment, claude.system_read_linux),
-                         (None, (), ()))
+        self.assertEqual((claude.credential_file, claude.environment, claude.system_read_linux,
+                          claude.config_unwritable), (None, (), (), ()))
         for field in worker.Backend._fields:
-            if field in ("credential_file", "environment", "system_read_linux"):
+            if field in ("credential_file", "environment", "system_read_linux", "config_unwritable"):
                 continue
             self.assertIsNotNone(getattr(claude, field), field)
             self.assertEqual(claude.require(field), getattr(claude, field))
 
     def test_unmeasured_backends_have_only_a_name_and_an_executable(self):
         for backend in (worker.AGY,):
-            self.assertEqual((backend.environment, backend.system_read_linux), ((), ()))
+            self.assertEqual((backend.environment, backend.system_read_linux, backend.config_unwritable),
+                             ((), (), ()))
             for field in worker.Backend._fields:
-                if field in ("name", "executable", "environment", "system_read_linux"):
+                if field in ("name", "executable", "environment", "system_read_linux", "config_unwritable"):
                     continue
                 with self.subTest(backend=backend.name, field=field):
                     self.assertIsNone(getattr(backend, field))

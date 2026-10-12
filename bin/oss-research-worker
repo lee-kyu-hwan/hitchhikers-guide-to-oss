@@ -238,6 +238,7 @@ class Backend(NamedTuple):
     credential_file: str | None = None           # run/<config_subdir>/<credential_file>
     environment: tuple[tuple[str, str], ...] = ()  # fixed child variables
     system_read_linux: tuple[str, ...] = ()      # read paths beyond SYSTEM_READ_LINUX
+    config_unwritable: tuple[str, ...] = ()      # dirs under the config home: made, never written
 
     def require(self, field: str):
         value = getattr(self, field)
@@ -264,7 +265,12 @@ CLAUDE = Backend(
 # CODEX_EXEC_SERVER_URL=none it has no execution environment, so no shell,
 # apply_patch, view_image or request_permissions tool exists, and its own
 # bubblewrap sandbox never starts inside srt's. RUST_LOG adds the session's
-# "server reported model" line to stderr (observed_models).
+# "server reported model" line to stderr (observed_models). Codex puts helper
+# symlinks to itself under <CODEX_HOME>/tmp/arg0 at every start (apply_patch,
+# codex-linux-sandbox, ...); a symlink in a writable area fails the run
+# (area_problems), so tmp is made by the parent and unwritable to the child:
+# Codex then warns and goes on without them (arg0/src/lib.rs; measured in the
+# guest, docs/development/2026-10-13-6-codex-backend).
 CODEX_PROFILES = ("codex-profile1",)
 CODEX_CREDENTIAL_NAME = "auth.json"
 CODEX_CA_FILE = "/etc/ssl/certs/ca-certificates.crt"
@@ -277,7 +283,7 @@ CODEX = Backend(
     credential_file=CODEX_CREDENTIAL_NAME,
     environment=(("CODEX_EXEC_SERVER_URL", "none"), ("SSL_CERT_FILE", CODEX_CA_FILE),
                  ("RUST_LOG", "error,opentelemetry_sdk=off,opentelemetry_otlp=off,codex_core::session=info")),
-    system_read_linux=(CODEX_CA_FILE,))
+    system_read_linux=(CODEX_CA_FILE,), config_unwritable=("tmp",))
 # agy: named so --backend takes it, nothing measured (issue #6 stage 3).
 AGY = Backend("agy", "agy", None, None, None, None, None, None, None)
 BACKENDS = {backend.name: backend for backend in (CLAUDE, CODEX, AGY)}
@@ -1347,6 +1353,8 @@ def build_policy(input_dir: Path, run_dir: Path, cli: Path,
     domains = list(backend.require("allowed_domains_linux" if platform == "linux"
                                    else "allowed_domains")) if model else []
     deny_write = [str(run_dir / "policy"), str(run_dir / "result")]
+    deny_write += [str(run_dir / backend.require("config_subdir") / name)
+                   for name in backend.config_unwritable]
     if model and backend.credential_file is not None:
         # The parent's copy of the login: readable, never rewritten by the child.
         deny_write.append(str(run_dir / backend.require("config_subdir") / backend.credential_file))
@@ -1668,7 +1676,10 @@ def prepare_run(run_dir: Path, policy: dict, backend: Backend = CLAUDE) -> Path:
     run_dir.mkdir(mode=0o700)
     for name in (*WRITABLE_AREAS, "policy", "result"):
         (run_dir / name).mkdir(mode=0o700)
-    (run_dir / (backend.config_subdir or CLAUDE.config_subdir)).mkdir(mode=0o700)
+    config = run_dir / (backend.config_subdir or CLAUDE.config_subdir)
+    config.mkdir(mode=0o700)
+    for name in backend.config_unwritable:
+        (config / name).mkdir(mode=0o700)
     policy_file = run_dir / "policy/srt-settings.json"
     policy_file.write_text(json.dumps(policy, indent=2), encoding="utf-8")
     policy_file.chmod(0o400)

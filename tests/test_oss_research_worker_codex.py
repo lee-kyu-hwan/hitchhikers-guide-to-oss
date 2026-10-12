@@ -134,6 +134,8 @@ class CodexAdapterTests(unittest.TestCase):
             "SSL_CERT_FILE": "/etc/ssl/certs/ca-certificates.crt",
             "RUST_LOG": "error,opentelemetry_sdk=off,opentelemetry_otlp=off,codex_core::session=info"})
         self.assertEqual(codex.system_read_linux, ("/etc/ssl/certs/ca-certificates.crt",))
+        self.assertEqual(codex.config_unwritable, ("tmp",))
+        self.assertEqual((worker.CLAUDE.config_unwritable, worker.AGY.config_unwritable), ((), ()))
         self.assertEqual(worker.ALL_PROFILES, ("claude-profile1", "claude-profile2", "codex-profile1"))
 
     def test_argv_is_the_tool_less_exec(self):
@@ -210,7 +212,8 @@ class CodexAdapterTests(unittest.TestCase):
         self.assertEqual(policy["network"]["allowedDomains"], ["chatgpt.com:443"])
         self.assertEqual(relay["network"]["allowedDomains"], ["chatgpt.com:443", "127.0.0.1:4321"])
         self.assertEqual(policy["filesystem"]["denyWrite"],
-                         ["/run/policy", "/run/result", "/run/home/.codex/auth.json"])
+                         ["/run/policy", "/run/result", "/run/home/.codex/tmp",
+                          "/run/home/.codex/auth.json"])
         read = policy["filesystem"]["allowRead"]
         self.assertEqual(read, [*worker.SYSTEM_READ_LINUX, "/etc/ssl/certs/ca-certificates.crt",
                                 "/input", "/opt/codex"])
@@ -221,7 +224,8 @@ class CodexAdapterTests(unittest.TestCase):
                          claude["network"]["deniedResolvedAddresses"])
         # The non-AI probe policy (model=False) opens no endpoint and protects no login.
         self.assertEqual(probe["network"]["allowedDomains"], [])
-        self.assertEqual(probe["filesystem"]["denyWrite"], ["/run/policy", "/run/result"])
+        self.assertEqual(probe["filesystem"]["denyWrite"],
+                         ["/run/policy", "/run/result", "/run/home/.codex/tmp"])
         with self.assertRaisesRegex(worker.Blocked, "no measured allowed domains"):
             worker.build_policy(Path("/input"), Path("/run"), Path("/opt/codex"), None,
                                 platform="darwin", backend=worker.CODEX)
@@ -457,6 +461,9 @@ class CodexRunTests(Fixture):
         self.assertNotIn("CODEX_API_KEY", seen["env"])
         self.assertEqual(seen["argv"][-1], "Reply with exactly OK")
         self.assertFalse((self.run_dir / "home/.codex/auth.json").exists())
+        self.assertTrue((self.run_dir / "home/.codex/tmp").is_dir())  # made by the parent
+        self.assertIn(str(self.run_dir / "home/.codex/tmp"),
+                      json.loads((self.run_dir / "policy/srt-settings.json").read_text())["filesystem"]["denyWrite"])
         self.assertEqual(manifest["backend"], "codex")
         self.assertEqual(manifest["credential"], {"file": "home/.codex/auth.json",
                                                   "exact_value_check": "clean"})

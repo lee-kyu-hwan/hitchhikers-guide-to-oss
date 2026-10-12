@@ -899,15 +899,24 @@ def codex_probe(out: Path, case: str) -> int:
     elif case == "login-status":
         result["run"] = codex_run(runtime, codex, work, case, [codex, "login", "status"], False)
     elif case == "escape":
-        script = ("for p in " + " ".join(CODEX_OUTSIDE) + "; do "
-                  "if (exec <\"$p\") 2>/dev/null; then echo \"READ $p\"; "
-                  "elif [ -n \"$(compgen -G \"$p/*\" | head -c 1)\" ]; then echo \"LISTED $p\"; "
-                  "else echo \"DENIED $p\"; fi; done; "
+        # bash builtins only (no other binary is readable): a file is READ when it
+        # opens; a directory is LISTED with the names it shows (an empty mount
+        # point the sandbox made for an allowed path below it shows nothing, or
+        # only that path's own top name), ABSENT when it does not exist.
+        script = ("shopt -s dotglob nullglob; for p in " + " ".join(CODEX_OUTSIDE) + "; do "
+                  "if [ -d \"$p\" ]; then n=( \"$p\"/* ); echo \"DIR $p ${#n[@]} ${n[*]}\"; "
+                  "elif (exec <\"$p\") 2>/dev/null; then echo \"READ $p\"; "
+                  "elif [ -e \"$p\" ]; then echo \"DENIED $p\"; "
+                  "else echo \"ABSENT $p\"; fi; done; "
                   "(exec <\"$SSL_CERT_FILE\") 2>/dev/null && echo \"READ-CA ok\" || echo \"READ-CA denied\"")
-        run = codex_run(runtime, codex, work, case, ["/usr/bin/bash", "-c", script], False)
-        lines = run["stdout_head"].splitlines()
-        run["outside_readable"] = [line for line in lines if line.startswith(("READ /", "LISTED"))]
-        run["outside_denied"] = sum(line.startswith("DENIED") for line in lines)
+        run = codex_run(runtime, codex, work, case, ["/usr/bin/bash", "-c", script], False,
+                        facts=lambda text: text.splitlines())
+        lines = run.pop("facts")
+        run["lines"] = lines[:40]
+        run["outside_readable"] = [line for line in lines if line.startswith("READ /")]
+        run["outside_listed"] = [line for line in lines if line.startswith("DIR ") and line.split()[2] != "0"]
+        run["outside_denied"] = sum(line.startswith(("DENIED", "ABSENT")) or
+                                    (line.startswith("DIR ") and line.split()[2] == "0") for line in lines)
         run["ca_readable"] = "READ-CA ok" in lines
         result["run"] = run
     elif case == "doctor":
