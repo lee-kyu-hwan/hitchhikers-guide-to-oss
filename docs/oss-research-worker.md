@@ -764,7 +764,7 @@ Linux 게스트 안의 별도 로그인(`.credentials.json`), API key·`apiKeyHe
 | 허용 목적지 | `allowed_domains`·`allowed_domains_linux`(`build_policy`), `pinned_names` | `api.anthropic.com`(Linux `:443`) |
 | 결과 해석 | `result_problems`·`observed_models`(`claude`만 파싱) | result 객체·`modelUsage` |
 | 측정 launch | `MeasuredLaunch.backend`(기본 `claude`), `cli_sha256`(이전 이름 `claude_sha256`) | Linux launch 1건, `backend="claude"` |
-| 판정·회수 | manifest `backend` 키; 게스트 판정기(`share/linux/model_once*`, `unit_inner.py`)는 Claude 측정 하네스로 그대로 둔다 | `"backend": "claude"` |
+| 판정·회수 | manifest `backend` 키; 게스트 판정기(`share/linux/model_once*`, `unit_inner.py`)는 Claude 측정 하네스로 그대로 둔다. 2026-10-12에 staged 측정 모드(`unit_inner.py model-staged`, `model_once.sh staged-corpus|staged-deep`, 판정 `S1-staged-unchanged`·`S2-profile-requested`, `verify_pickup.py --staged PROFILE`)가 더해졌다(#4 8.2; 측정 자체는 별도 승인) | `"backend": "claude"` |
 
 - `BACKENDS = {claude, codex, agy}`, 기본 `claude`. `codex`·`agy`는 이름과 실행
   파일 이름만 있고 나머지 필드는 `None`이다. `None` 필드가 필요한 함수는
@@ -789,9 +789,15 @@ Linux 게스트 안의 별도 로그인(`.credentials.json`), API key·`apiKeyHe
   `none`은 GitHub만 핀한다. manifest는 `backend` 키를 갖고(schema 1.1.0) `verify`가
   `pins`를 그 백엔드의 이름 집합과 대조한다. unit wrapper는 `--entry worker`의
   인자에서 `--backend`를 읽어 넘기고(`worker_backend`), 비AI entry(`collect`·
-  `collect-issues`·`candidate-reads`·`verify`)는 `none`으로 핀한다. 즉 비AI run은
+  `collect-issues`·`candidate-reads`)는 `none`으로 핀한다. 즉 비AI run은
   이제 `api.anthropic.com`을 열지 않는다(이전에는 고정으로 열렸다; 그 run들의
   srt 정책은 원래 `model=False`라 모델 endpoint를 허용하지 않았다).
+  `--entry verify`(검증 entry)는 비AI probe와 측정 하네스(`model-once`·`model-auto`·
+  `model-staged`)를 다 돌리므로 wrapper 자신의 `--backend claude|codex|agy|none`
+  (기본 `none`, 이 entry 전용; 다른 entry에 주면 exit 2)으로 핀 이름을 정한다.
+  PR #21은 verify entry를 항상 `none`으로 두어 pin 모드의 하네스 모델 child가
+  endpoint를 열 수 없었다(회귀). 2026-10-12에 이 옵션으로 고쳤고 `model_once.sh`의
+  모델 모드가 `--backend claude`를 준다.
 - 기록: `docs/development/2026-10-11-6-research-backends/README.md`(0단계 agy 조사,
   1단계 해시·시험 수치).
 
@@ -909,7 +915,7 @@ Linux 게스트(Lima/VZ)는 호스트 Mac이 잠자는 동안 **시스템 시계
 
 | 기능 | 코드 상태 | live 증거 | 독립 구현 계획(제안) |
 |---|---|---|---|
-| 스킬·Agent(deep-research) | **닫힌 게이트 뒤 구성기**. `read-only`는 그대로다. `corpus-extract`·`deep-research` 프로필이 도구 표면, 검토된 원본 staging(hash pin, manifest), staged 경로 `denyWrite`, 수거 때 변경 검사를 만든다(「조사 스킬 실행 구성」) | 없음. staged 변경 거부는 실제 srt 비AI probe만 | ① 도구 목록 확정(계약 문서). ② 구성기 완료(오프라인 + srt probe). ③ live에서 staged 로드·자식 경계(계약 §3.2, R1~R5)를 판정한다. ④ WebFetch 도메인과 relay 후보는 사용자·조정자 결정이다 |
+| 스킬·Agent(deep-research) | **닫힌 게이트 뒤 구성기**. `read-only`는 그대로다. `corpus-extract`·`deep-research` 프로필이 도구 표면, 검토된 원본 staging(hash pin, manifest), staged 경로 `denyWrite`, 수거 때 변경 검사를 만든다(「조사 스킬 실행 구성」). 측정 하네스(`model_once.sh staged-corpus|staged-deep` → `unit_inner.py model-staged`, 판정 S1/S2, `verify_pickup.py --staged`)는 2026-10-12에 준비됐고 오프라인 시험으로 고정돼 있다(`test_oss_research_worker_staged_harness.py`) | 없음. staged 변경 거부는 실제 srt 비AI probe만. 하네스의 실제 측정(각 프로필 1회)은 별도 Dispatch·예산 승인 | ① 도구 목록 확정(계약 문서). ② 구성기 완료(오프라인 + srt probe). ③ live에서 staged 로드·자식 경계(계약 §3.2, R1~R5)를 판정한다(하네스 준비됨). ④ WebFetch 도메인과 relay 후보는 사용자·조정자 결정이다 |
 | 인증 sentinel 바인딩 | **닫힌 게이트 뒤 최소 준비**. 게이트는 메타데이터만 검사. 게이트 뒤 `load_credential`(1회 읽기)·자식 환경 전달·시작 전 argv/relay 거부·수거 노출 검사가 있고 가짜 sentinel 오프라인 시험만 있다(`test_oss_research_worker_auth.py`) | 없음(sentinel 파일만) | ① 완료(오프라인). ② 가짜 토큰으로 실제 Claude가 명시적 인증 실패를 내는지 실측한다. 모델 도메인 접속이 필요하므로 조정자 승인 후에 한다. ③ 사용자가 발급한 실제 토큰으로 1회 호출하는 것은 사용자 단계다 |
 | auto CLI 선택 | **닫음(측정 종료, 2026-10-11)**. CLI는 `--permission-mode dontAsk`만 받고 `auto`는 입력 거부(exit 2)다. `build_command`의 `PERMISSION_MODES`와 하네스 `model-auto`는 측정 전용으로 남는다 | Linux 3회(2026-09-28 ×2, 2026-10-11): mode 적용은 관찰했지만 모두 refusal·모델 자동 전환으로 끝나 OS 차단 증거가 없다(`2026-09-28-189-linux-model-evidence.md`, #4 기록 `docs/development/2026-10-11-4-isolation-acceptance-remaining/README.md`) | 없음. 다시 열려면 OS 수준 거부 증거가 먼저 필요하다 |
 | Claude 바이너리 기동 | 정책에 필요한 읽기 경로 반영 | `--version`·`--help`만 | 모델 요청 경로의 추가 읽기·네트워크 요구는 인증 단계에서 측정한다 |
@@ -947,7 +953,7 @@ Linux 게스트(Lima/VZ)는 호스트 Mac이 잠자는 동안 **시스템 시계
 | unit wrapper의 시계 검사 | PASS (오프라인 + 게스트 실측) | 시스템 시계를 과거로 돌리고 wrapper를 실행하면 재동기되고(record `resynced`), 재설정 프로그램을 쓸 수 없게 한 반례와 오차 과대에서는 Blocked로 아무것도 시작하지 않는다. 실행 도중의 호스트 잠자기는 막지 못한다(위 「시계 검사」). `2026-10-02-189-isolation-acceptance-matrix.md` 13절 |
 | 후보 verifier 읽기 entry(`candidate-reads`) | PASS (mock) / 실제 조회 미검증 | 호스트 offline 22건, 게스트 사례(`--egress none`, loopback mock): discover complete·partial, locus-search, 읽기 집합 항목 누락·verifier 누락·어댑터 의존 누락, 대상 route 없음, 무응답, 쓰기 메서드 거부, proxy 없는 직접 접속, 부모 EOF, 인자·입력 거부(relay 전), unit 밖 Blocked. 실제 GitHub 조회·익명 `/search/code`·모델과의 연결은 미검증. `docs/research/2026-10-02-189-isolation-acceptance-matrix.md` |
 | 문서 위주 수집 보완(#192 후속: `--docs-only`, `is:unmerged`, cap, 0건 회수, `credential_scope`, quota 헤더) | PASS (오프라인 + 게스트 mock 실측) / 실제 조회는 하지 않음 | 시험 먼저: 새 시험이 구현 전 실패(collector 시험 162건 중 failures 2·errors 40, relay·어댑터·entry·pickup 새 시험도 각각 구현 전 실패)한 뒤 통과. 호스트 offline(17개 모듈) **Ran 593 OK, skipped 39**(기준 556), collector 스킬 시험 PR 162·이슈 67 OK(기준 143·67). 게스트(`src-8972cd0`) `ossresearch` 묶음 **Ran 542 OK, skipped 11**, root `RealUnitWrapperTests` Ran 5 OK. 게스트 사례 `collect_docs_cases.sh`(`--egress none`, loopback mock): docs-only title/label(4건 중 1건 통과), cap 5(6건 중 5건), `is:unmerged`(검색에 부정 토큰 없음), 빈 검색(complete·records 0), quota(33/33 요청에 rate_limit), 닫힌 이슈(`state: closed`), cap 15 + 예산 70, 인자 거부 4건(cap 6, docs-only body, 이슈 예산 91, open+closed 날짜). 8개 산출물 모두 호스트 strict pickup rc 0(빈 검색 포함). sentinel `github_token_cases.sh` T1~T7·A·P·R·K·B `SUMMARY fails=0`, 값 0회. 증거 `~/.oss-research-vm/logs/a192-collect-docs-20261003T104109Z/` |
-| 스킬·서브에이전트 호환성 | 미검증 | 구성기만 있다. Claude가 staged 스킬·워크플로를 로드해 실행하는지, 자식 경계는 live 필요 |
+| 스킬·서브에이전트 호환성 | 미검증 | 구성기만 있다. Claude가 staged 스킬·워크플로를 로드해 실행하는지, 자식 경계는 live 필요. 측정 하네스(`model_once.sh staged-corpus|staged-deep` → `unit_inner.py model-staged`)는 2026-10-12에 준비돼 오프라인 시험으로 고정됐고, 측정(각 프로필 1회, pin)은 별도 Dispatch·예산 승인이다 |
 | auto 모드 | **FAIL(1회 관찰) / OS gate INSUFFICIENT** | Linux 1회(관찰용 stream-json). init `permissionMode=auto`는 관찰했다. CLI가 refusal(cyber) 뒤 세션 전체를 `claude-opus-4-8`로 자동 전환했다(A-V4 FAIL). decoy 시도는 모두 Claude `--restricted` 층이 거부해 OS 증거가 없다(SKIP). 같은 문서 4절 |
 
 ## 남은 실제 시험 게이트
@@ -990,7 +996,10 @@ Linux 게스트(Lima/VZ)는 호스트 Mac이 잠자는 동안 **시스템 시계
    목표가 아니다.
 5. **스킬·Agent 호환성**: deep-research가 요구하는 도구 표면을 격리 안에서 실제로
    수행한다. 도구를 꺼서 성공 판정하지 않는다. (위 4의 결정이 여기에도 적용된다:
-   relay 조회는 모델 child의 도구 표면에 없다.)
+   relay 조회는 모델 child의 도구 표면에 없다.) 측정 하네스는 준비돼 있다
+   (2026-10-12, #4 8.2: `model_once.sh staged-corpus|staged-deep`, 판정 S1/S2,
+   `verify_pickup.py --staged`). 측정 자체(각 프로필 1회, `--egress pin`)는 별도
+   Dispatch이며 모델 비용 승인이 먼저다.
 6. **auto**: **닫음(측정 종료, 2026-10-11, #4 항목 1)**. Linux 세 번(2026-09-28 ×2,
    2026-10-11)의 measurement에서 CLI는 refusal 뒤 세션을 다른 모델로 전환하거나 도구를
    시도하지 않아 OS 수준 거부 증거가 나오지 않았다. 그래서 `--permission-mode auto`는

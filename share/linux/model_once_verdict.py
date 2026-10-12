@@ -18,6 +18,13 @@ judge reads the wrapper record. A missing or malformed record or unit name is
 a FAIL, never a skip. For KIND token the inner summary and V1-V5 are all
 required (no NA). For sentinel an absent summary (a stopped run) is NA and
 the cleanup facts decide. judge, cleanup and evidence read data only.
+judge takes the model-once summary and the model-staged one (unit_inner.py
+model-staged, a staged profile corpus-extract or deep-research). A staged
+run has no fixed answer, so instead of V2 it is judged on S1-staged-unchanged
+(the staging record names the profile's files with their pins and collect's
+staged check found nothing changed or added) and S2-profile-requested (the
+profile the run was asked for is a staged one and is the one the manifest and
+the staging record name). R1-R5, V1 and V3-V5 are the same for both.
 facts runs systemctl, nft and ps read-only and checks each exit and output
 shape: a tool that fails or says something unexpected is a measurement error,
 which cleanup fails, never a clean zero.
@@ -66,6 +73,9 @@ CLEANUP_FACTS = {"credential_dir_exists": False, "unit_load_state": "not-found",
                  "pin_manifest_exists": False, "work_dir_exists": False,
                  "reaper_timer_gone": True, "reaper_service_gone": True,
                  "credential_top_entries": 0, "measurement_errors": []}
+# The staged profiles the harness may measure (the product's STAGED_PROFILES).
+STAGED_PROFILES = ("corpus-extract", "deep-research")
+SHA256 = re.compile(r"[0-9a-f]{64}")
 # What a result bundle must hold for a token run (the names the worker writes).
 TOKEN_RESULT_FILES = {"manifest.json", "report.md", "stdout.json"}
 # The auto run's stdout is a stream, so the product writes no report.
@@ -142,7 +152,8 @@ def judge(text: str, kind: str) -> list[tuple[str, str]]:
         inner = json.loads(str(record.get("stdout", "")).strip().splitlines()[-1])
     except (IndexError, ValueError):
         inner = None
-    present = isinstance(inner, dict) and inner.get("mode") == "model-once" \
+    mode = inner.get("mode") if isinstance(inner, dict) else None
+    present = isinstance(inner, dict) and mode in ("model-once", "model-staged") \
         and inner.get("manifest_written") is True
     if not present and kind != "token":
         # A sentinel run stopped by a timeout or a signal prints no summary; only
@@ -161,7 +172,21 @@ def judge(text: str, kind: str) -> list[tuple[str, str]]:
     check("V1-manifest-succeeded", inner.get("status") == "succeeded" and inner.get("succeeded") is True
           and record.get("exit_code") == 0 and record.get("failures") == []
           and inner.get("failures") == [] and inner.get("problems") == [])
-    check("V2-fixed-answer-OK", str(inner.get("report_text", "")).strip() == "OK")
+    if mode == "model-staged":
+        staged = inner.get("staged")
+        files = staged.get("files") if isinstance(staged, dict) else None
+        requested = inner.get("requested_profile")
+        check("S1-staged-unchanged", isinstance(files, list) and files != []
+              and all(isinstance(entry, dict) and isinstance(entry.get("staged"), str)
+                      and isinstance(entry.get("sha256"), str) and SHA256.fullmatch(entry["sha256"])
+                      for entry in files)
+              and "settings.json" in {entry["staged"] for entry in files}
+              and inner.get("staged_changed") == [])
+        check("S2-profile-requested", requested in STAGED_PROFILES
+              and inner.get("execution_profile") == requested
+              and isinstance(staged, dict) and staged.get("profile") == requested)
+    else:
+        check("V2-fixed-answer-OK", str(inner.get("report_text", "")).strip() == "OK")
     check("V3-no-permission-denials", meta.get("type") == "result" and meta.get("subtype") == "success"
           and meta.get("is_error") is False and meta.get("permission_denials") == 0)
     check("V4-requested-model-observed", isinstance(observed, list) and observed != []

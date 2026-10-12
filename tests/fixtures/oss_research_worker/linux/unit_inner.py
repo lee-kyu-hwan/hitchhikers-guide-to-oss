@@ -6,6 +6,8 @@
     unit_inner.py egress OUT_DIR CA_PEM   # the pinned model name through srt (fixture TLS)
     unit_inner.py model-once OUT_DIR CREDENTIAL MODEL EFFORT SECONDS   # one model run
     unit_inner.py model-auto OUT_DIR CREDENTIAL MODEL EFFORT SECONDS CONTROL DECOY_CRED DECOY_HOME
+    unit_inner.py model-staged OUT_DIR PROFILE CREDENTIAL MODEL EFFORT SECONDS PROMPT
+                                    # one model run with a staged profile (corpus-extract | deep-research)
     unit_inner.py collect OUT_DIR   # the production collection entry with a local mock upstream
     unit_inner.py collect-case OUT_DIR CASE [TOKEN_FILE]   # the same with one counterexample (COLLECT_CASES)
     unit_inner.py unit-check OUT_DIR   # the worker's unit_problems() inside the real unit
@@ -622,23 +624,111 @@ def model_once(out: Path, credential_file: Path, model: str, effort: str, second
                                     MODEL_ONCE_PROFILE, seconds, None, dict(os.environ),
                                     "dontAsk", credential, None, selection)
     manifest, summary = manifest_summary("model-once", succeeded, run_dir)
-    stdout_file = run_dir / "result/stdout.json"
-    if stdout_file.exists():
-        # collect writes stdout.json only after the exact-value checks passed.
-        try:
-            result = json.loads(stdout_file.read_text())
-        except ValueError:
-            result = None
-        if isinstance(result, dict):
-            denials = result.get("permission_denials")
-            usage = result.get("modelUsage")
-            summary["result_meta"] = {
-                "type": result.get("type"), "subtype": result.get("subtype"),
-                "is_error": result.get("is_error"), "num_turns": result.get("num_turns"),
-                "permission_denials": len(denials) if isinstance(denials, list) else None,
-                "model_usage_keys": sorted(usage) if isinstance(usage, dict) else None}
+    summary.update(result_meta(run_dir))
     if succeeded:
         # collect wrote report.md only after the exact-value checks passed.
+        summary["report_text"] = (run_dir / "result/report.md").read_text()[:200]
+    print(json.dumps(summary))
+    return 0 if succeeded else 1
+
+
+def result_meta(run_dir: Path) -> dict:
+    """{"result_meta": ...} from result/stdout.json (fields only, never the text), or {}."""
+    stdout_file = run_dir / "result/stdout.json"
+    if not stdout_file.exists():
+        return {}
+    # collect writes stdout.json only after the exact-value checks passed.
+    try:
+        result = json.loads(stdout_file.read_text())
+    except ValueError:
+        return {}
+    if not isinstance(result, dict):
+        return {}
+    denials = result.get("permission_denials")
+    usage = result.get("modelUsage")
+    return {"result_meta": {
+        "type": result.get("type"), "subtype": result.get("subtype"),
+        "is_error": result.get("is_error"), "num_turns": result.get("num_turns"),
+        "permission_denials": len(denials) if isinstance(denials, list) else None,
+        "model_usage_keys": sorted(usage) if isinstance(usage, dict) else None}}
+
+
+# model-staged: at most this many output/ entries are named in the summary (names and sizes only).
+OUTPUT_LISTING_LIMIT = 50
+
+
+def output_listing(output: Path):
+    """What the child left under run/output: relative names and sizes (never content),
+    sorted, at most OUTPUT_LISTING_LIMIT entries; None when the area is absent."""
+    if output.is_symlink() or not output.is_dir():
+        return None
+    entries = []
+    for current, directories, files in os.walk(output):
+        for name in sorted(files):
+            path = Path(current) / name
+            entries.append({"path": path.relative_to(output).as_posix(),
+                            "bytes": path.lstat().st_size if not path.is_symlink() else None})
+    entries.sort(key=lambda entry: entry["path"])
+    return {"count": len(entries), "files": entries[:OUTPUT_LISTING_LIMIT]}
+
+
+def model_staged(out: Path, profile: str, credential_file: Path, model: str, effort: str,
+                 seconds: float, prompt_file: Path) -> int:
+    """model_once's path with a staged execution profile (corpus-extract or
+    deep-research), as a measurement (#4 item 2, 8.2).
+
+    The same contract and preconditions as model_once, in the same order, then
+    run_research with staged set: the parent stages the reviewed sources of the
+    profile into run/home/.claude (pins checked), writes the settings and agents
+    files and checks them unchanged at collect. No web domain is given, so
+    deep-research gets no WebFetch rule. The prompt comes from PROMPT (a regular
+    file the harness checked and copied for this run) and is copied once more
+    into the run's own input/task.txt. The product main stays closed: staged
+    launches are not in MEASURED_LAUNCHES and this run is what would measure
+    them. Only manifest fields, the staged record, the output/ listing and the
+    result's fields are printed, never the model's text.
+    """
+    if profile not in worker.STAGED_PROFILES:
+        print(json.dumps({"mode": "model-staged", "refused": "profile outside the measurement contract",
+                          "profiles": sorted(worker.STAGED_PROFILES)}))
+        return worker.EXIT_BAD_INPUT
+    if prompt_file.is_symlink() or not prompt_file.is_file() \
+            or not 0 < prompt_file.stat().st_size <= worker.MAX_PROMPT_BYTES:
+        print(json.dumps({"mode": "model-staged",
+                          "refused": "prompt is not a regular file within the size bound"}))
+        return worker.EXIT_BAD_INPUT
+    launch = measured_launch("model-staged", model, effort, seconds)
+    if isinstance(launch, int):
+        return launch
+    runtime, claude = launch
+    # The reviewed source checkout this worker runs from (skills/ beside bin/): the
+    # guest's /opt/oss-research/src-<commit> is a whole git archive. Blocked otherwise.
+    staged = worker.StagedRun(profile, worker.reviewed_source_root(Path(worker.__file__)), ()).check()
+    inputs = out / "input"
+    inputs.mkdir(mode=0o700)
+    (inputs / "task.txt").write_bytes(prompt_file.read_bytes())
+    input_dir, prompt = worker.checked_input(inputs, inputs / "task.txt", Path.home())
+    worker.checked_staged_input(input_dir)
+    run_dir = worker.checked_run_dir(out / "run", input_dir)
+    selection = worker.Selection(model, effort).check()
+    worker.checked_credential(MODEL_ONCE_PROFILE, credential_file, input_dir, run_dir)
+    credential = worker.load_credential(MODEL_ONCE_PROFILE, credential_file, input_dir, run_dir)
+    succeeded = worker.run_research(runtime, claude, prompt, input_dir, run_dir,
+                                    MODEL_ONCE_PROFILE, seconds, None, dict(os.environ),
+                                    "dontAsk", credential, staged, selection)
+    manifest, summary = manifest_summary("model-staged", succeeded, run_dir)
+    summary["requested_profile"] = profile
+    if manifest is not None:
+        summary["execution_profile"] = manifest.get("execution_profile")
+        summary["staged"] = manifest.get("staged")   # the staging record (profile, files, pins)
+        problems = manifest.get("problems")
+        # collect's staged check: every staged file unchanged, nothing added (staged_problems).
+        summary["staged_changed"] = [item for item in problems
+                                     if isinstance(item, str) and item.startswith("staged-changed")] \
+            if isinstance(problems, list) else None
+    summary["output_files"] = output_listing(run_dir / "output")
+    summary.update(result_meta(run_dir))
+    if succeeded:
         summary["report_text"] = (run_dir / "result/report.md").read_text()[:200]
     print(json.dumps(summary))
     return 0 if succeeded else 1
@@ -886,7 +976,8 @@ def token_probe(out: Path, token_file: Path) -> int:
 
 
 def main() -> int:
-    modes = {"run": 3, "hang": 3, "egress": 4, "model-once": 7, "model-auto": 10, "collect": 3,
+    modes = {"run": 3, "hang": 3, "egress": 4, "model-once": 7, "model-auto": 10, "model-staged": 9,
+             "collect": 3,
              "collect-case": 4, "unit-check": 3, "collect-issues": 3, "collect-issues-case": 4,
              "candidate-reads": 3, "candidate-reads-case": 4}
     # Three modes take an optional fixture token file as one more argument.
@@ -924,6 +1015,9 @@ def main() -> int:
     if mode == "model-auto":
         return model_auto(out, Path(sys.argv[3]), sys.argv[4], sys.argv[5], float(sys.argv[6]),
                           *(Path(argument) for argument in sys.argv[7:10]))
+    if mode == "model-staged":
+        return model_staged(out, sys.argv[3], Path(sys.argv[4]), sys.argv[5], sys.argv[6],
+                            float(sys.argv[7]), Path(sys.argv[8]))
     escaped = subprocess.Popen(
         [sys.executable, "-I", "-c",
          "import os,sys,time\nos.setsid()\ntime.sleep(3600)", f"escape:{out}"],
