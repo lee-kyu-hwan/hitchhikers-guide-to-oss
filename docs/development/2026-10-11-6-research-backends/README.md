@@ -173,3 +173,115 @@ launch의 게스트 실행은 VM이 필요하다. 이 Dispatch에서는 VM을 �
 symlink 해석(`/usr/bin/socat → socat1`)과 `socatPath`를 넣기 때문이었다. 시험이 그 두 호스트 의존 부분을 고정하도록 고치고
 (`host_free`), main `74e49d6`의 worker로 같은 방식으로 다시 계산한 값(컨테이너가 낸 값과 같다)으로 상수를 바꿨다.
 게스트(VM) 사례는 CI 범주 밖이고 이번 Dispatch에서 돌리지 않았다(위 「시험 수치」).
+
+## 후속 (a) — 8.2 staged 측정 하네스 + 게스트 gate 사례 재실행 (2026-10-12)
+
+PR #21 병합 뒤 `origin/main` `c789087`에서 새 브랜치 `lee-kyu-hwan/6-staged-harness`. 제품 코드 중 바뀐 것은
+unit wrapper 1파일(아래 「PR #21 회귀」)뿐이고 `bin/oss-research-worker`·`bin/oss-research-egress-pin`은
+그대로다(1단계의 Claude 경로 해시 시험 17건이 그대로 통과한다). 실제 모델 호출 0회, 비용 0 USD.
+
+### 바뀐 것 (8.2, #4 워커의 diff 제안 기준)
+
+| 파일 | 변경 |
+|---|---|
+| `tests/fixtures/oss_research_worker/linux/unit_inner.py` | 모드 `model-staged OUT PROFILE CREDENTIAL MODEL EFFORT SECONDS PROMPT`(인자 9개). `model_once`와 같은 계약(`claude-opus-5-5`·medium·≤300 s)과 같은 전제 순서(verify_runtime·platform_problems·checked_input·checked_run_dir·Selection·checked_credential·load_credential) 뒤 `run_research(..., staged=StagedRun(PROFILE, reviewed_source_root, ()), ...)`. 프로필이 `corpus-extract`·`deep-research`가 아니거나 PROMPT가 일반 파일이 아니거나 65536 B를 넘으면 어떤 읽기도 전에 exit 2. 요약에 `requested_profile`·`execution_profile`(manifest)·`staged`(staging 기록)·`staged_changed`(collect의 `staged-changed:` 문제만)·`output_files`(이름·크기만, 50개 상한)·`result_meta`를 더한다. 모델 텍스트는 찍지 않는다. `model_once`의 result_meta 추출은 공용 `result_meta()`로 옮겼다(동작 같음) |
+| `share/linux/model_once.sh` | MODE `staged-corpus`·`staged-deep`(PROFILE `corpus-extract`·`deep-research`). PROMPT(10번째 인자) 필수, analysis와 같은 P0 검사(root 소유·쓰기 불가·크기·UTF-8·자격 표지 없음) 뒤 root가 `$OUT/prompt.txt`(ossresearch 0600)로 복사하고 sha 대조(W3), inner가 그 경로를 받아 자기 `input/task.txt`로 다시 복사한다. 제품 main은 거치지 않는다(`PRODUCT=no`). 판정은 `judge`(S1·S2), 요약 출력(`INFO R inner`)에 `requested_profile`·`execution_profile`·`staged_changed`·`output_files`를 더했다. 모델 모드 셋(`model-once`·`model-auto`·staged)은 wrapper에 `--backend claude`를 준다 |
+| `share/linux/model_once_verdict.py` | `judge`가 `model-staged` 요약도 받는다. staged에는 V2(고정 답 OK) 대신 **S1-staged-unchanged**(staging 기록의 `files`가 비어 있지 않고 모두 64-hex sha256을 가지며 `settings.json`을 포함, `staged_changed == []`)와 **S2-profile-requested**(`requested_profile`이 staged 프로필이고 manifest의 `execution_profile`·기록의 `profile`과 같음). R1~R5·V1·V3~V5는 같다. `model-once` 판정은 바뀌지 않았다 |
+| `share/linux/verify_pickup.py` | `--staged corpus-extract|deep-research` 계약(아래 결정) |
+| `bin/oss-research-linux-run` | `--backend claude|codex|agy|none`(기본 `none`, `--entry verify` 전용) → `open_egress`. `--entry worker`는 지금처럼 worker 인자에서 읽고, 다른 entry에 이 옵션을 주면 exit 2. 조정자 결정 (A), 2026-10-12 |
+| `tests/test_oss_research_worker_staged_harness.py`(신설) | 오프라인 시험 13개(아래) |
+| `tests/test_oss_research_worker_backends.py` | `WrapperBackendTests` +2(verify entry의 `--backend`, main → launch 전달·거부) |
+| `docs/oss-research-worker.md` | 「백엔드」 egress pin 항목에 verify entry 옵션과 회귀, 판정·회수 행, 「미구현과 미증명」 스킬·Agent 행, 「검증 상태」 호환성 행, 「남은 실제 시험 게이트」 5에 하네스 준비 사실 |
+
+### `verify_pickup.py` 결정 — 기본 계약은 staged 묶음에도 맞고, `--staged PROFILE`을 더했다
+
+코드로 확인한 사실: 결과 묶음은 `run/result/`를 tar로 뜬 것이고 worker는 staged run에서도 같은 파일 집합
+(`manifest.json`·`report.md`·`stdout.json`·`stderr.log`[·`relay.log`])을 쓴다. `output/`은 `run/output/`
+(`WRITABLE_AREAS`)에 남고 `result/`에 들어가지 않으므로 묶음의 member 규칙은 바뀌지 않는다. manifest에는
+`execution_profile`과 `staged`(staging 기록)가 더 있지만 기본 계약은 그 키를 보지 않는다. 따라서 **기본 계약
+(member 집합·`succeeded`·`report.md` sha)은 staged 묶음을 그대로 받는다.** 다만 프로필을 묶지 않아 read-only
+run의 묶음과 구분하지 못하므로, 측정이 쓸 명시 계약 `--staged PROFILE`을 더했다: 기본 검사 전부 + manifest
+`execution_profile == PROFILE`, `staged.profile == PROFILE`, `staged.files`가 비어 있지 않고 모두 64-hex sha256을
+갖고 `settings.json`을 포함, `permission_mode dontAsk`, `exit_code 0`, `failures`·`problems` 비어 있음, 자격 검사
+`clean`. 출력 JSON에 `contract: staged`·`execution_profile`. 잘못된 사용(`--staged` 값 없음·`read-only`·다른 옵션
+결합)은 풀기 전에 끝난다. `output/` 산출물은 묶음에 없으므로 inner 요약의 `output_files`(이름·크기)로만 관찰한다.
+묶음에 넣는 것은 측정 뒤 별도 결정이다.
+
+### PR #21 회귀 — verify entry의 pin backend가 항상 `none`
+
+1단계에서 `worker_backend()`는 `--entry worker`가 아니면 `none`을 돌려줬다. 측정 하네스(`unit_inner.py`의
+`model-once`·`model-auto`·새 `model-staged`)는 `--entry verify`로 돌므로 `--egress pin`이면 GitHub 이름만 열리고
+`api.anthropic.com`은 `/etc/hosts` 차단·nft 미허용이 되어 모델 child가 접속할 수 없다(이번 gate 사례는
+`--egress none`이라 영향이 없고, 2026-10-11 S1 측정은 1단계 이전 `74e49d6`에서 돌았다). 조정자 결정 (A,
+2026-10-12): wrapper에 자기 옵션 `--backend`(verify entry 전용, 기본 `none`)를 더하고 `model_once.sh`의 모델
+모드가 `--backend claude`를 준다. 제품 worker·egress-pin은 그대로다. 시험: `WrapperBackendTests`
+`test_verify_entry_takes_the_wrappers_own_backend`(verify + claude → claude, 기본 none, 비AI entry none 유지,
+worker entry는 자기 인자에서 읽고 wrapper 옵션은 거부, 모르는 값 ValueError)와
+`test_main_hands_the_verify_backend_to_the_launch_or_refuses_it`(main → launch에 `claude` 전달, 모르는 값·빈
+값·값 없음·worker entry에 준 경우 exit 2, launch 미호출). apply 응답의 backend 대조는 기존
+`test_open_egress_pins_the_given_backend`가 본다.
+
+### 오프라인 시험 (신설 `tests/test_oss_research_worker_staged_harness.py`, 13개)
+
+| 묶음 | 시험 | 고정하는 것 |
+|---|---|---|
+| `ModelOnceScriptTests` 2 | `bash -n`; 모르는 MODE exit 2; `staged-corpus`·`staged-deep`·`analysis`는 PROMPT 없으면 `FAIL P0-prompt-argument (<MODE> needs PROMPT)` exit 2(sudo 전); MODE 표 1곳, 제품 경로 표에 staged 없음 | 스크립트의 CMD 블록을 떼어 변수만 주고 평가: staged 두 모드의 argv(`--entry verify --egress pin --backend claude --timeout 330 -- model-staged OUT PROFILE CRED MODEL EFFORT INNER OUT/prompt.txt`), `model-once`·`model-auto`의 argv(기존 + `--backend claude`), `--egress none`에서도 backend 전달 |
+| `UnitInnerStagedTests` 5 | 인자 표(`model-staged: 9`, 모자라거나 많으면 usage로 SystemExit, 맞아도 wrapper 밖이면 "not inside the unit wrapper"); 계약 밖 프로필·prompt(symlink·빈 파일·65537 B·없음·디렉터리)·model/effort/seconds는 어떤 읽기도 전에 exit 2(`measured_launch`가 호출되지 않음을 mock으로); `run_research`를 mock해 전달 인자(runtime·cli·prompt·input/run 디렉터리·`claude-profile2`·300 s·relay None·`dontAsk`·자격 값·Selection·`StagedRun(profile, 저장소 루트, ())`)와 요약(`requested_profile`·`execution_profile`·`staged`·`staged_changed []`·`output_files`·`result_meta`·`report_text`, 모델 텍스트·자격 값 없음)을 보고 그 요약이 `judge`에서 모두 PASS; `staged-changed` 문제가 있는 실패 run은 exit 1과 `staged_changed` 목록; 설치본(`source_checkout None`)은 Blocked이고 input/run 디렉터리를 만들지 않음 |
+| `VerdictStagedTests` 3 | 완전한 staged token 기록은 11개 검사 모두 PASS(S1·S2 포함, V2 없음), deep-research도 PASS, sentinel은 R5까지; S1(기록 없음·files 빔·settings.json 없음·sha 형식·`staged_changed` 비어 있지 않음/None)·S2(read-only·프로필 불일치·None·기록 프로필 다름·요청 없음)·R4·V1·V4 반례 FAIL, 답 텍스트는 판정하지 않음; `model-once` 판정 불변(V2 유지, S1 없음), `model-auto` 요약은 R3 FAIL, CLI `judge … token` exit 0/1 |
+| `PickupStagedTests` 3 | `--staged corpus-extract` 통과(`contract staged`), 같은 묶음이 기본 계약도 통과(결정), deep-research 묶음을 corpus-extract로 요구하면 두 문제; read-only run·기록 없음·pin 없음·sha 형식·settings.json 없음·auto·exit 1·problems·자격 FAIL; 실패 manifest는 기본 검사가 먼저; 잘못된 사용 4가지는 풀지 않고 종료 |
+
+실제 하네스(`model_once.sh`)의 게스트 실행은 측정 Dispatch의 몫이다(모델 호출이 따라오므로 이번에는 돌리지 않았다).
+
+### 게스트 gate 사례 재실행 (G1~G9, VM, 모델 호출 없음)
+
+조정자 `ask` 승인 뒤(사용자 사전 승인 2026-10-12) 커밋 `96c1a0d`(하네스+wrapper, README 제외)를 게스트
+`oss-research-debian`에 root 소유 `/opt/oss-research/src-96c1a0d`로 배포하고(`git archive HEAD` 스트림,
+`files_not_root 0 group_other_write 0`; 파일 sha256 목록은 호스트 추적 파일과 같다. 유일한 차이는 당시 작성 중이던 이
+README) `tests/fixtures/oss_research_worker/linux/gate_cases.sh 96c1a0d`를 vmadmin으로 돌렸다. sentinel 가짜 자격만,
+claude는 PATH에 없고, 모두 `--egress none`. 모델 호출 0, 토큰 0, 비용 0 USD. 전후 units 0·procs 0·creds 0·pin 없음,
+`/tmp/osr-g-*` 0. 기존 `src-*` 트리와 기존 증거 디렉터리는 건드리지 않았다.
+
+| 사례 | 구성 | 기대 | 실제 | 판정 |
+|---|---|---|---|---|
+| G1 | wrapper `--entry verify` `unit-check` | unit 안에서 `unit_problems []`, wrapper exit 0 | `oss-research-5345d0f45e348b03 0 {"unit_problems": []}` | PASS |
+| G2 | wrapper 밖 직접 실행(marker 없음) | exit 3 | rc=3 "not started by the unit wrapper (no unit marker)" | PASS |
+| G3 | 위조 marker, stdin이 곧 닫힘 | exit 75(`PARENT_GONE_EXIT`, EOF guard가 먼저 끝냄) | rc=75 | PASS |
+| G3b | 위조 marker, 열린 pipe, unit 밖 | exit 3 | rc=3 "this process is not in the wrapper unit's cgroup" | PASS |
+| G4 | `--permission-mode auto` | **exit 2**(입력 거부, 8.1) | exit 2, argparse usage | PASS |
+| G5 | `--relay-repo eslint/eslint` | exit 3 | "relay a relay is not the measured none" | PASS |
+| G6 | `--execution-profile deep-research` | exit 3 | "execution profile deep-research is not the measured read-only" | PASS |
+| G7 | `--execution-profile corpus-extract` | exit 3 | "execution profile corpus-extract is not the measured read-only" | PASS |
+| G8 | `--model claude-sonnet-5-5` | exit 3 | "model claude-sonnet-5-5 is not the measured claude-opus-5-5" | PASS |
+| G9 | 범위 일치, claude PATH 제외 | exit 3(runtime pin) | "this is not the measured runtime: claude is not on PATH" | PASS |
+
+어느 사례도 run 디렉터리를 만들지 않았다(`run_dir_exists=no` ×9). G3의 기대값 75는 이전 판(a189x, 2026-10-02)과 같고,
+`gate_cases.sh` 머리말의 기대값 서술을 이에 맞게 고쳤다(1단계에서는 "나머지 전부 exit 3"으로 적었다). 부수 관찰: 배포 때
+게스트 시계가 호스트보다 약 11062 s 느려 tar가 "time stamp in the future" 경고 322줄을 냈고(`deploy.err`), 첫 wrapper
+실행의 시계 검사가 RTC로 재동기했다(상태 전 `2026-10-11T21:25:18Z` → 후 `2026-10-12T00:30:55Z`; 2026-10-11에도 본 호스트
+잠자기 효과).
+
+증거: `~/.oss-research-vm/logs/a6-gate-20261012T003032Z/`(0700, `SHA256SUMS` 18 entries, `shasum -a 256 -c` 전부 OK).
+핵심 파일 sha256: `guest-gate-cases.log` `d45707b25e3be83c9e917be9f2a42094a18ba426b109850d2e45ac27c35b574f`, `deploy.log` `d2e73911d2c0e702888e4eb62bc4893789af2d3baa58479fe884cf2b3880ad08`, `SHA256SUMS` 자체 `adc58cce29ad9087e6362478a44fad40dd5e8da98633f5a291e9a385a41f79e8`.
+
+### 로컬 Linux CI
+
+`docs/ci.md` 방식(Docker `python:3.14` linux/arm64, Python 3.14.8, `--network none --cpuset-cpus=0,1`, 비root `runner`),
+2026-10-12, 한 번에 하나만 실행. 추적 파일 기준 트리는 아래 PR HEAD와 같다(이 CI 수치 문단만 CI 뒤에 채웠다).
+
+| 묶음 | Linux | macOS(작성자 호스트) |
+|---|---|---|
+| 저장소 시험 `tests/test_*.py` 21모듈 | **708개 OK (skip 40)**; 모듈별 모두 OK(`worker_staged_harness` 13 신설, `worker_backends` 24(+2), `worker_linux` 174, `relay` 57 — 알려진 flake `ConnectionCapTests`는 단독 실행이라 재현되지 않음) | 모듈별 모두 OK(708, skip 39) |
+| 분석 번들 `test_*.py` 12개 + `selftest_*.py` 3개 | 모두 OK(skip: assess 1, assess_contract 1, continue_plan 8, dry_plan 3, model_retry 1, prompt_contract 3, reduce_inputs 1, search_clues 1, stage_inputs 2), selftest failures=0 / 129 cases 0 / 19 cases 0 | 돌리지 않음(미변경) |
+| 스킬 시험 6묶음 | **659개 OK** (researching 162, analyzing 77, verifying 138, recent-closed 162, curated 53, issues 67) | 돌리지 않음(미변경) |
+| `__pycache__` | 0 | 0 |
+
+1단계 PR(저장소 693, 스킬 642)과 비교하면 저장소 시험 +15(이 PR의 13+2), 스킬 +17은 main에 그사이 병합된 #19(researching
+145→162)이고 이 PR과 무관하다. 게스트(VM) 사례 G1~G9는 위 절대로 별도 실행했고 CI 범주 밖이다.
+
+### 남은 항목
+
+- staged 실제 측정 2회(`corpus-extract` ≤ 0.3 USD, `deep-research` ≤ 2 USD; #4 8.2의 계획표): 별도 Dispatch, 사용자 예산 승인
+  뒤 `model_once.sh token <src> … pin normal 330 300 staged-corpus|staged-deep <PROMPT>`. 측정 뒤 `MEASURED_LAUNCHES`에
+  staged launch를 더할지는 별도 결정.
+- `output/` 산출물을 결과 묶음에 넣을지(지금은 inner 요약의 `output_files`로만 관찰).
+- 2단계 Codex·3단계 agy(위 0·1단계 절), 분석 번들 M4 자격 변수 표.

@@ -1,8 +1,11 @@
 #!/bin/bash
 # 모델 gate 사례(게스트, 관리 계정 vmadmin이 실행, 안에서 sudo). 인자: 배포된 커밋.
 # 비AI: sentinel 자격(가짜 값)만 쓰고 claude를 PATH에서 뺀다. 그래서 어떤 사례도 모델을 launch할 수 없다.
-# 모두 --egress none. 기대 결과는 G4(permission mode auto)만 입력 거부(exit 2, #4 항목 1: auto는 CLI에서
-# 받지 않는다)이고 나머지는 전부 Blocked(exit 3)이다. 어느 사례도 run 디렉터리를 만들지 않아야 한다.
+# 모두 --egress none. 기대 결과: G1은 unit 안에서 unit_problems가 비어 있고(wrapper exit 0), G3(위조 marker,
+# stdin이 곧 닫힘)은 parent EOF guard가 먼저 끝내 exit 75(PARENT_GONE_EXIT), G4(permission mode auto)는 입력
+# 거부(exit 2, #4 항목 1: auto는 CLI에서 받지 않는다), 나머지(G2·G3b·G5~G9)는 전부 Blocked(exit 3)이다.
+# 어느 사례도 run 디렉터리를 만들지 않아야 한다. 2026-10-12 실행(a6-gate-20261012T003032Z, 커밋 96c1a0d)이 이
+# 기대값과 같았다.
 # 이전 판(a189g-host/gate_cases.sh·gate_forged.sh)에 relay·staged·다른 model 사례를 더했다.
 set -u
 C=$1; S=/opt/oss-research/src-$C; NODE=/opt/oss-research/node-v24.20.0-linux-arm64/bin
