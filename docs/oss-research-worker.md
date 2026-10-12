@@ -91,7 +91,7 @@ python3 bin/oss-research-worker \
 | 프로필 | `--tools` | `--allowedTools` | `--disallowedTools` | 빼는 플래그 | staging |
 |---|---|---|---|---|---|
 | `read-only`(기본) | `Read,Glob,Grep` | 같음 | 기존 목록 | 없음 | 없음 |
-| `corpus-extract` | `Read,Glob,Grep,Agent,Write` | `Read Glob Grep Agent(corpus-extractor) Write` | `Bash,PowerShell,WebFetch,WebSearch,Edit,NotebookEdit,Skill,Workflow` | `--safe-mode`(custom agent를 끄므로) | 부모가 쓴 `--agents` 파일(`corpus-extractor`, 도구 `Read`만, model 지정 없음), `--add-dir <run>/output` |
+| `corpus-extract` | `Read,Glob,Grep,Agent,Write` | `Read Glob Grep Agent(corpus-extractor) Write` | `Bash,PowerShell,WebFetch,WebSearch,Edit,NotebookEdit,Skill,Workflow` | `--safe-mode`(custom agent를 끄므로) | `--agents`에 agent 정의를 인라인 JSON 객체로(`corpus-extractor`, 도구 `Read`만, model 지정 없음; 부모가 `run/policy/claude-agents.json`에도 같은 객체를 기록용으로 쓴다. 자식은 `run/policy`를 읽지 못하므로 경로로 넘기면 CLI가 "file not found"로 끝난다 — 2026-10-13 실측), `--add-dir <run>/output` |
 | `deep-research` | `Read,Skill,Workflow,WebSearch,WebFetch` | `Read Skill(deep-research) Workflow(deep-research) WebSearch` + 도메인마다 `WebFetch(domain:<host>)` | `Bash,PowerShell,Edit,Write,NotebookEdit` | `--safe-mode`, `--disable-slash-commands` | `share/staged/skills/deep-research/SKILL.md`(`a330b11e…`), `share/staged/workflows/deep-research.js`(`4d7392eb…`) |
 
 - 두 staged 프로필 모두 `--restricted`, `--strict-mcp-config`, `--no-chrome`,
@@ -117,7 +117,7 @@ staging(`stage_research_config`)은 `prepare_run` 뒤, 자식 시작 전에 부�
    만들고(staging 대상이 아니면 빈 채로), 원본을 0444로 복사한다. 복사본은 다시 읽어
    hash를 대조하고 다르면 Blocked다. 설정 파일
    `settings.json`(argv와 같은 allow/deny 규칙, `disableAllHooks: true`)도 부모가
-   0444로 쓴다. corpus-extract의 agent 정의는 `run/policy/claude-agents.json`(0400)이다.
+   0444로 쓴다. corpus-extract의 agent 정의는 `run/policy/claude-agents.json`(0400)에 기록하고 argv에는 같은 객체를 인라인 JSON으로 넘긴다(자식은 `run/policy`를 읽지 못한다).
 4. 기록(원본 경로·staged 경로·hash, 프로필, 도메인, agents 파일 hash)은
    `run/policy/staged-manifest.json`(0400)과 결과 manifest의 `staged`에 남는다.
    manifest에는 `execution_profile`도 들어간다.
