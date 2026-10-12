@@ -14,6 +14,7 @@ import base64
 import calendar
 import hashlib
 import importlib.machinery
+import io
 import importlib.util
 import json
 import os
@@ -575,6 +576,241 @@ class CodexGateTests(Fixture):
                 self.assertIn(text, result.stderr)
                 self.assertFalse(self.run_dir.exists())
                 self.assertNotIn("sentinel-refresh", result.stdout + result.stderr)
+
+
+HARNESS = ROOT / "share/linux/model_once.sh"
+VERDICT = ROOT / "share/linux/model_once_verdict.py"
+INNER = ROOT / "tests/fixtures/oss_research_worker/linux/unit_inner.py"
+CASES = ROOT / "tests/fixtures/oss_research_worker/linux/codex_cases.sh"
+
+
+def load_inner():
+    """unit_inner imports the supervisor test module from the repository root."""
+    import contextlib
+    if str(ROOT) not in sys.path:
+        sys.path.insert(0, str(ROOT))
+    with contextlib.chdir(ROOT):
+        return load("oss_research_unit_inner_codex", INNER)
+
+
+class CodexHarnessScriptTests(unittest.TestCase):
+    """model_once.sh codex-once / codex-analysis and codex_cases.sh: input checks
+    and the argv, before any sudo (the guest run itself is the measurement)."""
+
+    def run_script(self, *args):
+        return subprocess.run(["bash", str(HARNESS), *args], capture_output=True, text=True,
+                              stdin=subprocess.DEVNULL, timeout=60)
+
+    def test_modes_and_refusals(self):
+        for script in (HARNESS, CASES):
+            self.assertEqual(subprocess.run(["bash", "-n", str(script)]).returncode, 0)
+        common = ("sentinel", "/src", "/srt", "/node/bin")
+        result = self.run_script(*common, "pin", "normal", "330", "300", "codex-once")
+        self.assertEqual((result.returncode, result.stdout.strip()),
+                         (2, "FAIL a codex sentinel run is --egress none only "
+                             "(a fake login never reaches chatgpt.com)"))
+        result = self.run_script(*common, "none", "normal", "330", "300", "codex-analysis")
+        self.assertEqual((result.returncode, result.stdout.strip()),
+                         (2, "FAIL P0-prompt-argument (codex-analysis needs PROMPT)"))
+        result = self.run_script(*common, "none", "normal", "330", "300", "codex-other")
+        self.assertEqual((result.returncode, result.stdout.strip()), (2, "FAIL bad MODE"))
+        usage = subprocess.run(["bash", str(CASES)], capture_output=True, text=True, timeout=60)
+        self.assertEqual(usage.returncode, 2)
+        text = CASES.read_text()
+        self.assertIn("TAR_SHA=bf3ca2719f1143b1440fbd85c149379e696c782c50ad7991f8bfcec60b2600c1", text)
+        inner = load_inner()
+        self.assertIn(f"BIN_SHA={inner.CODEX_SHA256}", text)
+
+    def argv_for(self, mode, egress="pin"):
+        text = HARNESS.read_text()
+        start = text.index('if [ "$PRODUCT" = yes ]; then\n  # The product path')
+        end = text.index('[ "$MODE" = model-auto ] && CMD+=')
+        script = text[start:end] + 'printf "%s\\n" "${CMD[@]}"\n'
+        environment = {"MODE": mode, "PRODUCT": "no", "CODEX": "yes", "STAGED": "", "PY": "/usr/bin/python3",
+                       "WRAPPER": "/src/bin/oss-research-linux-run", "EGRESS": egress, "TIMEOUT": "330",
+                       "OUT": "/tmp/osr-m-out-AAAA", "CRED": "/run/oss-research-credentials/r/codex-profile1/auth.json",
+                       "MODEL": "gpt-6.1-sol", "EFFORT": "medium", "INNER": "300", "PATH": os.environ["PATH"]}
+        result = subprocess.run(["bash", "-c", script], capture_output=True, text=True, env=environment,
+                                timeout=60)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return result.stdout.splitlines()
+
+    def test_argv_names_the_codex_backend(self):
+        head = ["/usr/bin/python3", "-I", "-B", "/src/bin/oss-research-linux-run", "--entry", "verify",
+                "--egress", "pin", "--backend", "codex", "--timeout", "330", "--"]
+        tail = ["/tmp/osr-m-out-AAAA", "/run/oss-research-credentials/r/codex-profile1/auth.json",
+                "gpt-6.1-sol", "medium", "300"]
+        self.assertEqual(self.argv_for("codex-once"), head + ["codex-once", *tail])
+        self.assertEqual(self.argv_for("codex-analysis"),
+                         head + ["codex-analysis", *tail, "/tmp/osr-m-out-AAAA/prompt.txt"])
+        text = HARNESS.read_text()
+        for line in ('PDIR="$CDIR/codex-profile1"; CRED="$PDIR/auth.json"; MODEL=gpt-6.1-sol; CRED_MIN=200; CRED_MAX=65536',
+                     '[ -n "$CODEX" ] && CLAUDE_DIR=/opt/oss-research/codex-0.162.1'):
+            self.assertEqual(text.count(line), 1, line)
+
+
+class CodexVerdictTests(unittest.TestCase):
+    def setUp(self):
+        self.verdict = load("oss_research_model_once_verdict_codex", VERDICT)
+        self.root = Path(tempfile.mkdtemp(prefix="osrc-v-", dir=SHORT_TMP)).resolve()
+        self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
+
+    def record(self, **inner_changes):
+        inner = {"mode": "codex-once", "succeeded": True, "manifest_written": True, "status": "succeeded",
+                 "exit_code": 0, "failures": [], "problems": [], "profile": PROFILE,
+                 "permission_mode": "dontAsk", "requested_model": "gpt-6.1-sol", "requested_effort": "medium",
+                 "observed_models": ["gpt-6.1-sol"], "backend": "codex", "login_copy_left": False,
+                 "credential": {"file": "home/.codex/auth.json", "exact_value_check": "clean"},
+                 "result_meta": {"item_types": ["reasoning", "agent_message"],
+                                 "server_model_lines": ["gpt-6.1-sol"]},
+                 "report_text": "OK"}
+        inner.update(inner_changes)
+        pin = {name: {"exit": 0} for name in ("apply", "verify", "clear")}
+        return json.dumps({"unit": "oss-research-0123456789abcdef", "exit_code": 0, "failures": [],
+                           "egress_pin": pin, "stdout": json.dumps(inner) + "\n"})
+
+    def test_a_good_codex_record_passes_and_each_counterexample_fails(self):
+        rows = dict(self.verdict.judge(self.record(), "token"))
+        self.assertEqual(rows, {name: "PASS" for name in (
+            "R1-record-present", "R2-unit-named", "R3-inner-summary-present", "R4-contract",
+            "R5-exposure-check-clean", "R6-login-copy-removed", "V1-manifest-succeeded",
+            "V2-fixed-answer-OK", "V3-text-items-only", "V4-requested-model-observed",
+            "V5-pin-apply-verify-clear")})
+        analysis = dict(self.verdict.judge(self.record(mode="codex-analysis", report_text=None), "token"))
+        self.assertNotIn("V2-fixed-answer-OK", analysis)
+        self.assertTrue(all(status == "PASS" for status in analysis.values()))
+        for change, failed in (
+                ({"requested_model": "gpt-5.5"}, "R4-contract"), ({"backend": "claude"}, "R4-contract"),
+                ({"profile": "claude-profile2"}, "R4-contract"),
+                ({"credential": {"variable": "CLAUDE_CODE_OAUTH_TOKEN", "exact_value_check": "clean"}},
+                 "R5-exposure-check-clean"),
+                ({"login_copy_left": True}, "R6-login-copy-removed"),
+                ({"problems": ["x"]}, "V1-manifest-succeeded"), ({"report_text": "OK!"}, "V2-fixed-answer-OK"),
+                ({"result_meta": {"item_types": ["command_execution", "agent_message"],
+                                  "server_model_lines": ["gpt-6.1-sol"]}}, "V3-text-items-only"),
+                ({"observed_models": None}, "V4-requested-model-observed"),
+                ({"observed_models": ["gpt-5.2"]}, "V4-requested-model-observed"),
+                ({"result_meta": {"item_types": ["agent_message"], "server_model_lines": []}},
+                 "V4-requested-model-observed")):
+            with self.subTest(failed=failed, change=change):
+                self.assertEqual(dict(self.verdict.judge(self.record(**change), "token"))[failed], "FAIL")
+        # A sentinel run (--egress none, the login is fake) is judged on R4-R6 only.
+        sentinel = dict(self.verdict.judge(self.record(succeeded=False, status="failed"), "sentinel"))
+        self.assertEqual(set(sentinel), {"R1-record-present", "R2-unit-named", "R3-inner-summary-present",
+                                         "R4-contract", "R5-exposure-check-clean", "R6-login-copy-removed"})
+
+    def test_scan_looks_for_each_token_of_a_login_file(self):
+        directory = self.root / "codex-profile1"
+        directory.mkdir()
+        credential = directory / "auth.json"
+        document = login()
+        credential.write_text(json.dumps(document))
+        area = self.root / "area"
+        area.mkdir()
+        (area / "plain.txt").write_text("nothing here")
+        self.assertEqual(self.verdict.scan(credential, [area], worker), "clean")
+        for key in ("id_token", "access_token", "refresh_token"):
+            with self.subTest(key):
+                (area / "leak.txt").write_text("x" + document["tokens"][key] + "x")
+                self.assertEqual(self.verdict.scan(credential, [area], worker), "exposed")
+                (area / "leak.txt").unlink()
+        credential.write_text("{}")
+        self.assertTrue(self.verdict.scan(credential, [area], worker).startswith("incomplete"))
+        # A Claude token file keeps its one-line rule.
+        claude = self.root / "oauth-token"
+        claude.write_text("sentinel-claude-" + "c" * 30 + "\n")
+        self.assertEqual(self.verdict.scan(claude, [area], worker), "clean")
+
+
+class CodexInnerTests(Fixture):
+    """unit_inner.py codex-once / codex-analysis / codex-probe without a guest."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.inner = load_inner()
+
+    def test_contract_and_prompt_refusals_come_before_any_read(self):
+        inner = self.inner
+        with mock.patch.object(inner, "codex_binary") as binary, mock.patch("sys.stdout"):
+            for model, effort, seconds in (("gpt-5.5", "medium", 300), ("gpt-6.1-sol", "high", 300),
+                                           ("gpt-6.1-sol", "medium", 301), ("gpt-6.1-sol", "medium", float("nan"))):
+                self.assertEqual(inner.codex_once(self.root, Path("/x"), model, effort, seconds),
+                                 worker.EXIT_BAD_INPUT)
+            for prompt in (self.root / "missing.txt", self.root):
+                self.assertEqual(inner.codex_once(self.root, Path("/x"), "gpt-6.1-sol", "medium", 300, prompt),
+                                 worker.EXIT_BAD_INPUT)
+            self.assertEqual(inner.codex_probe(self.root, "unknown"), worker.EXIT_BAD_INPUT)
+        binary.assert_not_called()
+        self.assertEqual(inner.CODEX_CONTRACT, {"model": "gpt-6.1-sol", "effort": "medium", "max_seconds": 300.0})
+
+    def test_codex_once_takes_the_product_path_with_the_codex_backend(self):
+        inner = self.inner
+        path = self.write_login()
+        out = self.root / "out"
+        out.mkdir()
+        seen = {}
+
+        def fake_research(runtime, cli, prompt, input_dir, run_dir, profile, seconds, relay, parent,
+                          mode, credential, staged, selection, backend):
+            seen.update(cli=cli, prompt=prompt, profile=profile, seconds=seconds, relay=relay, mode=mode,
+                        credential=credential, staged=staged, selection=selection, backend=backend)
+            (run_dir / "result").mkdir(parents=True)
+            (run_dir / "result/stdout.json").write_text(good_stream())
+            (run_dir / "result/stderr.log").write_text(SERVER_MODEL)
+            (run_dir / "result/report.md").write_text("OK")
+            (run_dir / "result/manifest.json").write_text(json.dumps({
+                "status": "succeeded", "backend": "codex", "profile": PROFILE, "exit_code": 0, "failures": [],
+                "problems": [], "permission_mode": "dontAsk", "requested_model": "gpt-6.1-sol",
+                "requested_effort": "medium", "observed_models": ["gpt-6.1-sol"],
+                "credential": {"file": "home/.codex/auth.json", "exact_value_check": "clean"}}))
+            return True
+
+        printed = io.StringIO()
+        with mock.patch.object(inner, "codex_binary", return_value=(["/n", "/s"], "/opt/codex")), \
+                mock.patch.object(inner.worker, "run_research", side_effect=fake_research), \
+                mock.patch("sys.stdout", printed):
+            code = inner.codex_once(out, path, "gpt-6.1-sol", "medium", 300)
+        self.assertEqual(code, 0)
+        self.assertIs(seen["backend"], inner.worker.CODEX)
+        self.assertEqual((seen["profile"], seen["seconds"], seen["relay"], seen["mode"], seen["staged"]),
+                         (PROFILE, 300, None, "dontAsk", None))
+        self.assertEqual(seen["prompt"], inner.MODEL_ONCE_PROMPT)
+        self.assertEqual(seen["selection"], inner.worker.Selection("gpt-6.1-sol", "medium"))
+        self.assertEqual(set(seen["credential"].secrets()), {
+            value for key, value in json.loads(path.read_text())["tokens"].items() if key != "account_id"})
+        summary = json.loads(printed.getvalue())
+        self.assertEqual(summary["mode"], "codex-once")
+        self.assertEqual(summary["backend"], "codex")
+        self.assertIs(summary["login_copy_left"], False)
+        self.assertEqual(summary["result_meta"]["item_types"], ["reasoning", "agent_message"])
+        self.assertEqual(summary["result_meta"]["server_model_lines"], ["gpt-6.1-sol"])
+        self.assertEqual(summary["report_text"], "OK")
+        for secret in seen["credential"].secrets():
+            self.assertNotIn(secret, printed.getvalue())
+        record = json.dumps({"unit": "oss-research-0123456789abcdef", "exit_code": 0, "failures": [],
+                             "egress_pin": {name: {"exit": 0} for name in ("apply", "verify", "clear")},
+                             "stdout": printed.getvalue()})
+        verdict = load("oss_research_model_once_verdict_codex_inner", VERDICT)
+        self.assertTrue(all(status == "PASS" for _, status in verdict.judge(record, "token")))
+
+    def test_prompt_input_facts(self):
+        items = [{"type": "message", "role": "developer", "content": [
+                    {"type": "input_text", "text": "<permissions instructions>\n`sandbox_mode` is `read-only`"}]},
+                 {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "osr probe prompt"}]}]
+        facts = self.inner.prompt_input_facts(json.dumps(items))
+        self.assertEqual(facts, {"parsed": True, "items": 2, "tags": ["<permissions instructions>"],
+                                 "skills": False, "multi_agent": False, "canary": False, "apps": False,
+                                 "sandbox_read_only": True, "approval_never": False, "prompt_last": True})
+        items[0]["content"].append({"type": "input_text", "text": "<skills_instructions> x "
+                                    + self.inner.CODEX_CANARY})
+        facts = self.inner.prompt_input_facts(json.dumps(items))
+        self.assertTrue(facts["skills"] and facts["canary"])
+        self.assertEqual(self.inner.prompt_input_facts("not json"), {"parsed": False})
+        # The probe's codex argv is the product's switches around a non-exec subcommand.
+        argv = self.inner.codex_config_argv(["debug", "prompt-input"])
+        self.assertEqual(argv[:2], ["--disable", "apps"])
+        self.assertIn("project_doc_max_bytes=0", argv)
+        self.assertEqual(argv[argv.index("debug"):argv.index("debug") + 2], ["debug", "prompt-input"])
 
 
 if __name__ == "__main__":
