@@ -27,6 +27,8 @@ sentinels and in that measured launch. See docs/oss-research-worker.md.
 from __future__ import annotations
 
 import argparse
+import base64
+import calendar
 import errno
 import hashlib
 import json
@@ -129,6 +131,10 @@ MEASURED_LAUNCHES = {
         profile="claude-profile2", model="claude-opus-5-5", effort="medium",
         backend="claude"),
 }
+# Launches of other backends, per (backend, platform). Codex is added only
+# after its real run (S4) passed; until then a codex request is compared with
+# the Claude launch above and closed at its first field.
+MEASURED_BACKEND_LAUNCHES: dict[tuple[str, str], MeasuredLaunch] = {}
 OS_RELEASE = Path("/etc/os-release")
 MAX_PINNED_BINARY_BYTES = 1024 * 1024 * 1024
 # What srt 0.0.77 needs on Linux (checkLinuxDependencies, checkDependenciesCommon).
@@ -212,7 +218,12 @@ class Backend(NamedTuple):
     needs it is Blocked (require). Only name and executable are always set.
     The argv builders (build_command, build_staged_command) and the result
     parsers (result_problems, observed_models) dispatch on name: the Claude
-    ones are the measured ones, the others stay closed until measured.
+    and Codex ones are written, the others stay closed until measured.
+
+    The credential reaches the child one of two ways (credential_variable or
+    credential_file, never both): Claude takes a token in one variable; Codex
+    reads <config home>/auth.json, which the parent writes into the run and
+    removes after it (run_supervised).
     """
     name: str
     executable: str                              # found on PATH past the gate
@@ -223,6 +234,10 @@ class Backend(NamedTuple):
     allowed_domains: tuple[str, ...] | None      # model endpoint (macOS form)
     allowed_domains_linux: tuple[str, ...] | None  # the same with :443 (Linux form)
     pinned_names: tuple[str, ...] | None         # names the egress pin resolves for a run
+    profiles: tuple[str, ...] | None = None      # --profile names this backend takes
+    credential_file: str | None = None           # run/<config_subdir>/<credential_file>
+    environment: tuple[tuple[str, str], ...] = ()  # fixed child variables
+    system_read_linux: tuple[str, ...] = ()      # read paths beyond SYSTEM_READ_LINUX
 
     def require(self, field: str):
         value = getattr(self, field)
@@ -238,14 +253,36 @@ CLAUDE = Backend(
     credential_name=CREDENTIAL_NAME, credential_variable=CREDENTIAL_VARIABLE,
     config_variable="CLAUDE_CONFIG_DIR", config_subdir="home/.claude",
     allowed_domains=ALLOWED_DOMAINS, allowed_domains_linux=ALLOWED_DOMAINS_LINUX,
-    pinned_names=("api.anthropic.com",))
-# Codex and agy: named so --backend takes them, nothing measured (issue #6
-# stages 2 and 3: argv from the installed version's --help, a run-only
-# configuration home, the credential shape, the endpoints seen in a real run).
-CODEX = Backend("codex", "codex", None, None, None, None, None, None, None)
+    pinned_names=("api.anthropic.com",), profiles=PROFILES)
+# Codex CLI 0.162.1 (issue #6 stage 2; docs/development/2026-10-13-6-codex-backend).
+# Linux only: ChatGPT-subscription login only (an API-key auth.json is refused,
+# load_codex_credential), so the model endpoint is chatgpt.com (WebSocket over
+# CONNECT, HTTPS fallback, the models list). auth.openai.com (token refresh) is
+# not allowed: the parent checks the token is fresh enough instead
+# (codex_credential_problems). Codex verifies TLS with rustls native roots, so
+# the child gets SSL_CERT_FILE and that one file is readable. With
+# CODEX_EXEC_SERVER_URL=none it has no execution environment, so no shell,
+# apply_patch, view_image or request_permissions tool exists, and its own
+# bubblewrap sandbox never starts inside srt's. RUST_LOG adds the session's
+# "server reported model" line to stderr (observed_models).
+CODEX_PROFILES = ("codex-profile1",)
+CODEX_CREDENTIAL_NAME = "auth.json"
+CODEX_CA_FILE = "/etc/ssl/certs/ca-certificates.crt"
+CODEX = Backend(
+    name="codex", executable="codex",
+    credential_name=CODEX_CREDENTIAL_NAME, credential_variable=None,
+    config_variable="CODEX_HOME", config_subdir="home/.codex",
+    allowed_domains=None, allowed_domains_linux=("chatgpt.com:443",),
+    pinned_names=("chatgpt.com",), profiles=CODEX_PROFILES,
+    credential_file=CODEX_CREDENTIAL_NAME,
+    environment=(("CODEX_EXEC_SERVER_URL", "none"), ("SSL_CERT_FILE", CODEX_CA_FILE),
+                 ("RUST_LOG", "error,opentelemetry_sdk=off,opentelemetry_otlp=off,codex_core::session=info")),
+    system_read_linux=(CODEX_CA_FILE,))
+# agy: named so --backend takes it, nothing measured (issue #6 stage 3).
 AGY = Backend("agy", "agy", None, None, None, None, None, None, None)
 BACKENDS = {backend.name: backend for backend in (CLAUDE, CODEX, AGY)}
 DEFAULT_BACKEND = CLAUDE.name
+ALL_PROFILES = (*PROFILES, *CODEX_PROFILES)
 
 
 class Selection(NamedTuple):
@@ -780,13 +817,20 @@ def parent_eof_guard(environ: dict[str, str]) -> bool:
 
 
 class Credential:
-    """A checked token held in memory only. repr/str never show the value."""
+    """A checked token held in memory only. repr/str never show the value.
 
-    __slots__ = ("profile", "_value")
+    secrets are the exact values the exposure checks look for: the value
+    itself for a Claude token; for a Codex auth.json (whose text is the value)
+    each token in it, since a copy of one token is an exposure on its own."""
 
-    def __init__(self, profile: str, value: str):
+    __slots__ = ("profile", "_value", "_secrets", "facts")
+
+    def __init__(self, profile: str, value: str, secrets: tuple[str, ...] | None = None,
+                 facts: dict | None = None):
         self.profile = profile
         self._value = value
+        self._secrets = (value,) if secrets is None else tuple(secrets)
+        self.facts = facts or {}
 
     def __repr__(self) -> str:
         return f"<credential for {self.profile}>"
@@ -800,30 +844,49 @@ class Credential:
         """The value, for the child environment and exposure checks only."""
         return self._value
 
+    def secrets(self) -> tuple[str, ...]:
+        """Every exact value the exposure checks look for (never logged)."""
+        return self._secrets
+
+    def found_in(self, text: str) -> bool:
+        return any(secret in text for secret in self._secrets)
+
 
 def open_credential(profile: str, credential: Path,
-                    forbidden: tuple[Path, ...]) -> tuple[int, os.stat_result]:
-    """Open a private token file bound to profile and return (descriptor, stat).
+                    forbidden: tuple[Path, ...],
+                    backend: Backend = CLAUDE) -> tuple[int, os.stat_result]:
+    """Open a private credential file bound to profile and return (descriptor, stat).
 
     The directory and the file are opened without following links, and the
     owner, mode and link count are checked on those descriptors, so what is
     checked is what a later read gets. Nothing is read. Messages never
-    include the content.
+    include the content. The file name, the profiles and the size bounds are
+    the backend's (Claude: oauth-token, a 20..4097 byte token; Codex:
+    auth.json, CODEX_CREDENTIAL_BYTES).
     """
     if credential.is_symlink() or credential.parent.is_symlink():
         raise Blocked("credential file and its directory must not be symlinks")
     credential = credential.absolute()
-    if credential.name != CREDENTIAL_NAME or credential.parent.name != profile:
-        raise Blocked(f"credential file must be <dir>/{profile}/{CREDENTIAL_NAME}")
-    if any(part in PROFILES for part in credential.parent.parent.parts):
+    name = backend.require("credential_name")
+    if profile not in backend.require("profiles"):
+        raise Blocked(f"profile {profile} is not a {backend.name} profile")
+    if credential.name != name or credential.parent.name != profile:
+        raise Blocked(f"credential file must be <dir>/{profile}/{name}")
+    # Claude keeps its own profile list here, as measured; another backend's
+    # credential path may name no profile of any backend.
+    others = PROFILES if backend.name == CLAUDE.name else ALL_PROFILES
+    if any(part in others for part in credential.parent.parent.parts):
         raise Blocked("credential path must name only its own profile")
     if any(credential.resolve().is_relative_to(path) for path in forbidden):
         raise Blocked("credential file must be outside the input and run directories")
+    low, high, shape = ((20, CREDENTIAL_MAX_BYTES, "a single-line ASCII token")
+                        if backend.name == CLAUDE.name
+                        else (*CODEX_CREDENTIAL_BYTES, "a Codex ChatGPT login file"))
     flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
     directory_fd = file_fd = None
     try:
         directory_fd = os.open(credential.parent, flags | os.O_DIRECTORY)
-        file_fd = os.open(CREDENTIAL_NAME, flags, dir_fd=directory_fd)
+        file_fd = os.open(name, flags, dir_fd=directory_fd)
         directory, info = os.fstat(directory_fd), os.fstat(file_fd)
         if not stat.S_ISREG(info.st_mode):
             raise Blocked("credential file is not a regular file")
@@ -832,8 +895,8 @@ def open_credential(profile: str, credential: Path,
                 raise Blocked(f"credential {label} must be owned by this user with mode {mode:o}")
         if info.st_nlink != 1:
             raise Blocked("credential file must have exactly one link")
-        if not 20 <= info.st_size <= CREDENTIAL_MAX_BYTES:
-            raise Blocked("credential file is not a single-line ASCII token")
+        if not low <= info.st_size <= high:
+            raise Blocked(f"credential file is not {shape}")
     except BaseException as error:
         if file_fd is not None:
             os.close(file_fd)
@@ -848,20 +911,45 @@ def open_credential(profile: str, credential: Path,
     return file_fd, info
 
 
-def checked_credential(profile: str, credential: Path, *forbidden: Path) -> None:
+def checked_credential(profile: str, credential: Path, *forbidden: Path,
+                       backend: Backend = CLAUDE) -> None:
     """Raise Blocked unless credential is a private file bound to profile.
 
     The closed gate uses this: path, owner, mode, link count and size only.
     The token itself is not read (load_credential does that).
     """
-    os.close(open_credential(profile, credential, forbidden)[0])
+    os.close(open_credential(profile, credential, forbidden, backend)[0])
 
 
-def load_credential(profile: str, credential: Path, *forbidden: Path) -> Credential:
+def read_credential(profile: str, credential: Path, forbidden: tuple[Path, ...],
+                    backend: Backend) -> bytes:
+    """One read of a checked credential file through its checked descriptor."""
+    descriptor, info = open_credential(profile, credential, forbidden, backend)
+    try:
+        data = os.read(descriptor, info.st_size + 1)
+        after = os.fstat(descriptor)
+    except OSError as error:
+        raise Blocked(f"credential file is unusable: {error.strerror}")
+    finally:
+        os.close(descriptor)
+    if (after.st_size, after.st_mtime_ns) != (info.st_size, info.st_mtime_ns) \
+            or len(data) != info.st_size:
+        raise Blocked("credential file changed while it was read")
+    return data
+
+
+def load_credential(profile: str, credential: Path, *forbidden: Path,
+                    backend: Backend = CLAUDE) -> Credential:
     """checked_credential plus one read of the token through the same descriptor.
 
     Called only past the gate (tests call it directly while it is closed).
+    A Codex credential is a login file (load_codex_credential).
     """
+    if backend.name == CODEX.name:
+        return load_codex_credential(profile, credential, *forbidden)
+    if backend.name != CLAUDE.name:
+        backend.require("credential_name")
+        raise Blocked(f"backend {backend.name} has no measured credential shape")
     descriptor, info = open_credential(profile, credential, forbidden)
     try:
         data = os.read(descriptor, CREDENTIAL_MAX_BYTES + 1)
@@ -880,6 +968,101 @@ def load_credential(profile: str, credential: Path, *forbidden: Path) -> Credent
     if not CREDENTIAL_PATTERN.fullmatch(token):
         raise Blocked("credential file is not a single-line ASCII token")
     return Credential(profile, token.removesuffix("\n"))
+
+
+# A Codex ChatGPT login file (auth.json of Codex 0.162.1, AuthDotJson): auth_mode
+# "chatgpt" (or absent), no API key, the three tokens and last_refresh. Any
+# other key with a value (an API key, a personal access token, an agent
+# identity, Bedrock keys) is refused: that is not the subscription login.
+CODEX_CREDENTIAL_BYTES = (200, 65_536)
+CODEX_TOKENS = ("id_token", "access_token", "refresh_token")
+CODEX_TOKEN = re.compile(r"[!-~]{20,16384}")
+CODEX_LOGIN_KEYS = {"auth_mode", "OPENAI_API_KEY", "tokens", "last_refresh"}
+CODEX_TIMESTAMP = re.compile(r"(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(?:\.\d{1,9})?(?:Z|\+00:00)")
+# Codex refreshes the token itself when it expires within 5 minutes or was
+# last refreshed 8 days ago (login/src/auth/manager.rs). A run cannot reach
+# auth.openai.com, so the parent refuses a login that would need a refresh
+# within the run: every bound below is checked with the run's whole timeout.
+CODEX_REFRESH_MARGIN_SECONDS = 300 + 60
+CODEX_REFRESH_AGE_SECONDS = 8 * 24 * 3600
+CODEX_CLOCK_SKEW_SECONDS = 300
+
+
+def jwt_expiry(token: str) -> int | None:
+    """The exp claim of a JWT (its payload only, never verified), or None."""
+    parts = token.split(".")
+    if len(parts) != 3:
+        return None
+    try:
+        payload = json.loads(base64.urlsafe_b64decode(parts[1] + "=" * (-len(parts[1]) % 4)))
+    except (ValueError, UnicodeError):
+        return None
+    expiry = payload.get("exp") if isinstance(payload, dict) else None
+    return expiry if isinstance(expiry, int) and not isinstance(expiry, bool) else None
+
+
+def load_codex_credential(profile: str, credential: Path, *forbidden: Path) -> Credential:
+    """The Codex login file, read once like a Claude token, then its shape.
+
+    Messages name keys only, never a value. The Credential's value is the
+    file's text (the parent writes exactly that into the run); its secrets are
+    the three tokens; its facts the access token's expiry and last_refresh."""
+    data = read_credential(profile, credential, forbidden, CODEX)
+    shape = "credential file is not a Codex ChatGPT login file"
+    try:
+        text = data.decode("utf-8")
+        login = json.loads(text, object_pairs_hook=unique_object)
+    except (UnicodeError, ValueError):
+        raise Blocked(shape) from None
+    if not isinstance(login, dict):
+        raise Blocked(shape)
+    extra = sorted(key for key, value in login.items()
+                   if key not in CODEX_LOGIN_KEYS and value is not None)
+    if extra:
+        raise Blocked(f"{shape}: it holds {', '.join(extra)}")
+    if login.get("OPENAI_API_KEY") is not None:
+        raise Blocked(f"{shape}: it holds an API key (paid API auth is never used)")
+    if login.get("auth_mode", "chatgpt") != "chatgpt":
+        raise Blocked(f"{shape}: auth_mode is not chatgpt")
+    tokens = login.get("tokens")
+    if not isinstance(tokens, dict):
+        raise Blocked(f"{shape}: no tokens")
+    secrets = []
+    for key in CODEX_TOKENS:
+        value = tokens.get(key)
+        if not isinstance(value, str) or CODEX_TOKEN.fullmatch(value) is None:
+            raise Blocked(f"{shape}: tokens.{key} is missing or malformed")
+        secrets.append(value)
+    if len(set(secrets)) != len(secrets):
+        raise Blocked(f"{shape}: two tokens are the same")
+    expiry = jwt_expiry(tokens["access_token"])
+    if expiry is None:
+        raise Blocked(f"{shape}: tokens.access_token has no expiry")
+    stamp = login.get("last_refresh")
+    matched = CODEX_TIMESTAMP.fullmatch(stamp) if isinstance(stamp, str) else None
+    if matched is None:
+        raise Blocked(f"{shape}: last_refresh is missing or malformed")
+    refreshed = calendar.timegm(time.strptime(matched.group(1), "%Y-%m-%dT%H:%M:%S"))
+    return Credential(profile, text, tuple(secrets),
+                      {"access_expires_at": expiry, "last_refresh_at": refreshed})
+
+
+def codex_credential_problems(credential: Credential, seconds: float,
+                              now: float | None = None) -> list[str]:
+    """Why Codex might refresh its login during a run of seconds (never a value)."""
+    now = time.time() if now is None else now
+    facts = credential.facts
+    problems = []
+    if facts.get("access_expires_at", 0) < now + seconds + CODEX_REFRESH_MARGIN_SECONDS:
+        problems.append("the Codex access token expires before the run could end; "
+                        "refresh the login outside the run")
+    refreshed = facts.get("last_refresh_at", 0)
+    if refreshed > now + CODEX_CLOCK_SKEW_SECONDS:
+        problems.append("the Codex login's last_refresh is in the future (clock?)")
+    elif now + seconds + 60 - refreshed >= CODEX_REFRESH_AGE_SECONDS:
+        problems.append("the Codex login is too old (Codex would refresh it); "
+                        "refresh the login outside the run")
+    return problems
 
 
 class LaunchRequest(NamedTuple):
@@ -958,9 +1141,16 @@ def file_sha256(path: Path, limit: int = MAX_PINNED_BINARY_BYTES) -> str | None:
         os.close(descriptor)
 
 
+def measured_scope(platform: str, backend: str) -> MeasuredLaunch | None:
+    """The measured launch a request of backend is compared with: that
+    backend's own once it has one (MEASURED_BACKEND_LAUNCHES), otherwise the
+    platform's Claude launch, which an unmeasured backend fails at its first field."""
+    return MEASURED_BACKEND_LAUNCHES.get((backend, platform)) or MEASURED_LAUNCHES.get(platform)
+
+
 def measured_launch_problems(platform: str, profile: str, launch: LaunchRequest | None) -> list[str]:
     """Why this launch is not the measured one (empty when it is exactly that)."""
-    scope = MEASURED_LAUNCHES.get(platform)
+    scope = measured_scope(platform, launch.backend if launch is not None else DEFAULT_BACKEND)
     if scope is None:
         return [f"no launch has been measured on {platform}"]
     if launch is None:
@@ -983,7 +1173,7 @@ def measured_launch_problems(platform: str, profile: str, launch: LaunchRequest 
 def measured_runtime_problems(platform: str, runtime: list[str], path: str | None,
                               backend: Backend = CLAUDE) -> tuple[str | None, list[str]]:
     """(cli, problems): the host, node and the backend's CLI must be the measured ones."""
-    scope = MEASURED_LAUNCHES[platform]
+    scope = measured_scope(platform, backend.name)
     problems = []
     if backend.name != scope.backend:
         problems.append(f"backend {backend.name} is not the measured {scope.backend}")
@@ -1050,7 +1240,14 @@ def require_runtime(profile: str, prefix: Path | None, path: str | None,
         raise Blocked(
             f"isolated launch is closed: srt {SRT_VERSION} verified at {runtime[1]}, "
             f"but no credential binding for {profile}")
-    checked_credential(profile, credential, *forbidden)
+    if scope_problems and (backend.credential_name is None
+                           or profile not in (backend.profiles or ())):
+        # A backend with no credential shape (agy), or a profile that is not
+        # the backend's: nothing to check, and the launch is closed anyway.
+        raise Blocked(
+            f"isolated launch is closed: srt {SRT_VERSION} verified at {runtime[1]}, "
+            "but no real launch has been measured with it: " + "; ".join(scope_problems))
+    checked_credential(profile, credential, *forbidden, backend=backend)
     if scope_problems:
         raise Blocked(
             f"isolated launch is closed: srt {SRT_VERSION} and the {profile} credential "
@@ -1060,7 +1257,7 @@ def require_runtime(profile: str, prefix: Path | None, path: str | None,
     if problems:
         raise Blocked("isolated launch is closed: this is not the measured runtime: "
                       + "; ".join(problems))
-    return runtime, cli, load_credential(profile, credential, *forbidden)
+    return runtime, cli, load_credential(profile, credential, *forbidden, backend=backend)
 
 
 def build_environment(parent: dict[str, str], run_dir: Path,
@@ -1073,17 +1270,23 @@ def build_environment(parent: dict[str, str], run_dir: Path,
     (relay_environment). On Linux PATH is LINUX_PATH, so srt finds the bwrap,
     socat and rg that linux_static_problems checked, never an earlier one on
     the parent's PATH. A backend without a measured configuration home or
-    credential variable is Blocked before any environment exists."""
+    credential variable is Blocked before any environment exists. A backend
+    that reads its credential from a file (Codex) gets no credential variable:
+    the parent writes the file into the run (run_supervised). Its fixed
+    variables (Backend.environment) come last; no parent value is inherited
+    for them."""
     config_variable, config_subdir = backend.require("config_variable"), backend.require("config_subdir")
-    credential_variable = backend.require("credential_variable") if credential is not None else None
+    by_variable = credential is not None and backend.credential_file is None
+    credential_variable = backend.require("credential_variable") if by_variable else None
     environment = {name: parent[name] for name in INHERITED_VARIABLES if name in parent}
     if (sys.platform if platform is None else platform) == "linux":
         environment["PATH"] = LINUX_PATH
     environment["HOME"] = str(run_dir / "home")
     environment["TMPDIR"] = str(run_dir / "tmp")
     environment[config_variable] = str(run_dir / config_subdir)
-    if credential is not None:
+    if by_variable:
         environment[credential_variable] = credential.reveal()
+    environment.update(backend.environment)
     return environment
 
 
@@ -1132,6 +1335,7 @@ def build_policy(input_dir: Path, run_dir: Path, cli: Path,
     read = list(system_read(platform))
     targets = [str(input_dir), str(run_dir), str(cli)]
     if platform == "linux":
+        read += backend.system_read_linux
         read += linux_link_targets(read)
         prefix = runtime_prefix(runtime)
         if prefix is not None and os.uname().machine in SECCOMP_ARCHES:
@@ -1143,6 +1347,9 @@ def build_policy(input_dir: Path, run_dir: Path, cli: Path,
     domains = list(backend.require("allowed_domains_linux" if platform == "linux"
                                    else "allowed_domains")) if model else []
     deny_write = [str(run_dir / "policy"), str(run_dir / "result")]
+    if model and backend.credential_file is not None:
+        # The parent's copy of the login: readable, never rewritten by the child.
+        deny_write.append(str(run_dir / backend.require("config_subdir") / backend.credential_file))
     if staged is not None:
         domains += staged.check().web_domains
         config = run_dir / backend.require("config_subdir")
@@ -1315,13 +1522,70 @@ def require_measured_argv(backend: Backend) -> None:
                       "the isolated launch stays closed")
 
 
+# Codex 0.162.1, the tool-less text mode (issue #6: no dontAsk equivalent, so
+# no tools at all). With CODEX_EXEC_SERVER_URL=none (build_environment) there
+# is no shell, apply_patch, view_image or request_permissions; these remove the
+# rest the model could otherwise get (hosted web search, image generation,
+# sub-agents, cloud skills, goals, sleep, request_user_input) and every
+# optional network use (apps MCP, plugin sync, analytics and Statsig metrics,
+# endless reconnects). Nothing is loaded from the run's CODEX_HOME config,
+# .rules, AGENTS.md in the input, hooks or bundled skills. exec itself forces
+# approval never; --sandbox read-only stays (its sandbox has nothing to run).
+CODEX_DISABLED_FEATURES = ("apps", "plugins", "image_generation", "goals", "sleep_tool",
+                           "shell_snapshot", "unbounded_connection_retries", "hooks",
+                           "shell_tool", "unified_exec", "view_image")
+CODEX_CONFIG = (("web_search", '"disabled"'), ("agents.enabled", "false"),
+                ("cloud.skills.enabled", "false"), ("skills.bundled.enabled", "false"),
+                ("skills.include_instructions", "false"), ("analytics.enabled", "false"),
+                ("project_doc_max_bytes", "0"),
+                ("tools.experimental_request_user_input.enabled", "false"),
+                ("check_for_update_on_startup", "false"))
+
+
+def build_codex_command(runtime: list[str], policy: Path, cli: str, prompt: str,
+                        permission_mode: str, selection: Selection | None) -> list[str]:
+    """The Codex read-only run's argv: exec --json in the tool-less mode.
+
+    permission_mode is the runner's only input mode (dontAsk); for Codex it
+    means this tool-less mode, so anything else is refused. A model and an
+    effort are always given (no Codex default is taken). The prompt is the
+    last argument after --; the child's stdin is /dev/null, which exec reads
+    as no additional input."""
+    if permission_mode != DEFAULT_PERMISSION_MODE:
+        raise ValueError(f"backend codex runs only the tool-less mode ({DEFAULT_PERMISSION_MODE})")
+    if selection is None:
+        raise Blocked("a codex run needs the user's explicit --model and --effort; "
+                      "no default is chosen")
+    selection.check()
+    features = [argument for name in CODEX_DISABLED_FEATURES for argument in ("--disable", name)]
+    config = [argument for key, value in CODEX_CONFIG for argument in ("-c", f"{key}={value}")]
+    return sandboxed(runtime, policy, [
+        cli, *features,
+        "exec",
+        "--json",
+        "--ephemeral",
+        "--skip-git-repo-check",
+        "--ignore-rules",
+        "--ignore-user-config",
+        "--sandbox", "read-only",
+        "--color", "never",
+        *config,
+        "--model", selection.model,
+        "-c", f'model_reasoning_effort="{selection.effort}"',
+        "--", prompt,
+    ])
+
+
 def build_command(runtime: list[str], policy: Path, cli: str, prompt: str,
                   permission_mode: str = DEFAULT_PERMISSION_MODE,
                   selection: Selection | None = None,
                   backend: Backend = CLAUDE) -> list[str]:
-    """The read-only run's argv (the Claude backend's; require_measured_argv).
+    """The read-only run's argv (the Claude backend's; require_measured_argv,
+    or Codex's: build_codex_command).
     selection, when given, adds --model and --effort before the permission
     flags; without it the argv is unchanged."""
+    if backend.name == CODEX.name:
+        return build_codex_command(runtime, policy, cli, prompt, permission_mode, selection)
     require_measured_argv(backend)
     if permission_mode not in PERMISSION_MODES:
         raise ValueError(f"permission mode must be one of {', '.join(PERMISSION_MODES)}")
@@ -1400,11 +1664,11 @@ def build_staged_command(runtime: list[str], policy: Path, cli: str, prompt: str
             "--", prompt]
 
 
-def prepare_run(run_dir: Path, policy: dict) -> Path:
+def prepare_run(run_dir: Path, policy: dict, backend: Backend = CLAUDE) -> Path:
     run_dir.mkdir(mode=0o700)
     for name in (*WRITABLE_AREAS, "policy", "result"):
         (run_dir / name).mkdir(mode=0o700)
-    (run_dir / "home/.claude").mkdir(mode=0o700)
+    (run_dir / (backend.config_subdir or CLAUDE.config_subdir)).mkdir(mode=0o700)
     policy_file = run_dir / "policy/srt-settings.json"
     policy_file.write_text(json.dumps(policy, indent=2), encoding="utf-8")
     policy_file.chmod(0o400)
@@ -1823,21 +2087,22 @@ def exposure_problems(run_dir: Path, credential: Credential,
     Only the exact value is matched. Encoded, split or transformed copies
     (base64, escapes, reversed) are not found; see the docs for the limits.
     """
-    value = credential.reveal()
     problems = [f"credential-exposed: {name}" for name, data in streams.items()
-                if value in data]
-    scan = ExposureScan(value)
-    for name in WRITABLE_AREAS:
-        area = run_dir / name
-        if area.is_symlink() or not area.is_dir():
-            continue
-        found = scan.area(area)
-        if found == "exposed":
-            problems.append(f"credential-exposed: {name}")
-        elif found is not None:
-            problems.append(f"credential-scan-{found.replace(': ', ': ' + name + ' ')}")
-            break
-    return problems
+                if credential.found_in(data)]
+    # One scan per exact secret (Claude: the token; Codex: each of its tokens).
+    for value in credential.secrets():
+        scan = ExposureScan(value)
+        for name in WRITABLE_AREAS:
+            area = run_dir / name
+            if area.is_symlink() or not area.is_dir():
+                continue
+            found = scan.area(area)
+            if found == "exposed":
+                problems.append(f"credential-exposed: {name}")
+            elif found is not None:
+                problems.append(f"credential-scan-{found.replace(': ', ': ' + name + ' ')}")
+                return list(dict.fromkeys(problems))
+    return list(dict.fromkeys(problems))
 
 
 def require_profile(credential: Credential | None, profile: str) -> None:
@@ -1854,6 +2119,9 @@ def result_problems(exit_code: int | None, stdout: str,
     if exit_code is None:
         return ["no exit code: the supervisor stopped the child"], None
     problems = [] if exit_code == 0 else [f"exit code {exit_code}"]
+    if backend.name == CODEX.name:
+        found, report = codex_events(stdout)
+        return problems + found, report
     if backend.name != CLAUDE.name:
         return problems + [f"backend {backend.name} has no measured result parser"], None
     try:
@@ -1874,10 +2142,91 @@ def result_problems(exit_code: int | None, stdout: str,
     return problems, text
 
 
-def observed_models(stdout: str, backend: Backend = CLAUDE) -> list[str] | None:
+# Codex exec --json (exec_events.rs of 0.162.1): one JSON object per line.
+# Items the tool-less mode may produce; any other item (command_execution,
+# file_change, mcp_tool_call, collab_tool_call, web_search, todo_list) is a tool
+# use and fails the run. A top-level "error" event is a transient reconnect
+# notice and is only counted; an "error" item fails the run except the one
+# transport notice below (WebSocket -> HTTPS fallback, seen with a 401 on the host).
+CODEX_TEXT_ITEMS = ("agent_message", "reasoning")
+CODEX_FALLBACK_NOTICE = "Falling back from WebSockets to HTTPS transport."
+# The session logs the server's model (RUST_LOG in CODEX.environment; exec's
+# default filter plus codex_core::session at info): "server reported model X
+# (matches requested model)" at info, or "... X while requested model was Y" at
+# warn (core/src/session/mod.rs), and a reroute also as an item
+# "model rerouted: A -> B (...)".
+CODEX_SERVER_MODEL = re.compile(
+    r"server reported model (\S+) (?:\(matches requested model\)|while requested model was )")
+CODEX_REROUTED = re.compile(r"model rerouted: (\S+) -> (\S+)")
+
+
+def codex_lines(stdout: str) -> list | None:
+    """The JSONL events, or None when a nonempty line is not a JSON object."""
+    events = []
+    for line in stdout.splitlines():
+        if not line.strip():
+            continue
+        try:
+            event = json.loads(line)
+        except ValueError:
+            return None
+        if not isinstance(event, dict):
+            return None
+        events.append(event)
+    return events
+
+
+def codex_events(stdout: str) -> tuple[list[str], str | None]:
+    """(problems, report text) of a Codex exec --json stream: one thread, one
+    completed turn, text items only, the last agent_message as the report."""
+    events = codex_lines(stdout)
+    if events is None:
+        return ["stdout is not Codex JSONL"], None
+    kinds = [event.get("type") for event in events]
+    problems = []
+    if kinds.count("thread.started") != 1:
+        problems.append("stdout does not start exactly one thread")
+    if kinds.count("turn.completed") != 1 or "turn.failed" in kinds:
+        problems.append("the turn did not complete")
+    elif kinds[-1] != "turn.completed":
+        problems.append("events follow the completed turn")
+    text = None
+    for event in events:
+        if event.get("type") not in ("item.started", "item.updated", "item.completed"):
+            continue
+        item = event.get("item")
+        kind = item.get("type") if isinstance(item, dict) else None
+        if kind == "error":
+            message = item.get("message")
+            if not (isinstance(message, str) and message.startswith(CODEX_FALLBACK_NOTICE)):
+                problems.append("an error item: " + (
+                    "model rerouted" if isinstance(message, str) and CODEX_REROUTED.search(message)
+                    else "see stdout"))
+        elif kind not in CODEX_TEXT_ITEMS:
+            problems.append(f"a tool item: {kind}")
+        elif kind == "agent_message" and event["type"] == "item.completed":
+            text = item.get("text")
+    problems = list(dict.fromkeys(problems))
+    if not isinstance(text, str) or not text.strip():
+        problems.append("result text is empty")
+        text = None
+    return problems, text
+
+
+def observed_models(stdout: str, backend: Backend = CLAUDE, stderr: str = "") -> list[str] | None:
     """Model names the result reports, in the backend's shape, if it has any:
-    Claude's result JSON names them under modelUsage. Another backend has no
-    measured shape yet, so nothing is observed (None, never a guess)."""
+    Claude's result JSON names them under modelUsage; Codex's session log line
+    on stderr names the server's model, and a rerouted item the model it was
+    rerouted to. Another backend has no measured shape yet, so nothing is
+    observed (None, never a guess)."""
+    if backend.name == CODEX.name:
+        names = set(CODEX_SERVER_MODEL.findall(stderr))
+        for event in codex_lines(stdout) or []:
+            item = event.get("item")
+            message = item.get("message") if isinstance(item, dict) else None
+            if isinstance(message, str):
+                names.update(match[1] for match in CODEX_REROUTED.findall(message))
+        return sorted(names) or None
     if backend.name != CLAUDE.name:
         return None
     try:
@@ -1928,7 +2277,12 @@ def collect(run_dir: Path, profile: str, exit_code: int | None,
             # JSON escapes (\uXXXX) would hide the value from the raw check.
             streams["stdout json"] = json.dumps(json.loads(stdout), ensure_ascii=False)
         except (ValueError, RecursionError):
-            pass
+            if backend.name == CODEX.name:
+                # JSONL: each event decoded the same way.
+                try:
+                    streams["stdout json"] = json.dumps(codex_lines(stdout), ensure_ascii=False)
+                except RecursionError:
+                    pass
         if relay_stderr is not None:
             streams["relay stderr"] = relay_stderr
         exposed = exposure_problems(run_dir, credential, streams)
@@ -1942,9 +2296,9 @@ def collect(run_dir: Path, profile: str, exit_code: int | None,
         problems += staged_problems(run_dir, staged)
     if credential is not None:
         # A path in a problem may itself hold the value; keep only the fact.
-        problems = [item if credential.reveal() not in item
+        problems = [item if not credential.found_in(item)
                     else "credential-exposed: problem text" for item in problems]
-        failures = [item if credential.reveal() not in item
+        failures = [item if not credential.found_in(item)
                     else "credential-exposed: failure text" for item in failures]
     manifest = {
         "status": "failed" if problems else "succeeded",
@@ -1965,14 +2319,17 @@ def collect(run_dir: Path, profile: str, exit_code: int | None,
         # only from the result itself, when it names models.
         manifest["requested_model"] = selection.model
         manifest["requested_effort"] = selection.effort
-    observed = observed_models(stdout, backend)
+    observed = observed_models(stdout, backend, stderr)
     if observed is not None:
         manifest["observed_models"] = observed
     if staged is not None:
         manifest["execution_profile"] = staged["profile"]
         manifest["staged"] = staged
     if credential is not None:
-        manifest["credential"] = {"variable": backend.require("credential_variable"),
+        delivery = ({"variable": backend.require("credential_variable")}
+                    if backend.credential_file is None else
+                    {"file": f"{backend.require('config_subdir')}/{backend.credential_file}"})
+        manifest["credential"] = {**delivery,
                                   "exact_value_check": "failed" if exposed else "clean"}
     if relay is not None:
         manifest["relay"] = relay
@@ -1982,12 +2339,55 @@ def collect(run_dir: Path, profile: str, exit_code: int | None,
         report.chmod(0o444)
         manifest["report_sha256"] = hashlib.sha256(report.read_bytes()).hexdigest()
     document = json.dumps(manifest, indent=2)
-    if credential is not None and credential.reveal() in document:
+    if credential is not None and credential.found_in(document):
         print("OSS research worker result not recorded: manifest would hold the credential",
               file=sys.stderr)
         return False
     (result_dir / "manifest.json").write_text(document, encoding="utf-8")
     return not problems
+
+
+def write_login(path: Path, credential: Credential) -> None:
+    """The parent's copy of a login file in the run (0600, new file, no link)."""
+    data = credential.reveal().encode("utf-8")
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    try:
+        view = memoryview(data)
+        while view:
+            view = view[os.write(descriptor, view):]
+    finally:
+        os.close(descriptor)
+
+
+def remove_login(path: Path, credential: Credential) -> bool:
+    """Remove the run's login copy; True when it was still exactly the parent's.
+
+    Whatever is at the path is removed (a link is unlinked, not followed), so
+    the exposure scan after it never meets the parent's own copy."""
+    unchanged = False
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError:
+        descriptor = None
+    if descriptor is not None:
+        try:
+            if stat.S_ISREG(os.fstat(descriptor).st_mode):
+                data = b""
+                while chunk := os.read(descriptor, 1 << 16):
+                    data += chunk
+                unchanged = data == credential.reveal().encode("utf-8")
+        finally:
+            os.close(descriptor)
+    try:
+        if path.is_dir() and not path.is_symlink():
+            shutil.rmtree(path)
+        else:
+            path.unlink()
+    except FileNotFoundError:
+        pass
+    except OSError:
+        return False
+    return unchanged
 
 
 def run_supervised(input_dir: Path, run_dir: Path, profile: str, seconds: float,
@@ -2018,10 +2418,10 @@ def run_supervised(input_dir: Path, run_dir: Path, profile: str, seconds: float,
     supervisor = Supervisor(seconds)
     port, relay_record, relay_process, exit_code = None, None, None, None
     staged_record = None
-    value = credential.reveal() if credential is not None else None
-
     def holds(strings) -> bool:
-        return value is not None and any(value in item for item in strings)
+        return credential is not None and any(credential.found_in(item) for item in strings)
+
+    login_file = None
 
     try:
         if relay is not None:
@@ -2043,12 +2443,16 @@ def run_supervised(input_dir: Path, run_dir: Path, profile: str, seconds: float,
                 except ValueError as error:
                     supervisor.fail(f"relay-not-ready: {error}")
             relay_record["port"] = port
-        policy_file = prepare_run(run_dir, policy_for(port))
+        policy_file = prepare_run(run_dir, policy_for(port), backend)
         if stage is not None and not supervisor.failures:
             try:
                 staged_record = stage(run_dir)
             except Blocked as error:
                 supervisor.fail(f"staging-blocked: {error}")
+        if credential is not None and backend.credential_file is not None \
+                and not supervisor.failures:
+            login_file = run_dir / backend.require("config_subdir") / backend.credential_file
+            write_login(login_file, credential)
         command = command_for(policy_file)
         if holds(command):
             supervisor.fail("credential-in-argv")
@@ -2063,6 +2467,11 @@ def run_supervised(input_dir: Path, run_dir: Path, profile: str, seconds: float,
                 exit_code = supervisor.run(child, relay_process)
     finally:
         supervisor.cleanup()
+        if login_file is not None:
+            # Removed before collect scans the run; changed means the child
+            # (or a refresh) rewrote the login, which fails the run.
+            if not remove_login(login_file, credential):
+                supervisor.fail("credential-file-changed")
     if relay_record is not None:
         relay_record["stderr"] = text(supervisor.data["relay stderr"])
     if supervisor.failures:
@@ -2094,7 +2503,10 @@ def run_research(runtime: list[str], cli: str, prompt: str, input_dir: Path,
     Without staged it is the read-only run exactly as before; with it, the
     profile's configuration is staged and its argv and policy are used.
     The backend's argv, environment and policy are built; a backend without
-    measured ones (codex, agy) is Blocked before any directory exists.
+    measured ones (agy) is Blocked before any directory exists. A Codex run is
+    the read-only one only (no staged profile), always with its login file
+    (without one Codex would go to the API-key endpoint), and only while that
+    login needs no refresh within seconds (codex_credential_problems).
     """
     require_profile(credential, profile)
     if selection is not None:
@@ -2102,7 +2514,18 @@ def run_research(runtime: list[str], cli: str, prompt: str, input_dir: Path,
     elif credential is not None:
         raise Blocked("a live run needs the user's explicit --model and --effort; "
                       "no default is chosen")
-    require_measured_argv(backend)
+    if backend.name == CODEX.name:
+        if staged is not None:
+            raise Blocked("backend codex has no staged profile; the isolated launch stays closed")
+        if credential is None:
+            raise Blocked("a codex run needs its ChatGPT login file; none was loaded")
+        if profile not in backend.require("profiles"):
+            raise Blocked(f"profile {profile} is not a codex profile")
+        stale = codex_credential_problems(credential, seconds)
+        if stale:
+            raise Blocked("; ".join(stale))
+    else:
+        require_measured_argv(backend)
     if staged is None:
         return run_supervised(
             input_dir, run_dir, profile, seconds, relay,
@@ -2136,7 +2559,8 @@ def positive_seconds(value: str) -> float:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--profile", required=True, choices=PROFILES)
+    parser.add_argument("--profile", required=True, choices=ALL_PROFILES,
+                        help="claude-profile1|2 for --backend claude, codex-profile1 for codex")
     parser.add_argument("--backend", choices=tuple(BACKENDS), default=DEFAULT_BACKEND,
                         help="the model CLI for the child (default claude). Only claude "
                              "has a measured launch; the others are blocked at the gate")
@@ -2194,6 +2618,9 @@ def main() -> int:
             arguments.relay_timeout_seconds) if arguments.relay_repo else None
         if (arguments.model is None) != (arguments.effort is None):
             raise ValueError("give --model and --effort together, or neither")
+        profiles = BACKENDS[arguments.backend].profiles
+        if profiles is not None and arguments.profile not in profiles:
+            raise ValueError(f"--profile {arguments.profile} is not a {arguments.backend} profile")
         selection = Selection(arguments.model, arguments.effort).check() \
             if arguments.model is not None else None
         if arguments.execution_profile == DEFAULT_EXECUTION_PROFILE:

@@ -4,9 +4,10 @@ S1: with --backend claude (the default) the Claude argv, srt policy, child
 environment and measured launch are byte for byte what main 74e49d6 built:
 the sha256 constants below were taken from that revision (docs/development/
 2026-10-11-6-research-backends/README.md) and the builders here must reproduce
-them. S2: an unmeasured backend (codex, agy) is Blocked at the gate with the
-credential unread and no run directory, and every adapter builder refuses to
-build anything for it. The egress pin and the unit wrapper carry the run's
+them. S2: a backend without a measured launch (codex until its real run, agy)
+is Blocked at the gate with the credential unread and no run directory, and
+every adapter builder refuses to build anything for agy. Codex's own adapter
+(stage 2) is tested in test_oss_research_worker_codex.py. The egress pin and the unit wrapper carry the run's
 backend and pin only its names.
 
 Every claude/srt/egress-pin here is a test-only fake; credential files hold
@@ -107,14 +108,21 @@ class BackendTableTests(unittest.TestCase):
         self.assertEqual(claude.allowed_domains, worker.ALLOWED_DOMAINS)
         self.assertEqual(claude.allowed_domains_linux, worker.ALLOWED_DOMAINS_LINUX)
         self.assertEqual(claude.pinned_names, ("api.anthropic.com",))
+        self.assertEqual(claude.profiles, worker.PROFILES)
+        # Claude takes its token in a variable, no fixed variable, no extra read.
+        self.assertEqual((claude.credential_file, claude.environment, claude.system_read_linux),
+                         (None, (), ()))
         for field in worker.Backend._fields:
+            if field in ("credential_file", "environment", "system_read_linux"):
+                continue
             self.assertIsNotNone(getattr(claude, field), field)
             self.assertEqual(claude.require(field), getattr(claude, field))
 
     def test_unmeasured_backends_have_only_a_name_and_an_executable(self):
-        for backend in (worker.CODEX, worker.AGY):
+        for backend in (worker.AGY,):
+            self.assertEqual((backend.environment, backend.system_read_linux), ((), ()))
             for field in worker.Backend._fields:
-                if field in ("name", "executable"):
+                if field in ("name", "executable", "environment", "system_read_linux"):
                     continue
                 with self.subTest(backend=backend.name, field=field):
                     self.assertIsNone(getattr(backend, field))
@@ -254,6 +262,18 @@ class UnmeasuredBackendGateTests(unittest.TestCase):
         self.credential = directory / worker.CREDENTIAL_NAME
         self.credential.write_text(FAKE_TOKEN + "\n")
         self.credential.chmod(0o600)
+        directory = self.root / "credentials/codex-profile1"
+        directory.mkdir(parents=True, mode=0o700)
+        self.codex_credential = directory / worker.CODEX_CREDENTIAL_NAME
+        self.codex_credential.write_text(json.dumps({"auth_mode": "chatgpt", "OPENAI_API_KEY": None,
+                                                     "tokens": {}, "pad": FAKE_TOKEN * 8}))
+        self.codex_credential.chmod(0o600)
+
+    def per_backend(self, name):
+        """(profile, credential file) a request of backend name carries."""
+        if name == "codex":
+            return "codex-profile1", self.codex_credential
+        return "claude-profile2", self.credential
 
     def test_measured_launch_problems_name_the_backend_first(self):
         for name in ("codex", "agy"):
@@ -262,7 +282,8 @@ class UnmeasuredBackendGateTests(unittest.TestCase):
             self.assertEqual(problems, [f"backend {name} is not the measured claude"])
         self.assertEqual(worker.measured_launch_problems("linux", "claude-profile2", self.GOOD), [])
 
-    def gate(self, platform, backend, launch):
+    def gate(self, platform, backend, launch, profile="claude-profile2", credential=None):
+        credential = self.credential if credential is None else credential
         with mock.patch.object(worker, "verify_runtime", return_value=list(RUNTIME)), \
                 mock.patch.object(worker, "platform_problems", return_value=[]), \
                 mock.patch.object(worker, "checked_credential",
@@ -271,8 +292,8 @@ class UnmeasuredBackendGateTests(unittest.TestCase):
                                   wraps=worker.load_credential) as load, \
                 mock.patch.object(worker.subprocess, "Popen") as popen:
             with self.assertRaises(worker.Blocked) as blocked:
-                worker.require_runtime("claude-profile2", self.root / "prefix", str(self.bin),
-                                       self.credential, (self.input, self.run_dir),
+                worker.require_runtime(profile, self.root / "prefix", str(self.bin),
+                                       credential, (self.input, self.run_dir),
                                        platform=platform, launch=launch, backend=backend)
         popen.assert_not_called()
         self.assertEqual(load.call_count, 0)
@@ -284,11 +305,13 @@ class UnmeasuredBackendGateTests(unittest.TestCase):
         for name in ("codex", "agy"):
             backend = worker.BACKENDS[name]
             for platform in ("linux", "darwin"):
-                with self.subTest(backend=name, platform=platform):
-                    message, _ = self.gate(platform, backend, self.GOOD._replace(backend=name))
-                    self.assertIn("isolated launch is closed", message)
-                    if platform == "linux":
-                        self.assertIn(f"backend {name} is not the measured claude", message)
+                for profile, credential in {self.per_backend(name), self.per_backend("claude")}:
+                    with self.subTest(backend=name, platform=platform, profile=profile):
+                        message, _ = self.gate(platform, backend, self.GOOD._replace(backend=name),
+                                               profile, credential)
+                        self.assertIn("isolated launch is closed", message)
+                        if platform == "linux":
+                            self.assertIn(f"backend {name} is not the measured claude", message)
         # On Linux the unmeasured read set closes the gate before the credential
         # file is even looked at.
         _, looked = self.gate("linux", worker.CODEX, self.GOOD._replace(backend="codex"))
@@ -307,12 +330,13 @@ class UnmeasuredBackendGateTests(unittest.TestCase):
         def gate(*arguments, **options):
             seen.update(options)
             raise worker.Blocked("stop here")
-        base = ["worker", "--profile", "claude-profile2", "--input-dir", str(self.input),
-                "--prompt-file", str(self.prompt), "--run-dir", str(self.run_dir),
-                "--credential-file", str(self.credential),
-                "--model", "claude-opus-5-5", "--effort", "medium"]
         for extra, expected in (([], "claude"), (["--backend", "claude"], "claude"),
                                 (["--backend", "codex"], "codex"), (["--backend", "agy"], "agy")):
+            profile, credential = self.per_backend(expected)
+            base = ["worker", "--profile", profile, "--input-dir", str(self.input),
+                    "--prompt-file", str(self.prompt), "--run-dir", str(self.run_dir),
+                    "--credential-file", str(credential),
+                    "--model", "claude-opus-5-5", "--effort", "medium"]
             with self.subTest(extra=extra):
                 seen.clear()
                 environment = {k: v for k, v in os.environ.items() if k != worker.UNIT_ENV_MARKER}
@@ -333,16 +357,18 @@ class UnmeasuredBackendGateTests(unittest.TestCase):
     def test_cli_takes_the_three_backends_and_blocks_the_unmeasured_ones(self):
         environment = {"PATH": f"{self.bin}:/usr/bin:/bin", "HOME": str(self.root / "home"),
                        "CLAUDE_CODE_OAUTH_TOKEN": "sentinel-must-not-reach-child"}
-        base = [sys.executable, "-B", str(WORKER), "--profile", "claude-profile2",
-                "--input-dir", str(self.input), "--prompt-file", str(self.prompt),
-                "--run-dir", str(self.run_dir), "--credential-file", str(self.credential),
-                "--model", "claude-opus-5-5", "--effort", "medium"]
         for extra, code in ((["--backend", "codex"], worker.EXIT_BLOCKED),
                             (["--backend", "agy"], worker.EXIT_BLOCKED),
                             (["--backend", "claude"], worker.EXIT_BLOCKED),
                             ([], worker.EXIT_BLOCKED),
                             (["--backend", "gemini"], worker.EXIT_BAD_INPUT),
                             (["--backend", ""], worker.EXIT_BAD_INPUT)):
+            name = extra[1] if extra and extra[1] in worker.BACKENDS else "claude"
+            profile, credential = self.per_backend(name)
+            base = [sys.executable, "-B", str(WORKER), "--profile", profile,
+                    "--input-dir", str(self.input), "--prompt-file", str(self.prompt),
+                    "--run-dir", str(self.run_dir), "--credential-file", str(credential),
+                    "--model", "claude-opus-5-5", "--effort", "medium"]
             with self.subTest(extra=extra):
                 result = subprocess.run(base + extra, cwd=self.root, env=environment,
                                         capture_output=True, text=True, timeout=120)
@@ -355,7 +381,7 @@ class UnmeasuredBackendGateTests(unittest.TestCase):
 
     def test_adapters_without_measurements_build_nothing(self):
         parent = {"PATH": "/usr/bin:/bin"}
-        for backend in (worker.CODEX, worker.AGY):
+        for backend in (worker.AGY,):
             with self.subTest(backend.name):
                 with self.assertRaisesRegex(worker.Blocked, "no measured argv"):
                     worker.build_command(RUNTIME, POLICY_FILE, "/opt/x", "prompt", backend=backend)
@@ -396,8 +422,10 @@ class EgressPinBackendTests(unittest.TestCase):
         self.assertEqual(pin.PINNED_NAMES, ("api.github.com", "api.anthropic.com"))
         self.assertEqual(pin.pinned_names("claude"), pin.PINNED_NAMES)
         self.assertEqual(pin.pinned_names("none"), ("api.github.com",))
+        self.assertEqual(pin.pinned_names("codex"), ("api.github.com", "chatgpt.com"))
+        self.assertEqual(pin.MODEL_NAMES["codex"], worker.CODEX.pinned_names)
         self.assertEqual(pin.BACKEND_NAMES, ("claude", "codex", "agy", "none"))
-        for name in ("codex", "agy"):
+        for name in ("agy",):
             with self.assertRaisesRegex(pin.PinError, f"no egress names have been measured for backend {name}"):
                 pin.pinned_names(name)
         for name in ("gemini", "", None, 3):
@@ -432,7 +460,7 @@ class EgressPinBackendTests(unittest.TestCase):
     def test_unmeasured_backend_is_refused_before_anything_changes(self):
         fixture = egress_tests.Fixture(self)
         before = fixture.hosts.read_text(encoding="utf-8")
-        for name in ("codex", "agy", "gemini"):
+        for name in ("agy", "gemini"):
             with self.subTest(name), self.assertRaises(pin.PinError):
                 pin.apply(fixture.env, "run-1", 600, fixture.resolver.address, name)
         self.assertEqual(fixture.nft.calls, [])
@@ -446,7 +474,8 @@ class EgressPinBackendTests(unittest.TestCase):
         path = fixture.env.manifest_path
         original = json.loads(path.read_text(encoding="utf-8"))
         for value, text in (("none", "pins must name exactly api.github.com"),
-                            ("codex", "manifest backend refused"),
+                            ("codex", "pins must name exactly"),
+                            ("agy", "manifest backend refused"),
                             ("gemini", "manifest backend refused"),
                             (None, "manifest backend refused")):
             with self.subTest(value):
@@ -475,7 +504,7 @@ class EgressPinBackendTests(unittest.TestCase):
         env = pin.Env(require_root=False, nft=lambda args: self.fail("nft must not run"))
         with contextlib.redirect_stdout(None):
             self.assertEqual(2, pin.main(["apply", "--run-id", "r", "--ttl", "600",
-                                          "--resolver", "127.0.0.1", "--backend", "codex"], env=env))
+                                          "--resolver", "127.0.0.1", "--backend", "agy"], env=env))
 
 
 FAKE_PIN = r"""
