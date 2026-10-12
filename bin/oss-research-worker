@@ -2157,10 +2157,16 @@ def result_problems(exit_code: int | None, stdout: str,
 # Items the tool-less mode may produce; any other item (command_execution,
 # file_change, mcp_tool_call, collab_tool_call, web_search, todo_list) is a tool
 # use and fails the run. A top-level "error" event is a transient reconnect
-# notice and is only counted; an "error" item fails the run except the one
-# transport notice below (WebSocket -> HTTPS fallback, seen with a 401 on the host).
+# notice and is only counted; an "error" item fails the run except the known
+# notices below: the WebSocket -> HTTPS fallback (seen with a 401 on the host),
+# and Code Mode being unavailable: gpt-6.1-sol's metadata asks for code mode
+# only, and without the separate codex-code-mode-host binary code mode "will
+# fail closed", which leaves the model no tool (core/src/tools/code_mode; seen
+# on the first item of every guest run, 2026-10-13).
 CODEX_TEXT_ITEMS = ("agent_message", "reasoning")
 CODEX_FALLBACK_NOTICE = "Falling back from WebSockets to HTTPS transport."
+CODEX_CODE_MODE_NOTICE = "Code Mode is unavailable because "
+CODEX_NOTICES = (CODEX_FALLBACK_NOTICE, CODEX_CODE_MODE_NOTICE)
 # The session logs the server's model (RUST_LOG in CODEX.environment; exec's
 # default filter plus codex_core::session at info): "server reported model X
 # (matches requested model)" at info, or "... X while requested model was Y" at
@@ -2209,7 +2215,7 @@ def codex_events(stdout: str) -> tuple[list[str], str | None]:
         kind = item.get("type") if isinstance(item, dict) else None
         if kind == "error":
             message = item.get("message")
-            if not (isinstance(message, str) and message.startswith(CODEX_FALLBACK_NOTICE)):
+            if not (isinstance(message, str) and message.startswith(CODEX_NOTICES)):
                 problems.append("an error item: " + (
                     "model rerouted" if isinstance(message, str) and CODEX_REROUTED.search(message)
                     else "see stdout"))

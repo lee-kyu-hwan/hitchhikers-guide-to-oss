@@ -350,6 +350,11 @@ class CodexResultTests(unittest.TestCase):
                        {"type": "error", "message": "Reconnecting... 1/5 (stream disconnected)"},
                        {"type": "item.completed", "item": {"id": "i", "type": "error", "message":
                         worker.CODEX_FALLBACK_NOTICE + " unexpected status"}},
+                       {"type": "item.completed", "item": {"id": "c", "type": "error", "message":
+                        "Code Mode is unavailable because failed to spawn code-mode host "
+                        "/opt/oss-research/codex-0.162.1/codex-code-mode-host: host executable was not "
+                        "found. Code mode will fail closed; enable `features.code_mode_host` and install "
+                        "`codex-code-mode-host`."}},
                        {"type": "item.completed", "item": {"id": "j", "type": "agent_message",
                                                            "text": "first"}},
                        {"type": "item.completed", "item": {"id": "k", "type": "agent_message",
@@ -373,6 +378,9 @@ class CodexResultTests(unittest.TestCase):
             (jsonl(*start, {"type": "item.completed", "item": {"id": "e", "type": "error",
                                                                "message": "boom"}}, message, done),
              "an error item: see stdout"),
+            (jsonl(*start, {"type": "item.completed", "item": {"id": "e", "type": "error", "message":
+                   "Model metadata for `gpt-6.1-sol` not found. Defaulting to fallback metadata"}},
+                   message, done), "an error item: see stdout"),
             (jsonl(*start, {"type": "turn.failed", "error": {"message": "x"}}), "the turn did not complete"),
             (jsonl(*start, message), "the turn did not complete"),
             (jsonl(*start, message, done, done), "the turn did not complete"),
