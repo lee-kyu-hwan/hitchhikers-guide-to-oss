@@ -1,5 +1,13 @@
 #!/usr/bin/env python3
-"""Start a read-only Claude worker for OSS research inside the sandbox runtime.
+"""Start a read-only model worker for OSS research inside the sandbox runtime.
+
+The model CLI is a backend (BACKENDS: claude, codex, agy; --backend, default
+claude). Everything the runner knows about one CLI (its executable, argv,
+configuration home, credential variable, model endpoint, result shape) sits
+behind that Backend; the module constants below are the Claude backend's
+values, unchanged. Only the Claude backend has a measured launch: a request
+for another backend is Blocked at the gate like any other unmeasured launch,
+with the credential unread, and the Claude path is byte for byte what it was.
 
 The real launch is closed except for the launches listed in MEASURED_LAUNCHES.
 The pinned srt install and the shape of a profile-bound credential file are
@@ -82,18 +90,23 @@ SYSTEM_READ_MEASURED = {"darwin": True, "linux": False}
 
 
 class MeasuredLaunch(NamedTuple):
-    """One launch configuration observed end to end with a real model."""
+    """One launch configuration observed end to end with a real model.
+
+    cli_sha256 is the backend's executable (Claude 2.1.283 for the Linux
+    launch); backend names which BACKENDS entry ran. A launch of another
+    backend is unmeasured until it has its own entry."""
     os_id: str
     os_version: str
     machine: str
     node_sha256: str
-    claude_sha256: str
+    cli_sha256: str
     execution_profile: str
     permission_mode: str
     relay: bool
     profile: str
     model: str
     effort: str
+    backend: str = "claude"
 
 
 # The launches that were measured, per platform. Linux: the Debian 13 arm64
@@ -111,9 +124,10 @@ MEASURED_LAUNCHES = {
     "linux": MeasuredLaunch(
         os_id="debian", os_version="13", machine="aarch64",
         node_sha256="23a5637c2470fde09fcc1acc77c1b92e04e3d7e3e6e80ff7df6f5831958d1477",
-        claude_sha256="346d294f0103d6fc0de11ac953579b5c62dfa90698a4cfc486b6f927c615e697",
+        cli_sha256="346d294f0103d6fc0de11ac953579b5c62dfa90698a4cfc486b6f927c615e697",
         execution_profile="read-only", permission_mode="dontAsk", relay=False,
-        profile="claude-profile2", model="claude-opus-5-5", effort="medium"),
+        profile="claude-profile2", model="claude-opus-5-5", effort="medium",
+        backend="claude"),
 }
 OS_RELEASE = Path("/etc/os-release")
 MAX_PINNED_BINARY_BYTES = 1024 * 1024 * 1024
@@ -185,6 +199,53 @@ EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
 # One opaque argument: printable ASCII without spaces, 1-128 characters, not
 # starting with "-". It keeps every form the CLI accepts (claude-opus-5-5[1m]).
 MODEL_NAME = re.compile(r"[!-,.-~][!-~]{0,127}")
+
+
+class Blocked(Exception):
+    """The isolated launch cannot start; never fall back to an unisolated one."""
+
+
+class Backend(NamedTuple):
+    """One model CLI as the runner drives it (issue #6, the seven Claude dependencies).
+
+    A field that is None is not measured for that backend yet; anything that
+    needs it is Blocked (require). Only name and executable are always set.
+    The argv builders (build_command, build_staged_command) and the result
+    parsers (result_problems, observed_models) dispatch on name: the Claude
+    ones are the measured ones, the others stay closed until measured.
+    """
+    name: str
+    executable: str                              # found on PATH past the gate
+    credential_name: str | None                  # <dir>/<profile>/<credential_name>
+    credential_variable: str | None              # the one variable the child gets it in
+    config_variable: str | None                  # the CLI's configuration-home variable
+    config_subdir: str | None                    # ... pointed at run/<config_subdir>
+    allowed_domains: tuple[str, ...] | None      # model endpoint (macOS form)
+    allowed_domains_linux: tuple[str, ...] | None  # the same with :443 (Linux form)
+    pinned_names: tuple[str, ...] | None         # names the egress pin resolves for a run
+
+    def require(self, field: str):
+        value = getattr(self, field)
+        if value is None:
+            raise Blocked(f"backend {self.name} has no measured {field.replace('_', ' ')}; "
+                          "the isolated launch stays closed")
+        return value
+
+
+# The Claude backend is the measured one: its fields are the module constants.
+CLAUDE = Backend(
+    name="claude", executable="claude",
+    credential_name=CREDENTIAL_NAME, credential_variable=CREDENTIAL_VARIABLE,
+    config_variable="CLAUDE_CONFIG_DIR", config_subdir="home/.claude",
+    allowed_domains=ALLOWED_DOMAINS, allowed_domains_linux=ALLOWED_DOMAINS_LINUX,
+    pinned_names=("api.anthropic.com",))
+# Codex and agy: named so --backend takes them, nothing measured (issue #6
+# stages 2 and 3: argv from the installed version's --help, a run-only
+# configuration home, the credential shape, the endpoints seen in a real run).
+CODEX = Backend("codex", "codex", None, None, None, None, None, None, None)
+AGY = Backend("agy", "agy", None, None, None, None, None, None, None)
+BACKENDS = {backend.name: backend for backend in (CLAUDE, CODEX, AGY)}
+DEFAULT_BACKEND = CLAUDE.name
 
 
 class Selection(NamedTuple):
@@ -296,10 +357,6 @@ MAX_RELAY_TIMEOUT_SECONDS = 300.0
 EXIT_BAD_INPUT = 2
 EXIT_BLOCKED = 3
 EXIT_FAILED = 4
-
-
-class Blocked(Exception):
-    """The isolated launch cannot start; never fall back to an unisolated one."""
 
 
 class StagedRun(NamedTuple):
@@ -835,6 +892,7 @@ class LaunchRequest(NamedTuple):
     relay: bool
     selection: "Selection | None"
     unit_problems: tuple[str, ...]
+    backend: str = DEFAULT_BACKEND
 
 
 UNIT_NAME = re.compile(r"oss-research-[0-9a-f]{16}")
@@ -910,6 +968,7 @@ def measured_launch_problems(platform: str, profile: str, launch: LaunchRequest 
     problems = list(launch.unit_problems)
     selection = launch.selection
     for label, got, want in (
+            ("backend", launch.backend, scope.backend),
             ("execution profile", launch.execution_profile, scope.execution_profile),
             ("permission mode", launch.permission_mode, scope.permission_mode),
             ("relay", "a relay" if launch.relay else "none", "a relay" if scope.relay else "none"),
@@ -921,11 +980,13 @@ def measured_launch_problems(platform: str, profile: str, launch: LaunchRequest 
     return problems
 
 
-def measured_runtime_problems(platform: str, runtime: list[str], path: str | None
-                              ) -> tuple[str | None, list[str]]:
-    """(claude, problems): the host, node and Claude must be the measured ones."""
+def measured_runtime_problems(platform: str, runtime: list[str], path: str | None,
+                              backend: Backend = CLAUDE) -> tuple[str | None, list[str]]:
+    """(cli, problems): the host, node and the backend's CLI must be the measured ones."""
     scope = MEASURED_LAUNCHES[platform]
     problems = []
+    if backend.name != scope.backend:
+        problems.append(f"backend {backend.name} is not the measured {scope.backend}")
     release = os_release()
     if (release.get("ID"), release.get("VERSION_ID")) != (scope.os_id, scope.os_version):
         problems.append(f"the host is not {scope.os_id} {scope.os_version}")
@@ -939,31 +1000,35 @@ def measured_runtime_problems(platform: str, runtime: list[str], path: str | Non
     problems += file_problems("node", node, 0, Path("/"))
     if file_sha256(node) != scope.node_sha256:
         problems.append("node is not the measured node (sha256)")
-    found = shutil.which("claude", path=path) if path else None
+    found = shutil.which(backend.executable, path=path) if path else None
     if found is None:
-        return None, problems + ["claude is not on PATH"]
-    claude = Path(os.path.realpath(found))
-    problems += file_problems("claude", claude, 0, Path("/"))
-    if file_sha256(claude) != scope.claude_sha256:
-        problems.append("claude is not the measured Claude (sha256)")
-    return str(claude), problems
+        return None, problems + [f"{backend.executable} is not on PATH"]
+    cli = Path(os.path.realpath(found))
+    problems += file_problems(backend.executable, cli, 0, Path("/"))
+    if file_sha256(cli) != scope.cli_sha256:
+        problems.append(f"{backend.executable} is not the measured "
+                        f"{backend.executable.capitalize()} (sha256)")
+    return str(cli), problems
 
 
 def require_runtime(profile: str, prefix: Path | None, path: str | None,
                     credential: Path | None = None,
                     forbidden: tuple[Path, ...] = (),
                     platform: str | None = None,
-                    launch: LaunchRequest | None = None) -> tuple[list[str], str, Credential]:
+                    launch: LaunchRequest | None = None,
+                    backend: Backend = CLAUDE) -> tuple[list[str], str, Credential]:
     """Raise Blocked unless this is exactly a launch that has been measured.
 
     The runtime and credential-file checks are real. On a platform with a
     measured launch (MEASURED_LAUNCHES; Linux only), the gate opens for that
     one configuration: every field of launch must match, and the host, node
-    and Claude must be the measured files. Only then is the token read
-    (load_credential) and returned. Anything else is Blocked, with the token
-    unread: until those checks passed, only the credential's metadata is
+    and the backend's CLI must be the measured files. Only then is the token
+    read (load_credential) and returned. Anything else is Blocked, with the
+    token unread: until those checks passed, only the credential's metadata is
     looked at. On Linux the file-only prerequisites are checked too; nothing
     is started for them (linux_execution_preflight is a separate, manual step).
+    launch.backend must name backend; a backend without a measured launch
+    (codex, agy) is Blocked here like any other unmeasured field.
     """
     platform = sys.platform if platform is None else platform
     runtime = verify_runtime(prefix, path)
@@ -971,6 +1036,9 @@ def require_runtime(profile: str, prefix: Path | None, path: str | None,
     if problems:
         raise Blocked(f"srt {SRT_VERSION} verified at {runtime[1]}, but this {platform} "
                       "host cannot run it isolated: " + "; ".join(problems))
+    if launch is not None and launch.backend != backend.name:
+        raise Blocked(f"isolated launch is closed: the launch request names backend "
+                      f"{launch.backend}, not {backend.name}")
     scope_problems = measured_launch_problems(platform, profile, launch)
     if not SYSTEM_READ_MEASURED[platform] and scope_problems:
         # Only the measured launch stands in for the unmeasured read set.
@@ -988,28 +1056,34 @@ def require_runtime(profile: str, prefix: Path | None, path: str | None,
             f"isolated launch is closed: srt {SRT_VERSION} and the {profile} credential "
             "file are checked, but no real launch has been measured with them: "
             + "; ".join(scope_problems))
-    claude, problems = measured_runtime_problems(platform, runtime, path)
+    cli, problems = measured_runtime_problems(platform, runtime, path, backend)
     if problems:
         raise Blocked("isolated launch is closed: this is not the measured runtime: "
                       + "; ".join(problems))
-    return runtime, claude, load_credential(profile, credential, *forbidden)
+    return runtime, cli, load_credential(profile, credential, *forbidden)
 
 
 def build_environment(parent: dict[str, str], run_dir: Path,
                       credential: Credential | None = None,
-                      platform: str | None = None) -> dict[str, str]:
-    """The child's environment: the allowlist, run paths and, only when given,
-    the checked credential. The relay never gets it (relay_environment).
-    On Linux PATH is LINUX_PATH, so srt finds the bwrap, socat and rg that
-    linux_static_problems checked, never an earlier one on the parent's PATH."""
+                      platform: str | None = None,
+                      backend: Backend = CLAUDE) -> dict[str, str]:
+    """The child's environment: the allowlist, run paths, the backend's
+    configuration home under the run and, only when given, the checked
+    credential in the backend's variable. The relay never gets it
+    (relay_environment). On Linux PATH is LINUX_PATH, so srt finds the bwrap,
+    socat and rg that linux_static_problems checked, never an earlier one on
+    the parent's PATH. A backend without a measured configuration home or
+    credential variable is Blocked before any environment exists."""
+    config_variable, config_subdir = backend.require("config_variable"), backend.require("config_subdir")
+    credential_variable = backend.require("credential_variable") if credential is not None else None
     environment = {name: parent[name] for name in INHERITED_VARIABLES if name in parent}
     if (sys.platform if platform is None else platform) == "linux":
         environment["PATH"] = LINUX_PATH
     environment["HOME"] = str(run_dir / "home")
     environment["TMPDIR"] = str(run_dir / "tmp")
-    environment["CLAUDE_CONFIG_DIR"] = str(run_dir / "home/.claude")
+    environment[config_variable] = str(run_dir / config_subdir)
     if credential is not None:
-        environment[CREDENTIAL_VARIABLE] = credential.reveal()
+        environment[credential_variable] = credential.reveal()
     return environment
 
 
@@ -1034,10 +1108,10 @@ def linux_link_targets(paths: list[str]) -> list[str]:
     return targets
 
 
-def build_policy(input_dir: Path, run_dir: Path, claude: Path,
+def build_policy(input_dir: Path, run_dir: Path, cli: Path,
                  relay_port: int | None = None, model: bool = True,
                  staged: StagedRun | None = None, platform: str | None = None,
-                 runtime: list[str] | None = None) -> dict:
+                 runtime: list[str] | None = None, backend: Backend = CLAUDE) -> dict:
     """srt settings using only keys documented in the sandbox-runtime README.
 
     The system read paths are the platform's (system_read). On Linux srt runs
@@ -1045,16 +1119,18 @@ def build_policy(input_dir: Path, run_dir: Path, claude: Path,
     found from runtime (the argv verify_runtime returned); without runtime it
     is not opened and srt fails to start the command (measured, fail closed).
 
-    The model endpoint is allowed only for a model run (model=False is the
-    non-AI relay-only probe); the relay port only after its ready line checked.
+    The model endpoint (the backend's allowed domains) is allowed only for a
+    model run (model=False is the non-AI relay-only probe, which needs no
+    backend endpoint); the relay port only after its ready line checked.
     srt 0.0.77 rejects a network section without deniedDomains.
     A staged run adds its WebFetch domains and denies writes to every
-    configuration path under run/home/.claude; srt 0.0.77 also refused
-    renaming their parent directories (measured, test_oss_research_worker_skills).
+    configuration path under the backend's configuration home (run/home/.claude);
+    srt 0.0.77 also refused renaming their parent directories (measured,
+    test_oss_research_worker_skills).
     """
     platform = sys.platform if platform is None else platform
     read = list(system_read(platform))
-    targets = [str(input_dir), str(run_dir), str(claude)]
+    targets = [str(input_dir), str(run_dir), str(cli)]
     if platform == "linux":
         read += linux_link_targets(read)
         prefix = runtime_prefix(runtime)
@@ -1064,12 +1140,12 @@ def build_policy(input_dir: Path, run_dir: Path, claude: Path,
         # it read-only (srt 0.0.77 on Linux, measured); they stay readable as
         # allowWrite paths, and policy/ and result/ stay unreadable to the child.
         targets.remove(str(run_dir))
-    domains = list(ALLOWED_DOMAINS_LINUX if platform == "linux" else ALLOWED_DOMAINS) \
-        if model else []
+    domains = list(backend.require("allowed_domains_linux" if platform == "linux"
+                                   else "allowed_domains")) if model else []
     deny_write = [str(run_dir / "policy"), str(run_dir / "result")]
     if staged is not None:
         domains += staged.check().web_domains
-        config = run_dir / "home/.claude"
+        config = run_dir / backend.require("config_subdir")
         deny_write += [str(config / name)
                        for name in (*PROTECTED_CONFIG_DIRECTORIES, *PROTECTED_CONFIG_FILES)]
     if relay_port is not None:
@@ -1231,15 +1307,26 @@ def sandboxed(runtime: list[str], policy: Path, argv: list[str]) -> list[str]:
     return [*runtime, "--settings", str(policy), "--", *argv]
 
 
-def build_command(runtime: list[str], policy: Path, claude: str, prompt: str,
+def require_measured_argv(backend: Backend) -> None:
+    """Only the Claude argv below has been measured; another backend's argv
+    (issue #6 stages 2 and 3) does not exist yet, so nothing is built for it."""
+    if backend.name != CLAUDE.name:
+        raise Blocked(f"backend {backend.name} has no measured argv; "
+                      "the isolated launch stays closed")
+
+
+def build_command(runtime: list[str], policy: Path, cli: str, prompt: str,
                   permission_mode: str = DEFAULT_PERMISSION_MODE,
-                  selection: Selection | None = None) -> list[str]:
-    """The read-only run's argv. selection, when given, adds --model and
-    --effort before the permission flags; without it the argv is unchanged."""
+                  selection: Selection | None = None,
+                  backend: Backend = CLAUDE) -> list[str]:
+    """The read-only run's argv (the Claude backend's; require_measured_argv).
+    selection, when given, adds --model and --effort before the permission
+    flags; without it the argv is unchanged."""
+    require_measured_argv(backend)
     if permission_mode not in PERMISSION_MODES:
         raise ValueError(f"permission mode must be one of {', '.join(PERMISSION_MODES)}")
     return sandboxed(runtime, policy, [
-        claude,
+        cli,
         "--print",
         "--output-format", "json",
         "--no-session-persistence",
@@ -1268,26 +1355,28 @@ def staged_rules(staged: StagedRun) -> tuple[list[str], list[str]]:
     return allow, staged.spec.denied.split(",")
 
 
-def build_staged_command(runtime: list[str], policy: Path, claude: str, prompt: str,
+def build_staged_command(runtime: list[str], policy: Path, cli: str, prompt: str,
                          run_dir: Path, staged: StagedRun,
                          permission_mode: str = DEFAULT_PERMISSION_MODE,
-                         selection: Selection | None = None) -> list[str]:
-    """The argv of a corpus-extract or deep-research run.
+                         selection: Selection | None = None,
+                         backend: Backend = CLAUDE) -> list[str]:
+    """The argv of a corpus-extract or deep-research run (the Claude backend's).
 
     It is build_command's argv without the profile's dropped flags, plus the
     parent-written settings (and agents) files and the profile's tools and
     rules. --restricted, --strict-mcp-config and --setting-sources "" stay.
     Building it says nothing about what Claude then loads or exposes.
     """
+    require_measured_argv(backend)
     if permission_mode not in PERMISSION_MODES:
         raise ValueError(f"permission mode must be one of {', '.join(PERMISSION_MODES)}")
     spec = staged.check().spec
     allow, _ = staged_rules(staged)
-    base = build_command(runtime, policy, claude, prompt, permission_mode, selection)
+    base = build_command(runtime, policy, cli, prompt, permission_mode, selection, backend)
     head = base[:base.index("--permission-mode")]
     head = [argument for argument in head if argument not in spec.dropped]
     # One --settings only: the staged settings file carries CHILD_SETTINGS.
-    at = head.index("--settings", head.index(claude))
+    at = head.index("--settings", head.index(cli))
     head = head[:at] + head[at + 2:]
     extra = ["--settings", str(run_dir / "home/.claude/settings.json")]
     if spec.agents is not None:
@@ -1750,10 +1839,16 @@ def require_profile(credential: Credential | None, profile: str) -> None:
         raise Blocked(f"credential is bound to {credential.profile}, not {profile}")
 
 
-def result_problems(exit_code: int | None, stdout: str) -> tuple[list[str], str | None]:
+def result_problems(exit_code: int | None, stdout: str,
+                    backend: Backend = CLAUDE) -> tuple[list[str], str | None]:
+    """(problems, report text) of the child's result in the backend's shape.
+    Only the Claude result (--output-format json: a result object) is parsed;
+    another backend's result is a problem, never a success."""
     if exit_code is None:
         return ["no exit code: the supervisor stopped the child"], None
     problems = [] if exit_code == 0 else [f"exit code {exit_code}"]
+    if backend.name != CLAUDE.name:
+        return problems + [f"backend {backend.name} has no measured result parser"], None
     try:
         result = json.loads(stdout)
     except json.JSONDecodeError:
@@ -1772,8 +1867,12 @@ def result_problems(exit_code: int | None, stdout: str) -> tuple[list[str], str 
     return problems, text
 
 
-def observed_models(stdout: str) -> list[str] | None:
-    """Model names the result JSON reports under modelUsage, if it has any."""
+def observed_models(stdout: str, backend: Backend = CLAUDE) -> list[str] | None:
+    """Model names the result reports, in the backend's shape, if it has any:
+    Claude's result JSON names them under modelUsage. Another backend has no
+    measured shape yet, so nothing is observed (None, never a guess)."""
+    if backend.name != CLAUDE.name:
+        return None
     try:
         usage = json.loads(stdout).get("modelUsage")
     except (ValueError, AttributeError):
@@ -1796,7 +1895,8 @@ def collect(run_dir: Path, profile: str, exit_code: int | None,
             stdout: str, stderr: str, failures: list[str] = (),
             relay: dict | None = None, credential: Credential | None = None,
             permission_mode: str | None = None, staged: dict | None = None,
-            selection: Selection | None = None, prompt_digest: str | None = None) -> bool:
+            selection: Selection | None = None, prompt_digest: str | None = None,
+            backend: Backend = CLAUDE) -> bool:
     """Record the outcome. The report is data: it is never executed here.
 
     failures are the supervisor's reasons (timeout, output bound, relay
@@ -1813,7 +1913,7 @@ def collect(run_dir: Path, profile: str, exit_code: int | None,
         return False
     result_dir = run_dir / "result"
     relay_stderr = relay.pop("stderr", "") if relay is not None else None
-    problems, report_text = result_problems(exit_code, stdout)
+    problems, report_text = result_problems(exit_code, stdout, backend)
     exposed = []
     if credential is not None:
         streams = {"stdout": stdout, "stderr": stderr, "report": report_text or ""}
@@ -1841,6 +1941,7 @@ def collect(run_dir: Path, profile: str, exit_code: int | None,
                     else "credential-exposed: failure text" for item in failures]
     manifest = {
         "status": "failed" if problems else "succeeded",
+        "backend": backend.name,
         "profile": profile,
         "exit_code": exit_code,
         "failures": list(failures),
@@ -1857,14 +1958,14 @@ def collect(run_dir: Path, profile: str, exit_code: int | None,
         # only from the result itself, when it names models.
         manifest["requested_model"] = selection.model
         manifest["requested_effort"] = selection.effort
-    observed = observed_models(stdout)
+    observed = observed_models(stdout, backend)
     if observed is not None:
         manifest["observed_models"] = observed
     if staged is not None:
         manifest["execution_profile"] = staged["profile"]
         manifest["staged"] = staged
     if credential is not None:
-        manifest["credential"] = {"variable": CREDENTIAL_VARIABLE,
+        manifest["credential"] = {"variable": backend.require("credential_variable"),
                                   "exact_value_check": "failed" if exposed else "clean"}
     if relay is not None:
         manifest["relay"] = relay
@@ -1887,7 +1988,7 @@ def run_supervised(input_dir: Path, run_dir: Path, profile: str, seconds: float,
                    environment: dict[str, str], credential: Credential | None = None,
                    permission_mode: str | None = None, stage=None,
                    selection: Selection | None = None, prompt_digest: str | None = None,
-                   record=None) -> bool:
+                   record=None, backend: Backend = CLAUDE) -> bool:
     """Start the relay (if any) and the sandboxed child under one deadline.
 
     policy_for(port) builds the policy once the relay's ready line checked out
@@ -1964,17 +2065,19 @@ def run_supervised(input_dir: Path, run_dir: Path, profile: str, seconds: float,
                       text(supervisor.data["stderr"]), list(supervisor.failures), relay_record)
     return collect(run_dir, profile, exit_code, text(supervisor.data["stdout"]),
                    text(supervisor.data["stderr"]), supervisor.failures, relay_record,
-                   credential, permission_mode, staged_record, selection, prompt_digest)
+                   credential, permission_mode, staged_record, selection, prompt_digest,
+                   backend)
 
 
-def run_research(runtime: list[str], claude: str, prompt: str, input_dir: Path,
+def run_research(runtime: list[str], cli: str, prompt: str, input_dir: Path,
                  run_dir: Path, profile: str, seconds: float,
                  relay: RelayLaunch | None, parent: dict[str, str],
                  permission_mode: str = DEFAULT_PERMISSION_MODE,
                  credential: Credential | None = None,
                  staged: StagedRun | None = None,
-                 selection: Selection | None = None) -> bool:
-    """The Claude run: model endpoint plus the relay port once it is ready.
+                 selection: Selection | None = None,
+                 backend: Backend = CLAUDE) -> bool:
+    """The model run: model endpoint plus the relay port once it is ready.
 
     A run with a credential is a live model run: it needs the user's explicit
     selection (model and effort) and is Blocked before anything without one.
@@ -1983,6 +2086,8 @@ def run_research(runtime: list[str], claude: str, prompt: str, input_dir: Path,
     A credential of another profile is Blocked before anything is built.
     Without staged it is the read-only run exactly as before; with it, the
     profile's configuration is staged and its argv and policy are used.
+    The backend's argv, environment and policy are built; a backend without
+    measured ones (codex, agy) is Blocked before any directory exists.
     """
     require_profile(credential, profile)
     if selection is not None:
@@ -1990,26 +2095,29 @@ def run_research(runtime: list[str], claude: str, prompt: str, input_dir: Path,
     elif credential is not None:
         raise Blocked("a live run needs the user's explicit --model and --effort; "
                       "no default is chosen")
+    require_measured_argv(backend)
     if staged is None:
         return run_supervised(
             input_dir, run_dir, profile, seconds, relay,
-            lambda port: build_policy(input_dir, run_dir, Path(claude), port,
-                                      runtime=runtime),
-            lambda policy_file: build_command(runtime, policy_file, claude, prompt,
-                                              permission_mode, selection),
-            build_environment(parent, run_dir, credential), credential, permission_mode,
-            selection=selection, prompt_digest=prompt_sha256(prompt))
+            lambda port: build_policy(input_dir, run_dir, Path(cli), port,
+                                      runtime=runtime, backend=backend),
+            lambda policy_file: build_command(runtime, policy_file, cli, prompt,
+                                              permission_mode, selection, backend),
+            build_environment(parent, run_dir, credential, backend=backend), credential,
+            permission_mode, selection=selection, prompt_digest=prompt_sha256(prompt),
+            backend=backend)
     staged.check()
     checked_staged_input(input_dir)
     return run_supervised(
         input_dir, run_dir, profile, seconds, relay,
-        lambda port: build_policy(input_dir, run_dir, Path(claude), port, staged=staged,
-                                  runtime=runtime),
-        lambda policy_file: build_staged_command(runtime, policy_file, claude, prompt,
-                                                 run_dir, staged, permission_mode, selection),
-        build_environment(parent, run_dir, credential), credential, permission_mode,
-        lambda directory: stage_research_config(directory, staged), selection,
-        prompt_sha256(prompt))
+        lambda port: build_policy(input_dir, run_dir, Path(cli), port, staged=staged,
+                                  runtime=runtime, backend=backend),
+        lambda policy_file: build_staged_command(runtime, policy_file, cli, prompt,
+                                                 run_dir, staged, permission_mode, selection,
+                                                 backend),
+        build_environment(parent, run_dir, credential, backend=backend), credential,
+        permission_mode, lambda directory: stage_research_config(directory, staged), selection,
+        prompt_sha256(prompt), backend=backend)
 
 
 def positive_seconds(value: str) -> float:
@@ -2022,6 +2130,9 @@ def positive_seconds(value: str) -> float:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--profile", required=True, choices=PROFILES)
+    parser.add_argument("--backend", choices=tuple(BACKENDS), default=DEFAULT_BACKEND,
+                        help="the model CLI for the child (default claude). Only claude "
+                             "has a measured launch; the others are blocked at the gate")
     parser.add_argument("--input-dir", required=True, type=Path)
     parser.add_argument("--prompt-file", required=True, type=Path)
     parser.add_argument("--run-dir", required=True, type=Path)
@@ -2034,10 +2145,14 @@ def main() -> int:
                              "(passed to claude --model); no default")
     parser.add_argument("--effort", choices=EFFORT_LEVELS,
                         help="the effort for the child (passed to claude --effort); no default")
-    parser.add_argument("--permission-mode", choices=PERMISSION_MODES,
+    # dontAsk only (#4 item 1, decided 2026-10-11): auto was measured three times
+    # (2026-09-28 twice, 2026-10-11) with no OS-level evidence, so it is refused
+    # as input. build_command keeps PERMISSION_MODES for the measurement harness.
+    parser.add_argument("--permission-mode", choices=(DEFAULT_PERMISSION_MODE,),
                         default=DEFAULT_PERMISSION_MODE,
-                        help="Claude permission mode for the child; auto only changes "
-                             "this argument and is not measured")
+                        help="Claude permission mode for the child: dontAsk only. auto was "
+                             "measured three times (2026-09-28 x2, 2026-10-11) with no OS-level "
+                             "evidence and is refused as input")
     parser.add_argument("--execution-profile", choices=EXECUTION_PROFILES,
                         default=DEFAULT_EXECUTION_PROFILE,
                         help="read-only (default) is the restricted run; corpus-extract "
@@ -2086,13 +2201,15 @@ def main() -> int:
     except (OSError, UnicodeError, ValueError) as error:
         print(f"OSS research worker did not start: {error}", file=sys.stderr)
         return EXIT_BAD_INPUT
+    backend = BACKENDS[arguments.backend]
     try:
-        runtime, claude, credential = require_runtime(
+        runtime, cli, credential = require_runtime(
             arguments.profile, arguments.runtime_prefix, parent.get("PATH"),
             arguments.credential_file, (input_dir, run_dir),
             launch=LaunchRequest(arguments.execution_profile, arguments.permission_mode,
                                  relay_request is not None, selection,
-                                 tuple(unit_problems(parent, guarded))))
+                                 tuple(unit_problems(parent, guarded)), backend.name),
+            backend=backend)
         # Past the gate a model run starts next: without the user's explicit
         # model and effort it never does, and no default is picked.
         if selection is None:
@@ -2105,9 +2222,10 @@ def main() -> int:
         print(f"OSS research worker blocked: {error}", file=sys.stderr)
         return EXIT_BLOCKED
     try:
-        succeeded = run_research(runtime, claude, prompt, input_dir, run_dir, arguments.profile,
+        succeeded = run_research(runtime, cli, prompt, input_dir, run_dir, arguments.profile,
                                  arguments.timeout, relay, parent,
-                                 arguments.permission_mode, credential, staged, selection)
+                                 arguments.permission_mode, credential, staged, selection,
+                                 backend=backend)
     except Blocked as error:
         print(f"OSS research worker blocked: {error}", file=sys.stderr)
         return EXIT_BLOCKED

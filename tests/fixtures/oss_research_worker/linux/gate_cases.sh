@@ -1,7 +1,8 @@
 #!/bin/bash
 # 모델 gate 사례(게스트, 관리 계정 vmadmin이 실행, 안에서 sudo). 인자: 배포된 커밋.
 # 비AI: sentinel 자격(가짜 값)만 쓰고 claude를 PATH에서 뺀다. 그래서 어떤 사례도 모델을 launch할 수 없다.
-# 모두 --egress none. 기대 결과는 전부 Blocked(exit 3)이고 run 디렉터리가 없어야 한다.
+# 모두 --egress none. 기대 결과는 G4(permission mode auto)만 입력 거부(exit 2, #4 항목 1: auto는 CLI에서
+# 받지 않는다)이고 나머지는 전부 Blocked(exit 3)이다. 어느 사례도 run 디렉터리를 만들지 않아야 한다.
 # 이전 판(a189g-host/gate_cases.sh·gate_forged.sh)에 relay·staged·다른 model 사례를 더했다.
 set -u
 C=$1; S=/opt/oss-research/src-$C; NODE=/opt/oss-research/node-v24.20.0-linux-arm64/bin
@@ -28,7 +29,7 @@ echo "== G3 forged marker, stdin pipe closes at once (parent EOF guard)"
 echo | sudo -u ossresearch env -i HOME=/home/ossresearch PATH=$NODE:/usr/bin:/bin LANG=C.UTF-8 OSS_RESEARCH_UNIT=oss-research-0123456789abcdef python3 -I -B $S/bin/oss-research-worker $ARGS --run-dir $T/run-g3; echo "rc=$? run_dir_exists=$(test -e $T/run-g3 && echo yes || echo no)"
 echo "== G3b forged marker, an open pipe on stdin, outside any unit"
 sleep 20 | sudo -u ossresearch env -i HOME=/home/ossresearch PATH=$NODE:/usr/bin:/bin LANG=C.UTF-8 OSS_RESEARCH_UNIT=oss-research-0123456789abcdef python3 -I -B $S/bin/oss-research-worker $ARGS --run-dir $T/run-g3b; echo "rc=${PIPESTATUS[1]} run_dir_exists=$(test -e $T/run-g3b && echo yes || echo no)"
-echo "== G4 wrapper --entry worker, permission mode auto"
+echo "== G4 wrapper --entry worker, permission mode auto (refused as input: exit 2)"
 "${WRAP[@]}" --entry worker --egress none --timeout 60 -- $ARGS --permission-mode auto --run-dir $T/run-g4 | show G4 $T/run-g4
 echo "== G5 wrapper --entry worker, relay requested"
 "${WRAP[@]}" --entry worker --egress none --timeout 60 -- $ARGS --relay-repo eslint/eslint --run-dir $T/run-g5 | show G5 $T/run-g5

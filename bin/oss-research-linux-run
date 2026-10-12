@@ -10,7 +10,10 @@ Linux guest only, as root, started by the trusted guest administrator:
 With --egress pin (and OSS_RESEARCH_EGRESS_RESOLVER set by the administrator),
 B's egress-pin tool from the same tree opens the pinned names on 443 before
 the unit (apply, then verify: same run, same manifest, lease longer than the
-unit) and clears them after it, whatever happened. If this wrapper is killed
+unit) and clears them after it, whatever happened. The pinned names are the
+run's: GitHub plus the worker's --backend model endpoint (default claude;
+worker_backend reads it from the worker arguments), or GitHub alone for the
+non-AI entries (backend none). If this wrapper is killed
 with SIGKILL, the unit still ends (guard) but the pin stays until its kernel
 lease expires; clear then fails closed and a new run waits for the expiry.
 
@@ -472,17 +475,47 @@ def parse_expiry(value: object) -> float | None:
         return None
 
 
+NO_MODEL_BACKEND = "none"
+BACKEND_OPTION = "--backend"
+
+
+def worker_backend(worker, entry: str, arguments: list[str]) -> str:
+    """The backend the egress pin is opened for: the worker's --backend (its
+    default when absent; the worker's own choices), or none for an entry
+    without a model. A malformed or unknown value is a ValueError here, before
+    any pin or unit exists (the worker would refuse it too, exit 2)."""
+    if entry != "worker":
+        return NO_MODEL_BACKEND
+    values = []
+    for index, argument in enumerate(arguments):
+        if argument == BACKEND_OPTION:
+            if index + 1 >= len(arguments):
+                raise ValueError(f"{BACKEND_OPTION} needs a value")
+            values.append(arguments[index + 1])
+        elif argument.startswith(BACKEND_OPTION + "="):
+            values.append(argument[len(BACKEND_OPTION) + 1:])
+    if not values:
+        return worker.DEFAULT_BACKEND
+    if len(values) > 1:
+        raise ValueError(f"{BACKEND_OPTION} given more than once")
+    if values[0] not in worker.BACKENDS:
+        raise ValueError(f"{BACKEND_OPTION} must be one of {', '.join(worker.BACKENDS)}")
+    return values[0]
+
+
 def open_egress(tool: Path, python: Path, run_id: str, seconds: float, resolver: str,
-                now=time.time) -> tuple[dict | None, list[str], dict]:
+                now=time.time, backend: str = "claude") -> tuple[dict | None, list[str], dict]:
     """apply then verify; (evidence, problems, record). Evidence only when both
-    agree on the run and the manifest, and the pin outlives the unit."""
-    record: dict = {}
+    agree on the run, the backend and the manifest, and the pin outlives the unit."""
+    record: dict = {"backend": backend}
     code, applied = egress_tool(tool, python, "apply", "--run-id", run_id,
-                                "--ttl", str(pin_ttl(seconds)), "--resolver", resolver)
+                                "--ttl", str(pin_ttl(seconds)), "--resolver", resolver,
+                                "--backend", backend)
     record["apply"] = {"exit": code, **{key: applied.get(key) for key in
-                                         ("status", "run_id", "expires_at", "manifest_sha256",
-                                          "nft_elements", "error")}}
-    if code != 0 or applied.get("status") != "pinned" or applied.get("run_id") != run_id:
+                                         ("status", "run_id", "backend", "expires_at",
+                                          "manifest_sha256", "nft_elements", "error")}}
+    if code != 0 or applied.get("status") != "pinned" or applied.get("run_id") != run_id \
+            or applied.get("backend") != backend:
         return None, [f"egress-apply-failed: exit {code}"], record
     code, verified = egress_tool(tool, python, "verify", "--run-id", run_id)
     record["verify"] = {"exit": code, **{key: verified.get(key) for key in
@@ -655,11 +688,14 @@ def run_unit(worker, argv: list[str], unit: str, seconds: float, source: Path) -
 
 
 def launch(worker, entry: str, seconds: float, egress: str, source: Path, python: Path,
-           environment: dict[str, str], arguments: list[str], resolver: str | None) -> dict:
-    """One run: open the egress pin (if asked), the unit, and always clear."""
+           environment: dict[str, str], arguments: list[str], resolver: str | None,
+           backend: str | None = None) -> dict:
+    """One run: open the egress pin (if asked, for the run's backend), the unit,
+    and always clear. backend defaults to worker_backend(entry, arguments)."""
     unit = f"oss-research-{secrets.token_hex(8)}"
-    record: dict = {"unit": unit, "entry": entry, "egress": egress, "exit_code": None,
-                    "failures": []}
+    backend = worker_backend(worker, entry, arguments) if backend is None else backend
+    record: dict = {"unit": unit, "entry": entry, "egress": egress, "backend": backend,
+                    "exit_code": None, "failures": []}
     tool = source / EGRESS_PIN
     evidence = None
 
@@ -677,7 +713,7 @@ def launch(worker, entry: str, seconds: float, egress: str, source: Path, python
                     return record
             if egress == "pin":
                 evidence, problems, record["egress_pin"] = open_egress(
-                    tool, python, unit, seconds, resolver)
+                    tool, python, unit, seconds, resolver, backend=backend)
                 if problems:
                     record["failures"] += problems
                     return record
@@ -738,6 +774,7 @@ def main() -> int:
     worker = load_worker(Path(__file__))
     try:
         environment = unit_environment(worker, dict(os.environ))
+        backend = worker_backend(worker, options.entry, arguments)
     except ValueError as error:
         print(f"OSS research unit wrapper did not start: {error}", file=sys.stderr)
         return EXIT_BAD_INPUT
@@ -757,7 +794,7 @@ def main() -> int:
               f"({clock['reason']}); nothing was started", file=sys.stderr)
         return EXIT_BLOCKED
     record = launch(worker, options.entry, options.timeout, options.egress, source, python,
-                    environment, arguments, resolver)
+                    environment, arguments, resolver, backend)
     clock["after_run"] = clock_after_run()
     record["clock"] = clock
     print(json.dumps(record))

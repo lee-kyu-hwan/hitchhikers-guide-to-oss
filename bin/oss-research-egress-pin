@@ -1,19 +1,23 @@
 #!/usr/bin/env python3
-"""Pin the two fixed egress names of an OSS research run inside the Linux guest.
+"""Pin the fixed egress names of an OSS research run inside the Linux guest.
 
 This is one layer of the Linux research boundary, not the boundary itself.
 The research child stays in its bwrap network namespace and reaches the
 network only through the srt proxy (hostname allow list) and the #192 relay
 (read-only GitHub endpoints). This tool narrows what the non-sandboxed
 processes of the research uid (srt proxy, relay, supervisor) can dial: a root
-step resolves ``api.github.com`` and ``api.anthropic.com`` once per run through
-an explicit resolver, accepts only public IPv4 answers, and opens exactly those
-addresses on TCP 443 for a bounded time. DNS stays closed for the research uid,
-so names cannot be rebound during the run.
+step resolves ``api.github.com`` and the run's backend's model endpoint
+(``api.anthropic.com`` for claude, the default; MODEL_NAMES) once per run
+through an explicit resolver, accepts only public IPv4 answers, and opens
+exactly those addresses on TCP 443 for a bounded time. DNS stays closed for the
+research uid, so names cannot be rebound during the run. A backend whose
+endpoint has not been measured (codex, agy; issue #6) is refused, and ``none``
+(a run without a model) pins GitHub alone.
 
 Commands (run as root in the dedicated guest):
 
-  apply  --run-id ID --ttl SECONDS --resolver IPV4   close, resolve, pin, record
+  apply  --run-id ID --ttl SECONDS --resolver IPV4 [--backend NAME]
+                                                      close, resolve, pin, record
   verify [--run-id ID]                                check the live pin (exit 3 when not ok)
   clear  [--run-id ID]                                close and remove the pin
 
@@ -52,8 +56,17 @@ import tempfile
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 
-SCHEMA_VERSION = "1.0.0"
-PINNED_NAMES = ("api.github.com", "api.anthropic.com")
+SCHEMA_VERSION = "1.1.0"  # 1.1.0: the manifest names its backend
+GITHUB_NAME = "api.github.com"
+# The model endpoint per backend (issue #6). Only Claude's is measured; codex
+# and agy are named so the CLI takes them and refused until a real run shows
+# their endpoints (stages 2 and 3). "none" is a run without a model (the
+# non-AI collection and verifier entries): GitHub alone.
+MODEL_NAMES = {"claude": ("api.anthropic.com",), "none": ()}
+BACKEND_NAMES = ("claude", "codex", "agy", "none")
+DEFAULT_BACKEND = "claude"
+# The default backend's names: what every run pinned before backends existed.
+PINNED_NAMES = (GITHUB_NAME, *MODEL_NAMES[DEFAULT_BACKEND])
 PINNED_PORT = 443
 DNS_PORT = 53
 QUERIES_PER_NAME = 2
@@ -104,6 +117,15 @@ CLASS_IN = 1
 
 class PinError(Exception):
     """Refused pin; the allow set is left empty."""
+
+
+def pinned_names(backend: object) -> Tuple[str, ...]:
+    """GitHub plus the backend's measured model endpoint; PinError for any other backend."""
+    if not isinstance(backend, str) or backend not in BACKEND_NAMES:
+        raise PinError("backend must be one of %s" % ", ".join(BACKEND_NAMES))
+    if backend not in MODEL_NAMES:
+        raise PinError("no egress names have been measured for backend %s" % backend)
+    return (GITHUB_NAME, *MODEL_NAMES[backend])
 
 
 def utc_now() -> datetime:
@@ -268,7 +290,8 @@ Exchange = Callable[[Tuple[str, int], bytes], bytes]
 
 
 def resolve_pins(resolver: Tuple[str, int], exchange: Exchange = udp_exchange,
-                 queries: int = QUERIES_PER_NAME) -> Tuple[Dict[str, List[str]], List[dict]]:
+                 queries: int = QUERIES_PER_NAME,
+                 names: Sequence[str] = PINNED_NAMES) -> Tuple[Dict[str, List[str]], List[dict]]:
     """Query each fixed name ``queries`` times; every answer must be public IPv4.
 
     Pins the addresses present in every answer. A private, mixed, IPv6, or
@@ -276,7 +299,7 @@ def resolve_pins(resolver: Tuple[str, int], exchange: Exchange = udp_exchange,
     """
     pins: Dict[str, List[str]] = {}
     log: List[dict] = []
-    for name in PINNED_NAMES:
+    for name in names:
         common: Optional[set] = None
         for attempt in range(queries):
             query_id = secrets.randbelow(0x10000)
@@ -333,9 +356,10 @@ class Env:
 # ---------------------------------------------------------------------------
 
 
-def hosts_block(run_id: str, pins: Dict[str, List[str]]) -> str:
+def hosts_block(run_id: str, pins: Dict[str, List[str]],
+                names: Sequence[str] = PINNED_NAMES) -> str:
     lines = ["%s %s" % (BEGIN_MARK, run_id)]
-    for name in PINNED_NAMES:
+    for name in names:
         lines += ["%s %s" % (address, name) for address in pins[name]]
     lines.append("%s %s" % (END_MARK, run_id))
     return "\n".join(lines) + "\n"
@@ -449,8 +473,8 @@ def nft_live_set(env: Env) -> Tuple[List[str], List[str], List[Tuple[object, obj
 # ---------------------------------------------------------------------------
 
 
-MANIFEST_KEYS = {"schema_version", "tool", "tool_revision", "run_id", "created_at", "expires_at",
-                 "ttl_seconds", "resolver", "port", "pins", "queries", "hosts_block_sha256",
+MANIFEST_KEYS = {"schema_version", "tool", "tool_revision", "backend", "run_id", "created_at",
+                 "expires_at", "ttl_seconds", "resolver", "port", "pins", "queries", "hosts_block_sha256",
                  "nft_table", "nft_set", "nft_elements", "nft_elements_sha256"}
 TOOL_NAME = "oss-research-egress-pin"
 
@@ -555,12 +579,14 @@ def _read_manifest(env: Env) -> Optional[object]:
         return None
 
 
-def apply(env: Env, run_id: str, ttl: int, resolver: Tuple[str, int]) -> dict:
+def apply(env: Env, run_id: str, ttl: int, resolver: Tuple[str, int],
+          backend: str = DEFAULT_BACKEND) -> dict:
     _require_root(env)
     if RUN_ID.fullmatch(run_id or "") is None:
         raise PinError("run id must match %s" % RUN_ID.pattern)
     if isinstance(ttl, bool) or not isinstance(ttl, int) or not MIN_TTL_SECONDS <= ttl <= MAX_TTL_SECONDS:
         raise PinError("ttl must be an integer between %d and %d seconds" % (MIN_TTL_SECONDS, MAX_TTL_SECONDS))
+    names = pinned_names(backend)  # refused before anything changes
     ensure_state_dir(env)
     with _Lock(env):
         # A live pin of another run is never overwritten; wait for its expiry or clear it by run id.
@@ -571,8 +597,8 @@ def apply(env: Env, run_id: str, ttl: int, resolver: Tuple[str, int]) -> dict:
         nft_close(env)
         env.manifest_path.unlink(missing_ok=True)
         try:
-            pins, log = resolve_pins(resolver, env.exchange)
-            block = hosts_block(run_id, pins)
+            pins, log = resolve_pins(resolver, env.exchange, names=names)
+            block = hosts_block(run_id, pins, names)
             elements = nft_elements(pins)
             # 2. hosts, 3. nft (kernel timeout = ttl), 4. manifest last. The manifest window starts
             # after the elements exist, so the kernel lease never outlives the manifest.
@@ -581,6 +607,7 @@ def apply(env: Env, run_id: str, ttl: int, resolver: Tuple[str, int]) -> dict:
             created = env.now()
             manifest = {
                 "schema_version": SCHEMA_VERSION, "tool": TOOL_NAME, "tool_revision": tool_revision(),
+                "backend": backend,
                 "run_id": run_id, "created_at": iso(created), "expires_at": iso(created + timedelta(seconds=ttl)),
                 "ttl_seconds": ttl, "resolver": "%s:%d" % resolver, "port": PINNED_PORT, "pins": pins,
                 "queries": log, "hosts_block_sha256": sha256_text(block),
@@ -595,7 +622,7 @@ def apply(env: Env, run_id: str, ttl: int, resolver: Tuple[str, int]) -> dict:
                                     "open for at most %d s (kernel timeout); do not launch"
                                     % (error, "; ".join(failures), ttl)) from error
             raise
-    return {"status": "pinned", "run_id": run_id, "expires_at": manifest["expires_at"],
+    return {"status": "pinned", "run_id": run_id, "backend": backend, "expires_at": manifest["expires_at"],
             "manifest_sha256": manifest_sha256(manifest), "nft_elements": elements}
 
 
@@ -639,8 +666,15 @@ def verify(env: Env, run_id: Optional[str] = None) -> dict:
     elif now < created:
         problems.append("manifest created in the future")
     pins = manifest["pins"]
-    if not isinstance(pins, dict) or sorted(pins) != sorted(PINNED_NAMES):
-        problems.append("pins must name exactly %s" % ", ".join(PINNED_NAMES))
+    try:
+        names = pinned_names(manifest["backend"])
+    except PinError as error:
+        problems.append("manifest backend refused: %s" % error)
+        names = None
+    if names is None:
+        pass
+    elif not isinstance(pins, dict) or sorted(pins) != sorted(names):
+        problems.append("pins must name exactly %s" % ", ".join(names))
     else:
         for name, addresses in pins.items():
             if not isinstance(addresses, list) or not 0 < len(addresses) <= MAX_ADDRESSES_PER_NAME \
@@ -657,7 +691,7 @@ def verify(env: Env, run_id: Optional[str] = None) -> dict:
             problems.append("manifest nft elements do not match its pins")
         block = current_block(env.hosts_path.read_text(encoding="utf-8"))
         if block is None or sha256_text(block) != manifest["hosts_block_sha256"] or \
-                block != hosts_block(manifest["run_id"], pins):
+                block != hosts_block(manifest["run_id"], pins, names):
             problems.append("hosts pin block is missing or changed")
         try:
             flags, live, timeouts = nft_live_set(env)
@@ -691,6 +725,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_apply.add_argument("--run-id", required=True)
     p_apply.add_argument("--ttl", required=True, type=int)
     p_apply.add_argument("--resolver", required=True, help="IPv4 literal of the trusted resolver (port 53)")
+    p_apply.add_argument("--backend", choices=BACKEND_NAMES, default=DEFAULT_BACKEND,
+                         help="the run's model backend: its measured endpoint is pinned with GitHub; "
+                              "none pins GitHub alone (default claude)")
     p_verify = sub.add_parser("verify", help="check the live pin against its manifest")
     p_verify.add_argument("--run-id")
     p_clear = sub.add_parser("clear", help="close the allow set and remove the pin")
@@ -703,7 +740,7 @@ def main(argv: Optional[Sequence[str]] = None, env: Optional[Env] = None) -> int
     env = env or Env()
     try:
         if args.command == "apply":
-            result = apply(env, args.run_id, args.ttl, _resolver(args.resolver))
+            result = apply(env, args.run_id, args.ttl, _resolver(args.resolver), args.backend)
         elif args.command == "verify":
             result = verify(env, args.run_id)
             print(json.dumps(result, sort_keys=True))
