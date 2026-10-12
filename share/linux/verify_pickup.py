@@ -2,6 +2,7 @@
 """Check a result tar the host took from the guest (host side, Python 3.12+).
 
     python3 verify_pickup.py RESULT.tar CAP_BYTES DEST_DIR [--auto-observation]
+    python3 verify_pickup.py RESULT.tar CAP_BYTES DEST_DIR --staged corpus-extract|deep-research
     python3 verify_pickup.py RESULT.tar CAP_BYTES DEST_DIR --collect \
         --collector-sha256 HEX --wrapper-record RECORD.json \
         --upstream github-rest-via-relay|loopback-mock
@@ -37,6 +38,18 @@ report.md. The manifest must be exactly that failure: status failed, the
 child's exit code 0, no supervisor failures, the one parser problem the
 stream causes, permission mode auto and a clean credential check. Anything
 else fails. The default contract is unchanged.
+
+--staged PROFILE is the contract of a measured staged run (unit_inner.py
+model-staged through model_once.sh staged-corpus|staged-deep). The result set
+is the default one (the worker writes the same files; output/ stays in the run
+directory and is not in the bundle), so every default check applies, and the
+manifest must also bind the profile: execution_profile and the staging
+record's profile equal PROFILE, the record names the staged files with their
+sha256 pins (settings.json among them), permission mode dontAsk, exit code 0,
+no failures or problems and a clean credential check. The default contract
+accepts a staged bundle too (it is a succeeded run with the same files) but
+binds no profile; a measurement asks for --staged so that a read-only run is
+never taken as the staged one.
 
 --collect is the non-AI collection step's contract (produced by the
 collection entry bin/oss-research-collect). Fixed names, all required: corpus.json, collection-manifest.json,
@@ -202,6 +215,8 @@ MAX_MEMBERS = 16
 MAX_MEMBER_BYTES = 16 * 1024 * 1024
 AUTO_REQUIRED = {"manifest.json", "stdout.json"}
 AUTO_PROBLEMS = ["stdout is not a JSON result"]
+STAGED_PROFILES = ("corpus-extract", "deep-research")
+SHA256 = re.compile(r"[0-9a-f]{64}")
 COLLECT_FILES = {"corpus.json", "collection-manifest.json", "inventory.md", "transport.json",
                  "relay.log", "run-manifest.json", "collection-envelope.json"}
 COLLECT_REQUIRED = COLLECT_FILES
@@ -1144,6 +1159,35 @@ def token_problems(dest: Path, result: dict, envelope_name: str, forbid: Path | 
     return problems
 
 
+def staged_problems(manifest: dict, profile: str) -> list:
+    """The default checks passed; what a staged run's manifest must also say."""
+    problems = []
+    if manifest.get("execution_profile") != profile:
+        problems.append(f"manifest execution_profile is {manifest.get('execution_profile')!r}, "
+                        f"not {profile!r}")
+    record = manifest.get("staged")
+    if not isinstance(record, dict):
+        problems.append("manifest staged record is missing")
+    else:
+        if record.get("profile") != profile:
+            problems.append(f"staged record profile is {record.get('profile')!r}, not {profile!r}")
+        files = record.get("files")
+        if not isinstance(files, list) or not files or not all(
+                isinstance(entry, dict) and isinstance(entry.get("staged"), str)
+                and isinstance(entry.get("sha256"), str) and SHA256.fullmatch(entry["sha256"])
+                for entry in files):
+            problems.append("staged record does not name the staged files with sha256 pins")
+        elif "settings.json" not in {entry["staged"] for entry in files}:
+            problems.append("staged record lacks settings.json")
+    for key, value in (("permission_mode", "dontAsk"), ("exit_code", 0), ("failures", []),
+                       ("problems", [])):
+        if manifest.get(key) != value:
+            problems.append(f"manifest {key} is {manifest.get(key)!r}, not {value!r}")
+    if (manifest.get("credential") or {}).get("exact_value_check") != "clean":
+        problems.append("manifest credential check is not clean")
+    return problems
+
+
 def member_problems(bundle: tarfile.TarFile, cap: int, required=REQUIRED,
                     forbidden=frozenset(), allowed=RESULT_FILES) -> list[str]:
     problems, seen, total, count = [], set(), 0, 0
@@ -1207,9 +1251,13 @@ def main() -> int:
                 or re.fullmatch(r"[0-9a-f]{64}", tail[2]) is None:
             raise SystemExit(__doc__)
         host = {"collector_sha256": tail[2], "wrapper_record": Path(tail[4]), "upstream": tail[6]}
+    elif tail[:1] == ["--staged"]:
+        if len(tail) != 2 or tail[1] not in STAGED_PROFILES:
+            raise SystemExit(__doc__)
     elif tail not in ([], ["--auto-observation"]):
         raise SystemExit(__doc__)
     auto = tail == ["--auto-observation"]
+    staged = tail[1] if tail[:1] == ["--staged"] else None
     archive, cap, dest = Path(sys.argv[1]), int(sys.argv[2]), Path(sys.argv[3])
     size = archive.stat().st_size
     result = {"bytes": size, "files": [], "status": None, "policy_sha256": None}
@@ -1286,6 +1334,10 @@ def main() -> int:
             report = hashlib.sha256((dest / "report.md").read_bytes()).hexdigest()
             if report != manifest.get("report_sha256"):
                 problems.append("report.md does not match report_sha256")
+        if staged is not None:
+            result["contract"] = "staged"
+            result["execution_profile"] = staged
+            problems += staged_problems(manifest, staged)
     result["problems"] = problems
     print(json.dumps(result))
     return 0 if not problems else 1

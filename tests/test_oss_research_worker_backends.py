@@ -516,6 +516,85 @@ class WrapperBackendTests(unittest.TestCase):
         self.assertEqual(sorted(wrapper.worker_backend(worker, "worker", ["--backend", name])
                                 for name in worker.BACKENDS), sorted(worker.BACKENDS))
 
+    def test_verify_entry_takes_the_wrappers_own_backend(self):
+        """PR #21 left the verification entry at none, so a measurement harness run
+        (model-once, model-auto, model-staged) under --egress pin had no model
+        endpoint. The wrapper's own --backend names it, for that entry only."""
+        inner = ["model-once", "/o", "/c/claude-profile2/oauth-token", "claude-opus-5-5", "medium", "300"]
+        self.assertEqual(wrapper.worker_backend(worker, "verify", inner), "none")
+        self.assertEqual(wrapper.worker_backend(worker, "verify", inner, None), "none")
+        for name in (*worker.BACKENDS, "none"):
+            self.assertEqual(wrapper.worker_backend(worker, "verify", inner, name), name)
+        # The inner's own arguments never name it: only the wrapper option does.
+        self.assertEqual(wrapper.worker_backend(worker, "verify", inner + ["--backend", "claude"]), "none")
+        for bad in ("gemini", "", "Claude", "claude,codex"):
+            with self.subTest(bad), self.assertRaisesRegex(ValueError, "--backend must be one of"):
+                wrapper.worker_backend(worker, "verify", inner, bad)
+        # Any other entry refuses the wrapper option: the worker names its backend in its
+        # own arguments, and the non-AI entries run no model.
+        base = ["--profile", "claude-profile2", "--model", "claude-opus-5-5", "--effort", "medium"]
+        with self.assertRaisesRegex(ValueError, "verify only.*reads it from the worker arguments"):
+            wrapper.worker_backend(worker, "worker", base, "claude")
+        for entry in ("collect", "collect-issues", "candidate-reads"):
+            with self.subTest(entry), self.assertRaisesRegex(ValueError, "verify only.*runs no model"):
+                wrapper.worker_backend(worker, entry, ["--out-dir", "/o"], "none")
+            self.assertEqual(wrapper.worker_backend(worker, entry, ["--out-dir", "/o"]), "none")
+
+    def wrapper_main(self, *options):
+        """main past the trust checks (mocked), up to launch (recorded, not run)."""
+        launches = []
+
+        def fake_launch(worker_module, entry, seconds, egress, source, python, environment,
+                        arguments, resolver, backend=None):
+            launches.append({"entry": entry, "egress": egress, "arguments": arguments,
+                             "backend": backend})
+            return {"unit": self.UNIT, "entry": entry, "egress": egress, "backend": backend,
+                    "exit_code": 0, "failures": []}
+
+        argv = ["linux-run", "--entry", "verify", "--timeout", "10", *options, "--", "model-once", "/o"]
+        with mock.patch.object(wrapper.sys, "platform", "linux"), \
+                mock.patch.object(wrapper.os, "geteuid", return_value=wrapper.TRUSTED_OWNER), \
+                mock.patch.object(wrapper.sys, "argv", argv), \
+                mock.patch.object(wrapper, "bootstrap", return_value=(Path("/src"), [])), \
+                mock.patch.object(wrapper, "research_user_problems", return_value=[]), \
+                mock.patch.object(wrapper, "load_worker", return_value=worker), \
+                mock.patch.object(wrapper, "unit_environment", return_value={"PATH": "/usr/bin"}), \
+                mock.patch.object(wrapper, "acquire_run_lock"), \
+                mock.patch.object(wrapper, "clock_guard", return_value={"action": "none"}), \
+                mock.patch.object(wrapper, "clock_after_run", return_value={}), \
+                mock.patch.object(wrapper, "launch", side_effect=fake_launch), \
+                contextlib.redirect_stdout(None), mock.patch("sys.stderr"):
+            try:
+                code = wrapper.main()
+            except SystemExit as stop:
+                code = stop.code
+        return code, launches
+
+    def test_main_hands_the_verify_backend_to_the_launch_or_refuses_it(self):
+        code, launches = self.wrapper_main("--backend", "claude")
+        self.assertEqual((code, len(launches)), (0, 1))
+        self.assertEqual(launches[0]["backend"], "claude")
+        self.assertEqual(launches[0]["arguments"], ["model-once", "/o"])
+        code, launches = self.wrapper_main()
+        self.assertEqual((code, [l["backend"] for l in launches]), (0, ["none"]))
+        for bad in (("--backend", "gemini"), ("--backend", ""), ("--backend",)):
+            with self.subTest(bad):
+                code, launches = self.wrapper_main(*bad)
+                self.assertEqual((code, launches), (wrapper.EXIT_BAD_INPUT, []))
+        # The worker entry with the wrapper option: refused as input, nothing launched.
+        argv = ["linux-run", "--entry", "worker", "--timeout", "10", "--backend", "claude", "--",
+                "--profile", "claude-profile2"]
+        with mock.patch.object(wrapper.sys, "platform", "linux"), \
+                mock.patch.object(wrapper.os, "geteuid", return_value=wrapper.TRUSTED_OWNER), \
+                mock.patch.object(wrapper.sys, "argv", argv), \
+                mock.patch.object(wrapper, "bootstrap", return_value=(Path("/src"), [])), \
+                mock.patch.object(wrapper, "research_user_problems", return_value=[]), \
+                mock.patch.object(wrapper, "load_worker", return_value=worker), \
+                mock.patch.object(wrapper, "unit_environment", return_value={"PATH": "/usr/bin"}), \
+                mock.patch.object(wrapper, "launch", side_effect=AssertionError("launched")), \
+                mock.patch("sys.stderr"):
+            self.assertEqual(wrapper.main(), wrapper.EXIT_BAD_INPUT)
+
     def test_open_egress_pins_the_given_backend(self):
         root = Path(tempfile.mkdtemp(prefix="osr-backends-pin-")).resolve()
         self.addCleanup(shutil.rmtree, root, ignore_errors=True)

@@ -17,8 +17,14 @@
 #             멈춰 child가 시작될 수 없다. 자격 설치·reaper·wrapper·정리만 확인)
 #           | analysis(제품 경로와 같다. prompt는 10번째 인자 PROMPT: root staging의 파일을 검사한 뒤
 #             input/task.txt로 복사한다. 답 내용은 여기서 판정하지 않는다. bundle 검증기의 몫이다)
-#             | analysis-dry(같지만 claude를 PATH에서 뺀다, sentinel 전용).
-# PROMPT    analysis·analysis-dry의 prompt 파일(게스트 절대 경로). 자격을 읽기 전에 검사한다: lstat regular,
+#             | analysis-dry(같지만 claude를 PATH에서 뺀다, sentinel 전용)
+#           | staged-corpus | staged-deep (측정 harness: unit_inner.py model-staged, 프로필 corpus-extract /
+#             deep-research. PROMPT(10번째 인자) 필수, analysis와 같은 검사 뒤 root가 $OUT/prompt.txt로 복사해
+#             inner에 넘긴다. 제품 main은 거치지 않는다(staged launch는 MEASURED_LAUNCHES에 없다). web domain 없음.
+#             판정은 judge(S1-staged-unchanged·S2-profile-requested, V2 없음), 회수는 verify_pickup.py --staged).
+#           model-once·model-auto·staged-*는 wrapper에 --backend claude를 준다(--entry verify의 pin은 그 이름만
+#           연다. 기본 none이면 api.anthropic.com이 열리지 않는다).
+# PROMPT    analysis·analysis-dry·staged-*의 prompt 파일(게스트 절대 경로). 자격을 읽기 전에 검사한다: lstat regular,
 #           symlink 아님, root 소유, 그룹·기타 쓰기 불가, 상위 디렉터리 root 소유·쓰기 불가, 1..65536 B,
 #           strict UTF-8, NUL 없음, 인증 표지(oss-research-credentials, oauth-token,
 #           CLAUDE_CODE_OAUTH_TOKEN) 없음. 복사 뒤 sha256이 같아야 한다.
@@ -62,12 +68,13 @@ fail() { echo "FAIL $*"; fails=$((fails + 1)); }
 info() { echo "INFO $*"; }
 case "$KIND" in sentinel|token) ;; *) echo "FAIL bad KIND"; exit 2;; esac
 case "$EGRESS" in none|pin) ;; *) echo "FAIL bad EGRESS"; exit 2;; esac
-case "$MODE" in model-once|model-auto|worker|worker-dry|analysis|analysis-dry) ;; *) echo "FAIL bad MODE"; exit 2;; esac
+case "$MODE" in model-once|model-auto|worker|worker-dry|analysis|analysis-dry|staged-corpus|staged-deep) ;; *) echo "FAIL bad MODE"; exit 2;; esac
 case "$MODE" in worker-dry|analysis-dry) [ "$KIND" != sentinel ] && { echo "FAIL $MODE is sentinel only"; exit 2; };; esac
 PRODUCT=no; case "$MODE" in worker|worker-dry|analysis|analysis-dry) PRODUCT=yes;; esac
+STAGED=""; case "$MODE" in staged-corpus) STAGED=corpus-extract;; staged-deep) STAGED=deep-research;; esac
 PROMPT_SHA=""
-if [ "$MODE" = analysis ] || [ "$MODE" = analysis-dry ]; then
-  [ -n "$PROMPT" ] || { echo "FAIL P0-prompt-argument (analysis needs PROMPT)"; exit 2; }
+if [ "$MODE" = analysis ] || [ "$MODE" = analysis-dry ] || [ -n "$STAGED" ]; then
+  [ -n "$PROMPT" ] || { echo "FAIL P0-prompt-argument ($MODE needs PROMPT)"; exit 2; }
   PROMPT_SHA="$(sudo /usr/bin/python3 -I -B - "$PROMPT" <<'PYEOF'
 import hashlib, os, stat, sys
 path = sys.argv[1]
@@ -234,6 +241,13 @@ case "$MODE" in worker-dry|analysis-dry) CLAUDE_DIR="";; esac   # no claude on P
 ENVV=(PATH="$NODE_BIN:${CLAUDE_DIR:+$CLAUDE_DIR:}/usr/bin:/bin" LANG=C.UTF-8
       OSS_RESEARCH_SRT_PREFIX="$PREFIX" PYTHONDONTWRITEBYTECODE=1)
 [ "$EGRESS" = pin ] && ENVV+=(OSS_RESEARCH_EGRESS_RESOLVER=192.168.5.2)
+if [ -n "$STAGED" ]; then
+  # The checked prompt, copied by root for this run only; the inner copies it into its own input/.
+  sudo install -m 0600 -o ossresearch -g ossresearch "$PROMPT" "$OUT/prompt.txt" || abort W3-prompt
+  copied="$(sudo sha256sum "$OUT/prompt.txt" | cut -c1-64)"
+  [ "$copied" = "$PROMPT_SHA" ] || abort "W3-prompt-copy-sha"
+  pass "W3-prompt-copied sha256=$copied"
+fi
 if [ "$PRODUCT" = yes ]; then
   # The product path: the worker's own main, the measured launch's arguments only.
   sudo install -d -m 0700 -o ossresearch -g ossresearch "$OUT/input" || abort W3-input-dir
@@ -250,8 +264,12 @@ if [ "$PRODUCT" = yes ]; then
        --profile claude-profile2 --input-dir "$OUT/input" --prompt-file "$OUT/input/task.txt"
        --run-dir "$OUT/run" --credential-file "$CRED" --model "$MODEL" --effort "$EFFORT"
        --runtime-prefix "$PREFIX" --timeout "$INNER")
+elif [ -n "$STAGED" ]; then
+  # The measurement harness with a staged profile; the pin opens the claude names (wrapper --backend).
+  CMD=("$PY" -I -B "$WRAPPER" --entry verify --egress "$EGRESS" --backend claude --timeout "$TIMEOUT" --
+       model-staged "$OUT" "$STAGED" "$CRED" "$MODEL" "$EFFORT" "$INNER" "$OUT/prompt.txt")
 else
-  CMD=("$PY" -I -B "$WRAPPER" --entry verify --egress "$EGRESS" --timeout "$TIMEOUT" --
+  CMD=("$PY" -I -B "$WRAPPER" --entry verify --egress "$EGRESS" --backend claude --timeout "$TIMEOUT" --
        "$MODE" "$OUT" "$CRED" "$MODEL" "$EFFORT" "$INNER")
 fi
 [ "$MODE" = model-auto ] && CMD+=("$DECOY/control" "$DECOY/claude-profile2/oauth-token" "$DHOME/home-canary")
@@ -345,7 +363,7 @@ print("INFO R result", json.dumps({k:o.get(k) for k in ("type","subtype","is_err
   fi
   sudo "$PY" -I -B -c 'import json,sys
 r=json.loads(open(sys.argv[1]).read().strip().splitlines()[-1]); i=json.loads(r.get("stdout","").strip().splitlines()[-1])
-keep=("status","exit_code","failures","problems","requested_model","requested_effort","observed_models","result_meta","report_text","credential","stream_escaped_value_check","argv_auto_vs_dontAsk","stream_bytes","policy_sha256","policy_rebuilt_sha256","policy_builder_takes_mode","policy_builder_parameters")
+keep=("status","exit_code","failures","problems","requested_model","requested_effort","observed_models","result_meta","report_text","credential","stream_escaped_value_check","argv_auto_vs_dontAsk","stream_bytes","policy_sha256","policy_rebuilt_sha256","policy_builder_takes_mode","policy_builder_parameters","requested_profile","execution_profile","staged_changed","output_files")
 print("INFO R wrapper", json.dumps({k:r.get(k) for k in ("unit","egress","exit_code","failures")}))
 print("INFO R pin", json.dumps({k:((r.get("egress_pin") or {}).get(k) or {}).get("exit") for k in ("apply","verify","clear")}), json.dumps(((r.get("egress_pin") or {}).get("apply") or {}).get("nft_elements")))
 print("INFO R inner", json.dumps({k:i.get(k) for k in keep}))' "$WORK/record.json" 2>/dev/null || info "R no parsable record (the judge has failed it)"

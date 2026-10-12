@@ -13,7 +13,11 @@ the unit (apply, then verify: same run, same manifest, lease longer than the
 unit) and clears them after it, whatever happened. The pinned names are the
 run's: GitHub plus the worker's --backend model endpoint (default claude;
 worker_backend reads it from the worker arguments), or GitHub alone for the
-non-AI entries (backend none). If this wrapper is killed
+non-AI entries (backend none). The verification entry runs the measurement
+harness (unit_inner.py model-once, model-auto, model-staged) as well as non-AI
+probes, so it names its backend with this wrapper's own --backend
+(claude|codex|agy|none, default none); that option is for --entry verify
+only. If this wrapper is killed
 with SIGKILL, the unit still ends (guard) but the pin stays until its kernel
 lease expires; clear then fails closed and a new run waits for the expiry.
 
@@ -479,11 +483,25 @@ NO_MODEL_BACKEND = "none"
 BACKEND_OPTION = "--backend"
 
 
-def worker_backend(worker, entry: str, arguments: list[str]) -> str:
+def worker_backend(worker, entry: str, arguments: list[str], requested: str | None = None) -> str:
     """The backend the egress pin is opened for: the worker's --backend (its
-    default when absent; the worker's own choices), or none for an entry
-    without a model. A malformed or unknown value is a ValueError here, before
-    any pin or unit exists (the worker would refuse it too, exit 2)."""
+    default when absent; the worker's own choices), the wrapper's own
+    --backend for the verification entry (``requested``; none when absent,
+    since most of its modes run no model), or none for an entry without a
+    model. A malformed or unknown value is a ValueError here, before any pin
+    or unit exists (the worker would refuse it too, exit 2); so is the
+    wrapper's --backend given to any other entry than verify."""
+    if entry == "verify":
+        if requested is None:
+            return NO_MODEL_BACKEND
+        if requested not in worker.BACKENDS and requested != NO_MODEL_BACKEND:
+            raise ValueError(f"{BACKEND_OPTION} must be one of "
+                             f"{', '.join((*worker.BACKENDS, NO_MODEL_BACKEND))}")
+        return requested
+    if requested is not None:
+        raise ValueError(f"{BACKEND_OPTION} of the wrapper is for --entry verify only; "
+                         f"the {entry} entry " + ("reads it from the worker arguments"
+                                                  if entry == "worker" else "runs no model"))
     if entry != "worker":
         return NO_MODEL_BACKEND
     values = []
@@ -747,6 +765,11 @@ def main() -> int:
     parser.add_argument("--egress", choices=EGRESS_MODES, default="none",
                         help="none: the research user keeps no egress; pin: open the "
                              "pinned names on 443 for this run only")
+    parser.add_argument(BACKEND_OPTION, dest="backend", default=None,
+                        help="--entry verify only: the model backend the measurement "
+                             "harness runs (claude|codex|agy), or none (default) for a "
+                             "mode without a model; the pin opens that backend's names. "
+                             "The worker entry names its backend in its own arguments")
     parser.add_argument("arguments", nargs=argparse.REMAINDER)
     options = parser.parse_args()
     arguments = options.arguments[1:] if options.arguments[:1] == ["--"] else options.arguments
@@ -774,7 +797,7 @@ def main() -> int:
     worker = load_worker(Path(__file__))
     try:
         environment = unit_environment(worker, dict(os.environ))
-        backend = worker_backend(worker, options.entry, arguments)
+        backend = worker_backend(worker, options.entry, arguments, options.backend)
     except ValueError as error:
         print(f"OSS research unit wrapper did not start: {error}", file=sys.stderr)
         return EXIT_BAD_INPUT
