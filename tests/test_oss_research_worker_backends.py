@@ -59,7 +59,10 @@ FROZEN = {
     "argv_read_only": "eaea845d13e1b4823f9afb6d8282b903953b6b0fddf86a443246bf25550aa268",
     "argv_read_only_selection": "c9895e337a92e350515cd1bfc09ac6a5effe231c385b22c312236d484a28558b",
     "argv_auto_selection": "9fa50ee37057cafe6d1b9dc6634f22416b050fe8ca7580c6e242cf2b9021cc31",
-    "argv_corpus-extract": "9241254294db549b22407052d4176d3ff546e0da63cdab5a79dd82af9a1e893b",
+    # 2026-10-13 (#6 follow-up (b)): --agents is the inline JSON object; before, the path
+    # run/policy/claude-agents.json (9241254294db549b22407052d4176d3ff546e0da63cdab5a79dd82af9a1e893b),
+    # which the child cannot read (build_policy), so Claude 2.1.283 exited before any model call.
+    "argv_corpus-extract": "33e3a977a59a8904bc040992e04a5055d6d4c3a2d5b788da425c542f8296d84f",
     "argv_deep-research": "b33b52b69921986ee928d6f091c5158641513a819779f63e8ef4d3a1b1a785f2",
     "policy_darwin": "ce16b43a330890893bc41dd5b1adff1796e9e42bed48d1836fdf4083a1761266",
     "policy_darwin_relay": "ab9dfc392216135505c87d20195406f1cddb346d8d3627355d11c53152b1a4d0",

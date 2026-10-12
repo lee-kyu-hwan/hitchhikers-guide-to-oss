@@ -185,12 +185,44 @@ class ProfileTests(Fixture):
                          ["Read", "Glob", "Grep", "Agent(corpus-extractor)", "Write"])
         self.assertEqual(option(argv, "--disallowedTools"),
                          "Bash,PowerShell,WebFetch,WebSearch,Edit,NotebookEdit,Skill,Workflow")
-        self.assertEqual(option(argv, "--agents"),
-                         str(self.run_dir / "policy/claude-agents.json"))
+        # Inline JSON, not the run/policy file the parent records: the child cannot
+        # read run/policy (test_staged_argv_paths_are_readable_to_the_child).
+        self.assertEqual(json.loads(option(argv, "--agents")),
+                         worker.STAGED_PROFILES["corpus-extract"].agents)
+        self.assertFalse(os.path.isabs(option(argv, "--agents")))
         self.assertEqual(option(argv, "--add-dir"), str(self.run_dir / "output"))
         self.assertIn("--disable-slash-commands", argv)
         self.assertNotIn("--safe-mode", argv)
         self.assertEqual(option(argv, "--permission-mode"), "auto")
+
+    def test_staged_argv_paths_are_readable_to_the_child(self):
+        """Every path the staged argv hands Claude is in the policy's readable set
+        (allowRead or allowWrite) on both platforms, and none is under run/policy or
+        run/result, which the child cannot read on Linux by design (build_policy).
+        Measured 2026-10-13 (#6 follow-up (b)): --agents as the run/policy path was
+        "--agents file not found" to Claude 2.1.283 before any model call."""
+        for profile, domains in (("corpus-extract", ()), ("deep-research", ("docs.python.org",))):
+            staged = self.staged(profile, domains)
+            argv = worker.build_staged_command(RUNTIME, self.policy_file, "/opt/claude",
+                                               "prompt", self.run_dir, staged)
+            claude_args = argv[argv.index("--") + 2:]   # after srt's "--" and the cli
+            paths = [argument for argument in claude_args if os.path.isabs(argument)]
+            self.assertIn(str(self.run_dir / "home/.claude/settings.json"), paths)
+            if "--agents" in claude_args:
+                self.assertEqual(json.loads(option(claude_args, "--agents")),
+                                 worker.STAGED_PROFILES[profile].agents)
+            for path in paths:
+                self.assertFalse(path.startswith(str(self.run_dir / "policy")), path)
+                self.assertFalse(path.startswith(str(self.run_dir / "result")), path)
+            for platform in ("darwin", "linux"):
+                with self.subTest(profile=profile, platform=platform):
+                    policy = worker.build_policy(self.input, self.run_dir, self.root / "claude",
+                                                 staged=staged, platform=platform)
+                    readable = [*policy["filesystem"]["allowRead"],
+                                *policy["filesystem"]["allowWrite"]]
+                    for path in paths:
+                        self.assertTrue(any(path == root or path.startswith(root + "/")
+                                            for root in readable), (path, readable))
 
     def test_permission_mode_is_still_only_dont_ask_or_auto(self):
         for mode in ("bypassPermissions", "acceptEdits", "default", "plan", ""):
