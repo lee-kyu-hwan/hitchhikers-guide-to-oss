@@ -109,7 +109,18 @@ Claude일 때 이름·프로필 목록·크기 한계를 그대로 쓴다. 노�
 
 ## 6. 로컬 Linux CI
 
-(CI 뒤 채운다)
+`docs/ci.md` 방식(Docker `python:3.14` linux/arm64, Python 3.14.8, `--network none --cpuset-cpus=0,1`, 비root `runner`),
+2026-10-13, 한 번에 하나만 실행, 트리 = 커밋 `9e9c510`(이 CI 문단 앞).
+
+| 묶음 | Linux |
+|---|---|
+| 저장소 시험 `tests/test_*.py` 22모듈 | **737개 OK (skip 40)**; 모듈별 모두 OK(`worker_codex` 28 신설, `worker_backends` 24, `worker` 43, `worker_auth` 47, `worker_skills` 40, `worker_staged_harness` 13, `worker_linux` 174, `egress_pin` 26, `relay` 57) |
+| 분석 번들 `test_*.py` 12개 + `selftest_*.py` 3개 | 모두 OK(skip: assess 1, assess_contract 1, continue_plan 8, dry_plan 3, model_retry 1, prompt_contract 3, reduce_inputs 1, search_clues 1, stage_inputs 2), `selftest_verify` failures=0(사례 +6: M4 백엔드별), kinds 129 cases 0, scope 19 cases 0 |
+| 스킬 시험 6묶음 | **659개 OK** (researching 162, analyzing 77, verifying 138, recent-closed 162, curated 53, issues 67) — 변화 없음 |
+| `__pycache__` | 0 |
+
+이전 기준(main `8a21bcc`: 저장소 709 = PR #23의 708 + PR #26의 skills 시험 1)과 비교하면 저장소 +28(`worker_codex`),
+스킬 수 변화 없음(분석 번들 selftest 사례만 +6, 단위 시험 수 아님).
 
 ## 7. 남은 항목
 
