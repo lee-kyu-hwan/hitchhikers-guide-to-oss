@@ -7,11 +7,12 @@ network only through the srt proxy (hostname allow list) and the #192 relay
 (read-only GitHub endpoints). This tool narrows what the non-sandboxed
 processes of the research uid (srt proxy, relay, supervisor) can dial: a root
 step resolves ``api.github.com`` and the run's backend's model endpoint
-(``api.anthropic.com`` for claude, the default; MODEL_NAMES) once per run
+(``api.anthropic.com`` for claude, the default; ``chatgpt.com`` for codex;
+MODEL_NAMES) once per run
 through an explicit resolver, accepts only public IPv4 answers, and opens
 exactly those addresses on TCP 443 for a bounded time. DNS stays closed for the
 research uid, so names cannot be rebound during the run. A backend whose
-endpoint has not been measured (codex, agy; issue #6) is refused, and ``none``
+endpoint has not been measured (agy; issue #6) is refused, and ``none``
 (a run without a model) pins GitHub alone.
 
 Commands (run as root in the dedicated guest):
@@ -58,11 +59,14 @@ from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 SCHEMA_VERSION = "1.1.0"  # 1.1.0: the manifest names its backend
 GITHUB_NAME = "api.github.com"
-# The model endpoint per backend (issue #6). Only Claude's is measured; codex
-# and agy are named so the CLI takes them and refused until a real run shows
-# their endpoints (stages 2 and 3). "none" is a run without a model (the
-# non-AI collection and verifier entries): GitHub alone.
-MODEL_NAMES = {"claude": ("api.anthropic.com",), "none": ()}
+# The model endpoint per backend (issue #6). Claude's is measured; Codex's is
+# chatgpt.com (ChatGPT-subscription login: the model WebSocket/HTTPS and the
+# models list; analytics, plugins and apps are off and token refresh is not
+# allowed, docs/development/2026-10-13-6-codex-backend). agy is named so the
+# CLI takes it and refused until a real run shows its endpoints (stage 3).
+# "none" is a run without a model (the non-AI collection and verifier
+# entries): GitHub alone.
+MODEL_NAMES = {"claude": ("api.anthropic.com",), "codex": ("chatgpt.com",), "none": ()}
 BACKEND_NAMES = ("claude", "codex", "agy", "none")
 DEFAULT_BACKEND = "claude"
 # The default backend's names: what every run pinned before backends existed.

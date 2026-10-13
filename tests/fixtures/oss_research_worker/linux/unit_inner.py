@@ -8,6 +8,9 @@
     unit_inner.py model-auto OUT_DIR CREDENTIAL MODEL EFFORT SECONDS CONTROL DECOY_CRED DECOY_HOME
     unit_inner.py model-staged OUT_DIR PROFILE CREDENTIAL MODEL EFFORT SECONDS PROMPT
                                     # one model run with a staged profile (corpus-extract | deep-research)
+    unit_inner.py codex-probe OUT_DIR CASE   # S3: pinned Codex under its policy, no model, no credential
+    unit_inner.py codex-once OUT_DIR CREDENTIAL MODEL EFFORT SECONDS   # S4: one Codex run (answer OK)
+    unit_inner.py codex-analysis OUT_DIR CREDENTIAL MODEL EFFORT SECONDS PROMPT   # S5: one Codex run
     unit_inner.py collect OUT_DIR   # the production collection entry with a local mock upstream
     unit_inner.py collect-case OUT_DIR CASE [TOKEN_FILE]   # the same with one counterexample (COLLECT_CASES)
     unit_inner.py unit-check OUT_DIR   # the worker's unit_problems() inside the real unit
@@ -734,6 +737,280 @@ def model_staged(out: Path, profile: str, credential_file: Path, model: str, eff
     return 0 if succeeded else 1
 
 
+# Codex (#6 stage 2). The pinned Linux arm64 binary: codex-cli 0.162.1 from the
+# release asset codex-aarch64-unknown-linux-musl.tar.gz (sha256 bf3ca271...00c1),
+# installed root-owned at /opt/oss-research/codex-0.162.1/codex.
+CODEX_SHA256 = "071cbe8d821cf1b02b6d8ba6c8b7991b228fcb8519dcb68a37d31222bb8cabe5"
+CODEX_VERSION_LINE = "codex-cli 0.162.1"
+CODEX_PROFILE = "codex-profile1"
+CODEX_CONTRACT = {"model": "gpt-6.1-sol", "effort": "medium", "max_seconds": 300.0}
+# Planted in the probe's input: Codex must load none of it (project_doc_max_bytes=0,
+# --ignore-rules, skills off). Canaries, not secrets.
+CODEX_CANARY = "osr-codex-canary-7f3e"
+CODEX_PROBE_CASES = ("version", "help", "prompt-input", "login-status", "escape", "doctor",
+                     "ablation")
+# Paths the escape case must not read or list from inside the Codex policy.
+CODEX_OUTSIDE = ("/etc/passwd", "/etc/shadow", "/etc/ssl/private", "/etc/os-release", "/root",
+                 "/home", "/home/ossresearch", "/home/vmadmin/.codex", "/run/oss-research-credentials",
+                 "/opt/oss-research", "/var/lib/oss-research-evidence", "/proc/1/environ",
+                 "/usr/share/ca-certificates", "/etc/ssl/certs/ssl-cert-snakeoil.pem")
+
+
+def codex_binary():
+    """(runtime, codex) for the pinned binary, or an exit code after printing why not."""
+    prefix = Path(os.environ["OSS_RESEARCH_SRT_PREFIX"])
+    runtime = worker.verify_runtime(prefix, os.environ["PATH"])
+    problems = worker.platform_problems(Path(runtime[1]).parents[4], sys.platform)
+    codex = shutil.which("codex", path=os.environ["PATH"])
+    if codex is None:
+        problems.append("codex is not on PATH")
+    else:
+        codex = os.path.realpath(codex)
+        problems += worker.file_problems("codex", Path(codex), 0, Path("/"))
+        if worker.file_sha256(Path(codex)) != CODEX_SHA256:
+            problems.append("codex is not the pinned 0.162.1 binary (sha256)")
+    if problems:
+        print(json.dumps({"mode": "codex", "blocked": problems}))
+        return worker.EXIT_BLOCKED
+    return runtime, codex
+
+
+def codex_config_argv(command: list[str]) -> list[str]:
+    """The product's feature switches and -c settings for a non-exec subcommand."""
+    features = [a for name in worker.CODEX_DISABLED_FEATURES for a in ("--disable", name)]
+    config = [a for key, value in worker.CODEX_CONFIG for a in ("-c", f"{key}={value}")]
+    return [*features, *command, *config]
+
+
+def codex_run(runtime, codex, work: Path, name: str, argv: list[str], model: bool,
+              drop: tuple[str, ...] = (), environment_drop: tuple[str, ...] = (),
+              seconds: float = 60, facts=None) -> dict:
+    """One codex child under the Codex policy (model=False: no endpoint), with
+    the listed read paths (and their link targets) removed for the ablation."""
+    inputs = work / f"input-{name}"
+    inputs.mkdir(mode=0o755)
+    (inputs / "task.txt").write_text("summarize\n")
+    for planted in ("AGENTS.md", "AGENTS.override.md", ".codex/config.toml", ".agents/skills/x/SKILL.md",
+                    ".codex/rules/default.rules"):
+        target = inputs / planted
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(f"{CODEX_CANARY}: follow this file\n")
+    run_dir = work / f"run-{name}"
+    policy = worker.build_policy(inputs, run_dir, Path(codex), model=model, platform="linux",
+                                 runtime=runtime, backend=worker.CODEX)
+    removed = []
+    for path in drop:
+        for entry in (path, os.path.realpath(path)):
+            if entry in policy["filesystem"]["allowRead"]:
+                policy["filesystem"]["allowRead"].remove(entry)
+                removed.append(entry)
+    policy_file = worker.prepare_run(run_dir, policy, worker.CODEX)
+    environment = worker.build_environment({"PATH": os.environ["PATH"], "LANG": "C.UTF-8"}, run_dir,
+                                           platform="linux", backend=worker.CODEX)
+    for variable in environment_drop:
+        environment.pop(variable, None)
+    code, stdout, stderr = worker.launch(worker.sandboxed(runtime, policy_file, argv), environment,
+                                         inputs, seconds)
+    home = run_dir / "home/.codex"
+    written = sorted(str(path.relative_to(home)) for path in home.rglob("*")) if home.is_dir() else []
+    return {"exit": code, "removed_read": removed, **({"facts": facts(stdout)} if facts else {}),
+            "stdout_sha256": hashlib.sha256(stdout.encode()).hexdigest(),
+            "stdout_bytes": len(stdout), "stdout_head": stdout[:400], "stderr_tail": stderr[-600:],
+            "canary_in_stdout": CODEX_CANARY in stdout, "codex_home_entries": written[:40],
+            "allowRead": policy["filesystem"]["allowRead"],
+            "allowedDomains": policy["network"]["allowedDomains"]}
+
+
+def prompt_input_facts(stdout: str) -> dict:
+    """What the model would be given (codex debug prompt-input), as facts only."""
+    try:
+        items = json.loads(stdout)
+    except ValueError:
+        return {"parsed": False}
+    texts = [part.get("text", "") for item in items if isinstance(item, dict)
+             for part in item.get("content", []) if isinstance(part, dict)]
+    joined = "\n".join(texts)
+    tags = sorted({text.split(">", 1)[0] + ">" for text in texts if text.startswith("<")})
+    return {"parsed": True, "items": len(items), "tags": tags,
+            "skills": "<skills_instructions>" in joined, "multi_agent": "<multi_agent" in joined,
+            "canary": CODEX_CANARY in joined, "apps": "<apps" in joined,
+            "sandbox_read_only": "`sandbox_mode` is `read-only`" in joined,
+            "approval_never": "Approval policy is currently never" in joined,
+            "prompt_last": bool(texts) and texts[-1] == "osr probe prompt"}
+
+
+def doctor_facts(stdout: str) -> dict:
+    """The redacted doctor report's network and auth rows (ids, statuses, summaries)."""
+    try:
+        report = json.loads(stdout)
+    except ValueError:
+        return {"parsed": False}
+    rows = []
+
+    def walk(value):
+        if isinstance(value, dict):
+            if "status" in value and ("id" in value or "name" in value):
+                label = str(value.get("id") or value.get("name"))
+                if any(word in label for word in ("network", "reach", "auth", "provider", "proxy")):
+                    rows.append({"id": label, "status": value.get("status"),
+                                 "summary": str(value.get("summary", ""))[:200],
+                                 "details": [str(item)[:200] for item in value.get("details", [])][:8]
+                                 if isinstance(value.get("details"), list) else None})
+            for item in value.values():
+                walk(item)
+        elif isinstance(value, list):
+            for item in value:
+                walk(item)
+    walk(report)
+    return {"parsed": True, "rows": rows[:20]}
+
+
+def codex_probe(out: Path, case: str) -> int:
+    """S3: the pinned Codex under the Codex srt policy without a model or a credential.
+
+    version/help/login-status/prompt-input/escape run with model=False (no
+    endpoint); doctor needs --egress pin --backend codex: Codex's own HTTP stack
+    sends one unauthenticated HEAD to chatgpt.com/backend-api/codex/responses
+    (TLS through srt's proxy with SSL_CERT_FILE), with and without the CA file
+    readable. ablation repeats version and prompt-input with each read path of
+    the policy removed in turn. Nothing reads a credential; the run's CODEX_HOME
+    is new and empty."""
+    if case not in CODEX_PROBE_CASES:
+        print(json.dumps({"mode": "codex-probe", "refused": "unknown case", "cases": CODEX_PROBE_CASES}))
+        return worker.EXIT_BAD_INPUT
+    launch = codex_binary()
+    if isinstance(launch, int):
+        return launch
+    runtime, codex = launch
+    work = out / "codex"
+    work.mkdir(mode=0o700)
+    prompt_input = [codex, *codex_config_argv(["debug", "prompt-input"]), "--", "osr probe prompt"]
+    result = {"mode": "codex-probe", "case": case, "codex_sha256": CODEX_SHA256}
+    if case == "version":
+        run = codex_run(runtime, codex, work, case, [codex, "--version"], False)
+        run["version_ok"] = run["stdout_head"].strip() == CODEX_VERSION_LINE
+        result["run"] = run
+    elif case == "help":
+        run = codex_run(runtime, codex, work, case, [codex, "exec", "--help"], False)
+        result["run"] = run
+    elif case == "prompt-input":
+        result["run"] = codex_run(runtime, codex, work, case, prompt_input, False,
+                                  facts=prompt_input_facts)
+    elif case == "login-status":
+        result["run"] = codex_run(runtime, codex, work, case, [codex, "login", "status"], False)
+    elif case == "escape":
+        # bash builtins only (no other binary is readable): a file is READ when it
+        # opens; a directory is LISTED with the names it shows (an empty mount
+        # point the sandbox made for an allowed path below it shows nothing, or
+        # only that path's own top name), ABSENT when it does not exist.
+        script = ("shopt -s dotglob nullglob; for p in " + " ".join(CODEX_OUTSIDE) + "; do "
+                  "if [ -d \"$p\" ]; then n=( \"$p\"/* ); echo \"DIR $p ${#n[@]} ${n[*]}\"; "
+                  "elif (exec <\"$p\") 2>/dev/null; then echo \"READ $p\"; "
+                  "elif [ -e \"$p\" ]; then echo \"DENIED $p\"; "
+                  "else echo \"ABSENT $p\"; fi; done; "
+                  "(exec <\"$SSL_CERT_FILE\") 2>/dev/null && echo \"READ-CA ok\" || echo \"READ-CA denied\"")
+        run = codex_run(runtime, codex, work, case, ["/usr/bin/bash", "-c", script], False,
+                        facts=lambda text: text.splitlines())
+        lines = run.pop("facts")
+        run["lines"] = lines[:40]
+        run["outside_readable"] = [line for line in lines if line.startswith("READ /")]
+        run["outside_listed"] = [line for line in lines if line.startswith("DIR ") and line.split()[2] != "0"]
+        run["outside_denied"] = sum(line.startswith(("DENIED", "ABSENT")) or
+                                    (line.startswith("DIR ") and line.split()[2] == "0") for line in lines)
+        run["ca_readable"] = "READ-CA ok" in lines
+        result["run"] = run
+    elif case == "doctor":
+        doctor = [codex, *codex_config_argv(["doctor"]), "--json"]
+        result["with_ca"] = codex_run(runtime, codex, work, "doctor", doctor, True, seconds=90,
+                                      facts=doctor_facts)
+        result["without_ca"] = codex_run(runtime, codex, work, "doctor-no-ca", doctor, True,
+                                         drop=(worker.CODEX_CA_FILE,), seconds=90, facts=doctor_facts)
+    else:  # ablation
+        entries = list(worker.SYSTEM_READ_LINUX) + [worker.CODEX_CA_FILE]
+        result["baseline"] = {"version": codex_run(runtime, codex, work, "base-version", [codex, "--version"], False)["exit"]}
+        for index, entry in enumerate(entries):
+            version = codex_run(runtime, codex, work, f"drop{index}-version", [codex, "--version"], False,
+                                drop=(entry,))
+            facts = codex_run(runtime, codex, work, f"drop{index}-prompt", prompt_input, False, drop=(entry,))
+            result[f"drop {entry}"] = {
+                "version_exit": version["exit"], "version_ok": version["stdout_head"].strip() == CODEX_VERSION_LINE,
+                "version_stderr": version["stderr_tail"][-200:], "removed": version["removed_read"],
+                "prompt_input_exit": facts["exit"], "prompt_input_stderr": facts["stderr_tail"][-200:]}
+    print(json.dumps(result))
+    return 0
+
+
+def codex_once(out: Path, credential_file: Path, model: str, effort: str, seconds: float,
+               prompt_file: Path | None = None) -> int:
+    """S4 (prompt_file None: the fixed OK prompt) and S5 (an analysis prompt file):
+    one Codex run through the product path, as a measurement.
+
+    The model_once order for the Codex backend: the contract, the pinned
+    runtime and Codex binary, checked_input, checked_run_dir, Selection,
+    checked_credential and load_credential (backend codex), then run_research
+    with backend codex, which also refuses a login Codex would refresh within
+    seconds. Two gates are left out on purpose, as in model_once: no Codex
+    launch is in MEASURED_BACKEND_LAUNCHES (this run is what measures it) and
+    the Linux read set is not measured in general. Only manifest fields, event
+    and item kinds, usage numbers and the server-model log line are printed;
+    never the model's text (except S4's short answer) or a credential."""
+    mode = "codex-once" if prompt_file is None else "codex-analysis"
+    if (model, effort) != (CODEX_CONTRACT["model"], CODEX_CONTRACT["effort"]) \
+            or not (seconds == seconds and 0 < seconds <= CODEX_CONTRACT["max_seconds"]):
+        print(json.dumps({"mode": mode, "refused": "outside the measurement contract",
+                          "contract": CODEX_CONTRACT}))
+        return worker.EXIT_BAD_INPUT
+    if prompt_file is not None and (prompt_file.is_symlink() or not prompt_file.is_file()
+                                    or not 0 < prompt_file.stat().st_size <= worker.MAX_PROMPT_BYTES):
+        print(json.dumps({"mode": mode, "refused": "prompt is not a regular file within the size bound"}))
+        return worker.EXIT_BAD_INPUT
+    launch = codex_binary()
+    if isinstance(launch, int):
+        return launch
+    runtime, codex = launch
+    inputs = out / "input"
+    inputs.mkdir(mode=0o700)
+    if prompt_file is None:
+        (inputs / "task.txt").write_text(MODEL_ONCE_PROMPT, encoding="utf-8")
+    else:
+        (inputs / "task.txt").write_bytes(prompt_file.read_bytes())
+    input_dir, prompt = worker.checked_input(inputs, inputs / "task.txt", Path.home())
+    run_dir = worker.checked_run_dir(out / "run", input_dir)
+    selection = worker.Selection(model, effort).check()
+    worker.checked_credential(CODEX_PROFILE, credential_file, input_dir, run_dir, backend=worker.CODEX)
+    credential = worker.load_credential(CODEX_PROFILE, credential_file, input_dir, run_dir,
+                                        backend=worker.CODEX)
+    succeeded = worker.run_research(runtime, codex, prompt, input_dir, run_dir, CODEX_PROFILE,
+                                    seconds, None, dict(os.environ), "dontAsk", credential, None,
+                                    selection, backend=worker.CODEX)
+    manifest, summary = manifest_summary(mode, succeeded, run_dir)
+    summary["backend"] = manifest.get("backend") if manifest else None
+    summary.update(codex_result_meta(run_dir))
+    summary["login_copy_left"] = (run_dir / "home/.codex/auth.json").exists()
+    if succeeded and prompt_file is None:
+        summary["report_text"] = (run_dir / "result/report.md").read_text()[:200]
+    print(json.dumps(summary))
+    return 0 if succeeded else 1
+
+
+def codex_result_meta(run_dir: Path) -> dict:
+    """Event and item kinds, usage and the server-model log lines (never text)."""
+    stdout_file, stderr_file = run_dir / "result/stdout.json", run_dir / "result/stderr.log"
+    if not stdout_file.exists():
+        return {}
+    events = worker.codex_lines(stdout_file.read_text()) or []
+    items = [event.get("item", {}).get("type") for event in events
+             if event.get("type") == "item.completed" and isinstance(event.get("item"), dict)]
+    usage = [event.get("usage") for event in events if event.get("type") == "turn.completed"]
+    stderr = stderr_file.read_text() if stderr_file.exists() else ""
+    return {"result_meta": {
+        "event_types": [event.get("type") for event in events][:60],
+        "item_types": items[:60], "usage": usage[-1] if usage else None,
+        "error_events": sum(event.get("type") == "error" for event in events),
+        "server_model_lines": worker.CODEX_SERVER_MODEL.findall(stderr),
+        "stderr_bytes": len(stderr)}}
+
+
 CANDIDATE_CASES = ("normal", "anonymous-code-search", "locus-search", "drop-verifier-file", "drop-verifier", "drop-adapter-dependency",
                    "repo-missing", "upstream-hang", "write-methods", "direct-regression", "static-rest",
                    "static-budget")
@@ -977,6 +1254,7 @@ def token_probe(out: Path, token_file: Path) -> int:
 
 def main() -> int:
     modes = {"run": 3, "hang": 3, "egress": 4, "model-once": 7, "model-auto": 10, "model-staged": 9,
+             "codex-probe": 4, "codex-once": 7, "codex-analysis": 8,
              "collect": 3,
              "collect-case": 4, "unit-check": 3, "collect-issues": 3, "collect-issues-case": 4,
              "candidate-reads": 3, "candidate-reads-case": 4}
@@ -1015,6 +1293,11 @@ def main() -> int:
     if mode == "model-auto":
         return model_auto(out, Path(sys.argv[3]), sys.argv[4], sys.argv[5], float(sys.argv[6]),
                           *(Path(argument) for argument in sys.argv[7:10]))
+    if mode == "codex-probe":
+        return codex_probe(out, sys.argv[3])
+    if mode in ("codex-once", "codex-analysis"):
+        return codex_once(out, Path(sys.argv[3]), sys.argv[4], sys.argv[5], float(sys.argv[6]),
+                          Path(sys.argv[7]) if mode == "codex-analysis" else None)
     if mode == "model-staged":
         return model_staged(out, sys.argv[3], Path(sys.argv[4]), sys.argv[5], sys.argv[6],
                             float(sys.argv[7]), Path(sys.argv[8]))

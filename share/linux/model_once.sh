@@ -24,6 +24,13 @@
 #             판정은 judge(S1-staged-unchanged·S2-profile-requested, V2 없음), 회수는 verify_pickup.py --staged).
 #           model-once·model-auto·staged-*는 wrapper에 --backend claude를 준다(--entry verify의 pin은 그 이름만
 #           연다. 기본 none이면 api.anthropic.com이 열리지 않는다).
+#           | codex-once | codex-analysis (#6 2단계: unit_inner.py codex-once / codex-analysis, Codex 0.162.1
+#             gpt-6.1-sol·medium, 프로필 codex-profile1. 자격은 stdin 의 Codex ChatGPT 로그인 파일(auth.json,
+#             200..65536 B)을 $CDIR/codex-profile1/auth.json 으로 설치하고, 제품이 run/home/.codex/auth.json 으로
+#             복사했다가 지운다. wrapper 에 --backend codex(pin 은 chatgpt.com 만), PATH 에 sha 고정 codex.
+#             codex-analysis 는 PROMPT 필수(staged 와 같은 검사·복사). sentinel 은 가짜 로그인 파일로 --egress none
+#             에서만: 하네스 경로(설치·reaper·복사·삭제·scan·증거·정리) 확인용이고 외부 접속이 없다.
+#             판정은 judge(R4~R6, V1~V5: 관찰 모델 = gpt-6.1-sol, 텍스트 항목만), scan 은 세 토큰 각각.
 # PROMPT    analysis·analysis-dry·staged-*의 prompt 파일(게스트 절대 경로). 자격을 읽기 전에 검사한다: lstat regular,
 #           symlink 아님, root 소유, 그룹·기타 쓰기 불가, 상위 디렉터리 root 소유·쓰기 불가, 1..65536 B,
 #           strict UTF-8, NUL 없음, 인증 표지(oss-research-credentials, oauth-token,
@@ -45,6 +52,7 @@ set -u
 KIND="${1:?sentinel|token}"; SRC="${2:?src}"; PREFIX="${3:?srt prefix}"; NODE_BIN="${4:?node bin}"
 EGRESS="${5:?none|pin}"; SCENARIO="${6:?scenario}"; TIMEOUT="${7:?wrapper timeout}"; INNER="${8:?inner seconds}"
 MODE="${9:-model-once}"
+CODEX=""; case "$MODE" in codex-once|codex-analysis) CODEX=yes;; esac
 PROMPT="${10:-}"
 DECOY=/run/osr-auto-decoy
 DHOME=/var/tmp/osr-auto-decoy
@@ -61,6 +69,10 @@ EVIDENCE=/var/lib/oss-research-evidence
 REAPER="osr-cred-reaper-$RID"
 MODEL=claude-opus-5-5
 EFFORT=medium
+CRED_MIN=20; CRED_MAX=4097
+if [ -n "$CODEX" ]; then
+  PDIR="$CDIR/codex-profile1"; CRED="$PDIR/auth.json"; MODEL=gpt-6.1-sol; CRED_MIN=200; CRED_MAX=65536
+fi
 OUT=""
 fails=0
 pass() { echo "PASS $*"; }
@@ -68,12 +80,14 @@ fail() { echo "FAIL $*"; fails=$((fails + 1)); }
 info() { echo "INFO $*"; }
 case "$KIND" in sentinel|token) ;; *) echo "FAIL bad KIND"; exit 2;; esac
 case "$EGRESS" in none|pin) ;; *) echo "FAIL bad EGRESS"; exit 2;; esac
-case "$MODE" in model-once|model-auto|worker|worker-dry|analysis|analysis-dry|staged-corpus|staged-deep) ;; *) echo "FAIL bad MODE"; exit 2;; esac
+case "$MODE" in model-once|model-auto|worker|worker-dry|analysis|analysis-dry|staged-corpus|staged-deep) ;; codex-once|codex-analysis) ;; *) echo "FAIL bad MODE"; exit 2;; esac
+if [ -n "$CODEX" ] && [ "$KIND" = sentinel ] && [ "$EGRESS" != none ]; then
+  echo "FAIL a codex sentinel run is --egress none only (a fake login never reaches chatgpt.com)"; exit 2; fi
 case "$MODE" in worker-dry|analysis-dry) [ "$KIND" != sentinel ] && { echo "FAIL $MODE is sentinel only"; exit 2; };; esac
 PRODUCT=no; case "$MODE" in worker|worker-dry|analysis|analysis-dry) PRODUCT=yes;; esac
 STAGED=""; case "$MODE" in staged-corpus) STAGED=corpus-extract;; staged-deep) STAGED=deep-research;; esac
 PROMPT_SHA=""
-if [ "$MODE" = analysis ] || [ "$MODE" = analysis-dry ] || [ -n "$STAGED" ]; then
+if [ "$MODE" = analysis ] || [ "$MODE" = analysis-dry ] || [ -n "$STAGED" ] || [ "$MODE" = codex-analysis ]; then
   [ -n "$PROMPT" ] || { echo "FAIL P0-prompt-argument ($MODE needs PROMPT)"; exit 2; }
   PROMPT_SHA="$(sudo /usr/bin/python3 -I -B - "$PROMPT" <<'PYEOF'
 import hashlib, os, stat, sys
@@ -99,7 +113,8 @@ try:
 except UnicodeDecodeError:
     fail("prompt is not UTF-8")
 if "\0" in text or not text.strip(): fail("prompt is empty or holds NUL")
-for marker in ("oss-research-credentials", "oauth-token", "CLAUDE_CODE_OAUTH_TOKEN"):
+for marker in ("oss-research-credentials", "oauth-token", "CLAUDE_CODE_OAUTH_TOKEN", "auth.json",
+               "refresh_token", "codex-profile1"):
     if marker in text: fail("prompt holds a credential marker")
 print(hashlib.sha256(data).hexdigest())
 PYEOF
@@ -178,8 +193,9 @@ for path in ("/", "/run", ctop):
     info = os.lstat(path)
     assert stat.S_ISDIR(info.st_mode) and info.st_uid == 0 and not info.st_mode & 0o022, path
 assert stat.S_IMODE(os.lstat(ctop).st_mode) == 0o711 and not os.listdir(ctop), "top not private or not empty"
-data = sys.stdin.buffer.read(4098)
-if not 20 <= len(data) <= 4097:
+low, high = int(sys.argv[5]), int(sys.argv[6])
+data = sys.stdin.buffer.read(high + 1)
+if not low <= len(data) <= high:
     sys.exit("credential size out of bounds")
 os.mkdir(cdir, 0o711)            # fails if anything is there, a link included
 os.chown(cdir, 0, 0); os.chmod(cdir, 0o711)
@@ -194,7 +210,7 @@ try:
     os.fchmod(fd, 0o600)
 finally:
     os.close(fd)
-' "$CTOP" "$CDIR" "$PDIR" "$CRED" || abort "C1-credential-installed"
+' "$CTOP" "$CDIR" "$PDIR" "$CRED" "$CRED_MIN" "$CRED_MAX" || abort "C1-credential-installed"
 exec 0</dev/null   # 호스트 stdin 은 여기서 닫는다
 pass "C1-credential-installed (run $RID)"
 [ "$SCENARIO" = bad-meta ] && sudo chmod 0640 "$CRED"
@@ -238,6 +254,7 @@ sudo install -d -m 0700 "$WORK" || abort W1-work-dir
 OUT="$(sudo mktemp -d /tmp/osr-m-out-XXXX)" && sudo chown ossresearch:ossresearch "$OUT" || abort W2-out-dir
 CLAUDE_DIR=/opt/oss-research/claude-2.1.283
 case "$MODE" in worker-dry|analysis-dry) CLAUDE_DIR="";; esac   # no claude on PATH: no child can start
+[ -n "$CODEX" ] && CLAUDE_DIR=/opt/oss-research/codex-0.162.1   # the pinned codex instead of claude
 ENVV=(PATH="$NODE_BIN:${CLAUDE_DIR:+$CLAUDE_DIR:}/usr/bin:/bin" LANG=C.UTF-8
       OSS_RESEARCH_SRT_PREFIX="$PREFIX" PYTHONDONTWRITEBYTECODE=1)
 [ "$EGRESS" = pin ] && ENVV+=(OSS_RESEARCH_EGRESS_RESOLVER=192.168.5.2)
@@ -264,6 +281,11 @@ if [ "$PRODUCT" = yes ]; then
        --profile claude-profile2 --input-dir "$OUT/input" --prompt-file "$OUT/input/task.txt"
        --run-dir "$OUT/run" --credential-file "$CRED" --model "$MODEL" --effort "$EFFORT"
        --runtime-prefix "$PREFIX" --timeout "$INNER")
+elif [ -n "$CODEX" ]; then
+  # The Codex measurement harness; the pin opens chatgpt.com only (wrapper --backend codex).
+  CMD=("$PY" -I -B "$WRAPPER" --entry verify --egress "$EGRESS" --backend codex --timeout "$TIMEOUT" --
+       "$MODE" "$OUT" "$CRED" "$MODEL" "$EFFORT" "$INNER")
+  [ "$MODE" = codex-analysis ] && CMD+=("$OUT/prompt.txt")
 elif [ -n "$STAGED" ]; then
   # The measurement harness with a staged profile; the pin opens the claude names (wrapper --backend).
   CMD=("$PY" -I -B "$WRAPPER" --entry verify --egress "$EGRESS" --backend claude --timeout "$TIMEOUT" --
@@ -273,6 +295,13 @@ else
        "$MODE" "$OUT" "$CRED" "$MODEL" "$EFFORT" "$INNER")
 fi
 [ "$MODE" = model-auto ] && CMD+=("$DECOY/control" "$DECOY/claude-profile2/oauth-token" "$DHOME/home-canary")
+if [ "$MODE" = codex-analysis ]; then
+  # The same root copy as the staged modes: the inner copies it into its own input/.
+  sudo install -m 0600 -o ossresearch -g ossresearch "$PROMPT" "$OUT/prompt.txt" || abort W3-prompt
+  copied="$(sudo sha256sum "$OUT/prompt.txt" | cut -c1-64)"
+  [ "$copied" = "$PROMPT_SHA" ] || abort "W3-prompt-copy-sha"
+  pass "W3-prompt-copied sha256=$copied"
+fi
 began=$(date +%s)
 if [ "$SCENARIO" = sigterm ] || [ "$SCENARIO" = sigkill-during-run ]; then
   sudo bash -c 'env -i "$@" > '"$WORK"'/record.json 2> '"$WORK"'/wrapper.err & echo $! > '"$WORK"'/pid; wait' _ "${ENVV[@]}" "${CMD[@]}" &
@@ -363,7 +392,7 @@ print("INFO R result", json.dumps({k:o.get(k) for k in ("type","subtype","is_err
   fi
   sudo "$PY" -I -B -c 'import json,sys
 r=json.loads(open(sys.argv[1]).read().strip().splitlines()[-1]); i=json.loads(r.get("stdout","").strip().splitlines()[-1])
-keep=("status","exit_code","failures","problems","requested_model","requested_effort","observed_models","result_meta","report_text","credential","stream_escaped_value_check","argv_auto_vs_dontAsk","stream_bytes","policy_sha256","policy_rebuilt_sha256","policy_builder_takes_mode","policy_builder_parameters","requested_profile","execution_profile","staged_changed","output_files")
+keep=("status","exit_code","failures","problems","backend","login_copy_left","requested_model","requested_effort","observed_models","result_meta","report_text","credential","stream_escaped_value_check","argv_auto_vs_dontAsk","stream_bytes","policy_sha256","policy_rebuilt_sha256","policy_builder_takes_mode","policy_builder_parameters","requested_profile","execution_profile","staged_changed","output_files")
 print("INFO R wrapper", json.dumps({k:r.get(k) for k in ("unit","egress","exit_code","failures")}))
 print("INFO R pin", json.dumps({k:((r.get("egress_pin") or {}).get(k) or {}).get("exit") for k in ("apply","verify","clear")}), json.dumps(((r.get("egress_pin") or {}).get("apply") or {}).get("nft_elements")))
 print("INFO R inner", json.dumps({k:i.get(k) for k in keep}))' "$WORK/record.json" 2>/dev/null || info "R no parsable record (the judge has failed it)"

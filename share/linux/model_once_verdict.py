@@ -68,6 +68,13 @@ EFFORT = "medium"
 # The exact model, or the same name with a dated suffix (claude-opus-5-5-20260915).
 OBSERVED_MODEL = re.compile(r"claude-opus-5-5(-\d{8})?")
 UNIT = re.compile(r"oss-research-[0-9a-f]{16}")
+# The Codex measurement (#6 stage 2; unit_inner.py codex-once / codex-analysis).
+CODEX_MODEL = "gpt-6.1-sol"
+CODEX_PROFILE = "codex-profile1"
+CODEX_MODES = ("codex-once", "codex-analysis")
+CODEX_CREDENTIAL = {"file": "home/.codex/auth.json", "exact_value_check": "clean"}
+# Items a tool-less run may show; an "error" item only as the WebSocket -> HTTPS notice.
+CODEX_TEXT_ITEMS = {"agent_message", "reasoning"}
 CLEANUP_FACTS = {"credential_dir_exists": False, "unit_load_state": "not-found",
                  "cgroup_exists": False, "research_processes": 0, "pin_elements": 0,
                  "pin_manifest_exists": False, "work_dir_exists": False,
@@ -114,22 +121,44 @@ def load_worker():
     return module
 
 
-def scan(credential: Path, roots: list[Path], worker=None) -> str:
-    """"clean", "exposed" or "incomplete: <why>" over every root."""
-    worker = load_worker() if worker is None else worker
+def scan_values(credential: Path) -> list[str] | str:
+    """The exact values to look for: a Claude token file's one line, or each of
+    the three tokens of a Codex login file (auth.json). A reason string when
+    the file cannot give them (never a value)."""
     try:
-        value = credential.read_bytes().decode("ascii").removesuffix("\n")
-    except (OSError, UnicodeError) as error:
+        data = credential.read_bytes()
+    except OSError as error:
         return f"incomplete: credential unreadable ({type(error).__name__})"
-    if len(value) < 20:
+    if credential.name == "auth.json":
+        try:
+            tokens = json.loads(data.decode("utf-8")).get("tokens")
+            values = [tokens[key] for key in ("id_token", "access_token", "refresh_token")]
+        except (UnicodeError, ValueError, AttributeError, KeyError, TypeError):
+            return "incomplete: login file has no tokens to scan"
+    else:
+        try:
+            values = [data.decode("ascii").removesuffix("\n")]
+        except UnicodeError as error:
+            return f"incomplete: credential unreadable ({type(error).__name__})"
+    if any(not isinstance(value, str) or len(value) < 20 for value in values):
         return "incomplete: credential too short to scan"
-    probe = worker.ExposureScan(value)
-    for root in roots:
-        if not root.is_dir() or root.is_symlink():
-            return f"incomplete: {root} is not a directory"
-        found = probe.area(root)
-        if found is not None:
-            return found
+    return values
+
+
+def scan(credential: Path, roots: list[Path], worker=None) -> str:
+    """"clean", "exposed" or "incomplete: <why>" over every root, for every value."""
+    worker = load_worker() if worker is None else worker
+    values = scan_values(credential)
+    if isinstance(values, str):
+        return values
+    for value in values:
+        probe = worker.ExposureScan(value)
+        for root in roots:
+            if not root.is_dir() or root.is_symlink():
+                return f"incomplete: {root} is not a directory"
+            found = probe.area(root)
+            if found is not None:
+                return found
     return "clean"
 
 
@@ -153,7 +182,7 @@ def judge(text: str, kind: str) -> list[tuple[str, str]]:
     except (IndexError, ValueError):
         inner = None
     mode = inner.get("mode") if isinstance(inner, dict) else None
-    present = isinstance(inner, dict) and mode in ("model-once", "model-staged") \
+    present = isinstance(inner, dict) and mode in ("model-once", "model-staged", *CODEX_MODES) \
         and inner.get("manifest_written") is True
     if not present and kind != "token":
         # A sentinel run stopped by a timeout or a signal prints no summary; only
@@ -162,6 +191,8 @@ def judge(text: str, kind: str) -> list[tuple[str, str]]:
         return results
     if not check("R3-inner-summary-present", present):
         return results
+    if mode in CODEX_MODES:
+        return results + judge_codex(record, inner, kind)
     check("R4-contract", inner.get("requested_model") == MODEL and inner.get("requested_effort") == EFFORT
           and inner.get("profile") == "claude-profile2" and inner.get("permission_mode") == "dontAsk")
     check("R5-exposure-check-clean", (inner.get("credential") or {}).get("exact_value_check") == "clean")
@@ -262,6 +293,39 @@ def collect_facts(cdir, unit, manifest, work, reaper, ctop, run=run_tool) -> dic
         facts["credential_top_entries"] = None
         errors.append(f"list {ctop} ({type(error).__name__})")
     return facts
+
+
+def judge_codex(record: dict, inner: dict, kind: str) -> list[tuple[str, str]]:
+    """R4/R5 and, for a token run, V1-V5 of a Codex run (codex-once: answer OK;
+    codex-analysis: no fixed answer, the bundle's strict verifier judges it)."""
+    results = []
+
+    def check(name, ok):
+        results.append((name, "PASS" if ok else "FAIL"))
+
+    check("R4-contract", inner.get("requested_model") == CODEX_MODEL and inner.get("requested_effort") == EFFORT
+          and inner.get("profile") == CODEX_PROFILE and inner.get("permission_mode") == "dontAsk"
+          and inner.get("backend") == "codex")
+    check("R5-exposure-check-clean", inner.get("credential") == CODEX_CREDENTIAL)
+    check("R6-login-copy-removed", inner.get("login_copy_left") is False)
+    if kind != "token":
+        return results
+    meta = inner.get("result_meta") or {}
+    check("V1-manifest-succeeded", inner.get("status") == "succeeded" and inner.get("succeeded") is True
+          and record.get("exit_code") == 0 and record.get("failures") == []
+          and inner.get("failures") == [] and inner.get("problems") == [])
+    if inner.get("mode") == "codex-once":
+        check("V2-fixed-answer-OK", str(inner.get("report_text", "")).strip() == "OK")
+    items = meta.get("item_types")
+    check("V3-text-items-only", isinstance(items, list) and "agent_message" in items
+          and set(items) <= CODEX_TEXT_ITEMS | {"error"})
+    check("V4-requested-model-observed", inner.get("observed_models") == [CODEX_MODEL]
+          and meta.get("server_model_lines") not in (None, [])
+          and set(meta.get("server_model_lines") or []) == {CODEX_MODEL})
+    pin = record.get("egress_pin") or {}
+    check("V5-pin-apply-verify-clear", (pin.get("apply") or {}).get("exit") == 0
+          and (pin.get("verify") or {}).get("exit") == 0 and (pin.get("clear") or {}).get("exit") == 0)
+    return results
 
 
 def evidence(directory: Path, kind: str) -> list[tuple[str, str]]:
